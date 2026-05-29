@@ -10,6 +10,7 @@ BLOCKED_SUMMARY_FALLBACK = (
 
 _LINK_RE = re.compile(r"!?\[([^\]]*)\]\([^)]+\)")
 _SENTENCE_RE = re.compile(r"[^.!?]+[.!?](?=\s|$)")
+_BLOCKED_SUMMARY_LINE_RE = re.compile(r"^(?:[*_`]+)?\s*blocked\s+summary\s*(?:[*_`]+)?\s*:\s*(.+)$", re.I)
 
 
 def summarize_blocked_reason(text: str | None, *, limit: int = MAX_BLOCKED_SUMMARY_CHARS) -> str:
@@ -19,6 +20,21 @@ def summarize_blocked_reason(text: str | None, *, limit: int = MAX_BLOCKED_SUMMA
         return BLOCKED_SUMMARY_FALLBACK
     summary = _first_sentences(cleaned, max_sentences=2)
     return _truncate(summary, limit) or BLOCKED_SUMMARY_FALLBACK
+
+
+def extract_blocked_summary(text: str | None) -> str | None:
+    """Return the last explicit Blocked summary line from an artifact, if present."""
+    if not text:
+        return None
+    lines = text.splitlines()
+    for index in range(len(lines) - 1, -1, -1):
+        line = lines[index].strip()
+        line = re.sub(r"^(?:>+\s*)?(?:[-*+]\s*)?", "", line).strip()
+        match = _BLOCKED_SUMMARY_LINE_RE.match(line)
+        if match is None:
+            continue
+        return summarize_blocked_reason(match.group(1))
+    return None
 
 
 def _clean_text(text: str) -> str:

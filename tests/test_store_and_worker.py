@@ -936,6 +936,45 @@ class StoreAndWorkerTests(unittest.TestCase):
         self.assertEqual(run["status"], "success")
         self.assertEqual(run["next_phase"], "blocked")
 
+    def test_recovery_prefers_terminal_artifact_blocked_summary(self) -> None:
+        issue = self.store.create_issue("title", "desc", ready=True)
+        blocked_summary = "The source checkout credentials are missing. Add them and rerun research."
+        self.assertTrue(self.store.acquire_lock(issue.id, "legacy-worker", 60, "failed-run"))
+        self.store.transition_issue(issue.id, "researching", "failed-run")
+        self.store.create_run("failed-run", issue.id, "research", "copilot-cli")
+        artifact_path = self.artifacts.write_phase_artifact(
+            issue.id,
+            "research",
+            "failed-run",
+            (
+                "# Research blocked\n\n"
+                "Verbose diagnostics and retry metadata should not be the primary blocked reason.\n\n"
+                f"Blocked summary: {blocked_summary}\n"
+                "Recommendation: `blocked`\n"
+            ),
+        )
+        self.store.complete_run(
+            "failed-run",
+            issue.id,
+            "failed",
+            "Copilot CLI research failed with verbose internal details.",
+            str(artifact_path),
+            "Traceback and subprocess output should stay technical.",
+        )
+        self._expire_lock(issue.id)
+
+        result = Orchestrator(self.store, self.artifacts, self.config).recover_interrupted_issue(issue.id)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.next_phase, "blocked")
+        recovered = self.store.get_issue(issue.id)
+        self.assertEqual(recovered.phase, "blocked")
+        self.assertEqual(recovered.blocked_summary, blocked_summary)
+        self.assertNotIn("Recovered terminal", recovered.blocked_summary)
+        issue_payload_path = self.config.artifacts_dir / str(issue.id) / "issue.json"
+        issue_payload = json.loads(issue_payload_path.read_text(encoding="utf-8"))
+        self.assertEqual(issue_payload["blocked_summary"], blocked_summary)
+
     def test_recovery_clears_stale_lock_after_plan_reaches_approval(self) -> None:
         issue = self.store.create_issue("title", "desc", ready=True)
         self.store.transition_issue(issue.id, "researching")

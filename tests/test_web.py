@@ -22,6 +22,7 @@ import agent_team.web as web_module
 from agent_team.cli import build_parser
 from agent_team.config import AppConfig
 from agent_team.models import HumanInputRequestDraft, utc_now_iso
+from agent_team.orchestrator import Orchestrator
 from agent_team.web import AgentTeamWebApp, LOG_TAIL_BYTES, WebJob, serve_web, serve_web_and_worker
 
 
@@ -741,6 +742,40 @@ class WebTests(unittest.TestCase):
             "Source checkout credentials are missing. Add them and rerun research.",
         )
         self.assertIn("Verbose artifact preface", reason["artifact_excerpt"])
+
+    def test_recovered_terminal_run_exposes_artifact_blocked_summary(self) -> None:
+        issue = self.store.create_issue("recovered blocked summary issue", "desc", ready=True)
+        blocked_summary = "The source checkout credentials are missing. Add them and rerun research."
+        self.assertTrue(self.store.acquire_lock(issue.id, "legacy-worker", 60, "failed-run"))
+        self.store.transition_issue(issue.id, "researching", "failed-run")
+        self.store.create_run("failed-run", issue.id, "research", "copilot")
+        artifact_path = self.artifacts.write_phase_artifact(
+            issue.id,
+            "research",
+            "failed-run",
+            (
+                "Verbose recovery diagnostics should stay secondary.\n\n"
+                f"Blocked summary: {blocked_summary}\n"
+                "Recommendation: `blocked`\n"
+            ),
+        )
+        self.store.complete_run(
+            "failed-run",
+            issue.id,
+            "failed",
+            "Copilot CLI failed with generic recovery details.",
+            str(artifact_path),
+            "Generic subprocess failure details.",
+        )
+        self._expire_lock(issue.id)
+
+        result = Orchestrator(self.store, self.artifacts, self.config).recover_interrupted_issue(issue.id)
+        payload, _headers = self.get_json(f"/api/issues/{issue.id}")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(payload["issue"]["blocked_summary"], blocked_summary)
+        self.assertEqual(payload["blocked_reason"]["summary"], blocked_summary)
+        self.assertNotIn("Recovered terminal", payload["blocked_reason"]["summary"])
 
     def test_blocked_run_exposes_primary_retry_transition(self) -> None:
         issue = self.store.create_issue("retry blocked issue", "desc", ready=True)

@@ -1,6 +1,10 @@
 import unittest
 
-from agent_team.blocked_summary import BLOCKED_SUMMARY_FALLBACK, summarize_blocked_reason
+from agent_team.blocked_summary import (
+    BLOCKED_SUMMARY_FALLBACK,
+    extract_blocked_summary,
+    summarize_blocked_reason,
+)
 
 
 class BlockedSummaryTests(unittest.TestCase):
@@ -38,6 +42,18 @@ class BlockedSummaryTests(unittest.TestCase):
         )
 
         self.assertEqual(summary, "config_path is missing. Set ENV_VAR and rerun validation.")
+
+    def test_extracts_last_explicit_blocked_summary_line(self) -> None:
+        summary = extract_blocked_summary(
+            """
+            Blocked summary: Older reason should not win.
+
+            > - **Blocked summary**: The workspace credentials are missing. Add them and rerun review.
+            Recommendation: `blocked`
+            """
+        )
+
+        self.assertEqual(summary, "The workspace credentials are missing. Add them and rerun review.")
 
 
 if __name__ == "__main__":

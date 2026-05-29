@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 
-from agent_team.blocked_summary import summarize_blocked_reason
+from agent_team.blocked_summary import extract_blocked_summary, summarize_blocked_reason
 from agent_team.artifacts import (
     HUMAN_INPUT_JSONL_ARTIFACT,
     HUMAN_INPUT_MARKDOWN_ARTIFACT,
@@ -680,16 +680,7 @@ class CopilotCliRunner(AgentRunner):
 
     @staticmethod
     def _blocked_summary_from_artifact(artifact_markdown: str) -> str | None:
-        lines = artifact_markdown.splitlines()
-        for index in range(len(lines) - 1, -1, -1):
-            line = lines[index].strip()
-            line = re.sub(r"^(?:>+\s*)?(?:[-*+]\s*)?", "", line).strip()
-            match = re.match(r"^(?:[*_`]+)?\s*blocked\s+summary\s*(?:[*_`]+)?\s*:\s*(.+)$", line, re.I)
-            if match is None:
-                continue
-            summary = summarize_blocked_reason(match.group(1))
-            return summary
-        return None
+        return extract_blocked_summary(artifact_markdown)
 
     @staticmethod
     def _detected_invalid_recommendation_value(lines: list[str]) -> str | None:

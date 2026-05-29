@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
-from .blocked_summary import summarize_blocked_reason
+from .blocked_summary import extract_blocked_summary, summarize_blocked_reason
 from .locks import is_live_same_host_owner
 from .models import HumanInputRequest, HumanInputRequestDraft, Issue, utc_now_iso
 from .state_machine import (
@@ -1393,6 +1393,7 @@ class IssueStore:
         agent_phase = agent_phase_for_running_phase(phase)
         run = self._run_for_recovery(conn, issue_id, row["current_run_id"], agent_phase)
         run_id = str(run["id"]) if run is not None else row["current_run_id"]
+        blocked_summary = None
         if run is None:
             next_phase = ready_phase
             action = "running_phase_reset"
@@ -1402,9 +1403,11 @@ class IssueStore:
             action = "run_interrupted"
             summary = f"Recovered interrupted {agent_phase} run {run['id']}; returned to {ready_phase}."
         else:
-            next_phase, action, summary = self._terminal_recovery_target(run, phase, terminal_next_phase_resolver)
+            next_phase, action, summary, blocked_summary = self._terminal_recovery_target(
+                run, phase, terminal_next_phase_resolver
+            )
 
-        if not self._apply_recovery_issue_update(conn, row, next_phase, now_iso, summary):
+        if not self._apply_recovery_issue_update(conn, row, next_phase, now_iso, summary, blocked_summary):
             return None
         if run is not None and str(run["status"]) == "running":
             self._complete_recovered_run(conn, run, "interrupted", summary, next_phase, now_iso, None, summary)
@@ -1473,26 +1476,36 @@ class IssueStore:
         run: sqlite3.Row,
         running_phase: str,
         terminal_next_phase_resolver: TerminalNextPhaseResolver | None,
-    ) -> tuple[str, str, str]:
+    ) -> tuple[str, str, str, str | None]:
         stored_next_phase = run["next_phase"]
         if stored_next_phase:
             next_phase = str(stored_next_phase)
             return self._validated_terminal_recovery_target(run, running_phase, next_phase)
         if str(run["status"]) != "success":
+            summary = (
+                f"Recovered terminal {run['phase']} run {run['id']} with status {run['status']}; "
+                "blocked for inspection."
+            )
             return (
                 "blocked",
                 "terminal_run_blocked",
-                f"Recovered terminal {run['phase']} run {run['id']} with status {run['status']}; blocked for inspection.",
+                summary,
+                self._terminal_run_blocked_summary(run, summary, include_artifact_text=True),
             )
         resolved = terminal_next_phase_resolver(run) if terminal_next_phase_resolver is not None else None
         if resolved is None and str(run["runner"]) == "dry-run":
             resolved = default_next_phase(str(run["phase"]))
         if resolved is not None:
             return self._validated_terminal_recovery_target(run, running_phase, resolved)
+        summary = (
+            f"Recovered completed {run['phase']} run {run['id']} but could not determine its next phase; "
+            "blocked for inspection."
+        )
         return (
             "blocked",
             "terminal_run_blocked",
-            f"Recovered completed {run['phase']} run {run['id']} but could not determine its next phase; blocked for inspection.",
+            summary,
+            self._terminal_run_blocked_summary(run, summary),
         )
 
     @staticmethod
@@ -1500,28 +1513,72 @@ class IssueStore:
         run: sqlite3.Row,
         running_phase: str,
         next_phase: str,
-    ) -> tuple[str, str, str]:
+    ) -> tuple[str, str, str, str | None]:
         if next_phase == "awaiting_human_input":
+            summary = (
+                f"Recovered completed {run['phase']} run {run['id']} that requested human input, "
+                "but no pending request was committed atomically; blocked for rerun or inspection."
+            )
             return (
                 "blocked",
                 "terminal_run_blocked",
-                f"Recovered completed {run['phase']} run {run['id']} that requested human input, "
-                "but no pending request was committed atomically; blocked for rerun or inspection.",
+                summary,
+                IssueStore._terminal_run_blocked_summary(run, summary),
             )
         try:
             validate_transition(running_phase, next_phase)
         except ValueError as exc:
+            summary = (
+                f"Recovered terminal {run['phase']} run {run['id']} with invalid next phase "
+                f"{next_phase!r} from {running_phase}; blocked for inspection. {exc}"
+            )
             return (
                 "blocked",
                 "terminal_run_blocked",
-                f"Recovered terminal {run['phase']} run {run['id']} with invalid next phase "
-                f"{next_phase!r} from {running_phase}; blocked for inspection. {exc}",
+                summary,
+                IssueStore._terminal_run_blocked_summary(run, summary),
+            )
+        blocked_summary = None
+        if next_phase == "blocked":
+            blocked_summary = IssueStore._terminal_run_blocked_summary(
+                run,
+                f"Recovered completed {run['phase']} run {run['id']}; advanced to {next_phase}.",
+                include_artifact_text=True,
             )
         return (
             next_phase,
             "run_forward_completed",
             f"Recovered completed {run['phase']} run {run['id']}; advanced to {next_phase}.",
+            blocked_summary,
         )
+
+    @staticmethod
+    def _terminal_run_blocked_summary(
+        run: sqlite3.Row,
+        fallback_summary: str,
+        *,
+        include_artifact_text: bool = False,
+    ) -> str:
+        artifact_text = None
+        artifact_path = run["artifact_path"]
+        if artifact_path:
+            path = Path(str(artifact_path))
+            if path.is_file():
+                try:
+                    artifact_text = path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    artifact_text = None
+                artifact_summary = extract_blocked_summary(artifact_text)
+                if artifact_summary:
+                    return artifact_summary
+        error = run["error"]
+        if error:
+            return summarize_blocked_reason(str(error))
+        if include_artifact_text and artifact_text:
+            return summarize_blocked_reason(artifact_text)
+        if str(run["status"]) != "success" and run["summary"]:
+            return summarize_blocked_reason(str(run["summary"]))
+        return summarize_blocked_reason(fallback_summary)
 
     @staticmethod
     def _lock_is_recoverable(
@@ -1587,12 +1644,15 @@ class IssueStore:
         next_phase: str,
         now_iso: str,
         summary: str | None,
+        blocked_summary: str | None = None,
     ) -> bool:
-        blocked_summary = summarize_blocked_reason(summary) if next_phase == "blocked" else None
+        stored_blocked_summary = (
+            summarize_blocked_reason(blocked_summary or summary) if next_phase == "blocked" else None
+        )
         params: list[object] = [
             next_phase,
             "closed" if next_phase == "done" else "open",
-            blocked_summary,
+            stored_blocked_summary,
             now_iso,
             int(row["id"]),
             row["phase"],
