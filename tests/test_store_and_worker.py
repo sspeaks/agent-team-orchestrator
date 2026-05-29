@@ -154,7 +154,49 @@ class StoreAndWorkerTests(unittest.TestCase):
             row = conn.execute("SELECT last_scheduled_at FROM issues WHERE id = ?", (issue.id,)).fetchone()
         self.assertIsNotNone(row["last_scheduled_at"])
 
-    def test_schema_migration_adds_last_scheduled_at(self) -> None:
+    def test_transition_to_blocked_stores_and_clears_summary(self) -> None:
+        issue = self.store.create_issue("title", "desc", ready=True)
+        verbose_reason = """
+        # Blocked reason
+
+        Database credentials are missing. Grant the agent access to the test database.
+
+        Traceback (most recent call last):
+          File "runner.py", line 7, in <module>
+
+        Recommendation: `blocked`
+        """
+
+        blocked = self.store.transition_issue(issue.id, "blocked", message=verbose_reason)
+
+        self.assertEqual(
+            blocked.blocked_summary,
+            "Database credentials are missing. Grant the agent access to the test database.",
+        )
+        summary = self.store.dashboard_summary()
+        self.assertEqual(summary["blocked_issues"][0]["blocked_summary"], blocked.blocked_summary)
+
+        resumed = self.store.transition_issue(issue.id, "needs_research", message="Retry with credentials.")
+
+        self.assertEqual(resumed.phase, "needs_research")
+        self.assertIsNone(resumed.blocked_summary)
+
+    def test_transition_to_blocked_prefers_explicit_summary(self) -> None:
+        issue = self.store.create_issue("title", "desc", ready=True)
+
+        blocked = self.store.transition_issue(
+            issue.id,
+            "blocked",
+            message="A long technical error with stack traces and tool output.",
+            blocked_summary="The test database credentials are missing. Add them to the workspace and rerun research.",
+        )
+
+        self.assertEqual(
+            blocked.blocked_summary,
+            "The test database credentials are missing. Add them to the workspace and rerun research.",
+        )
+
+    def test_schema_migration_adds_issue_columns(self) -> None:
         old_db = self.home / "old-state.db"
         created_at = "2026-01-01T00:00:00+00:00"
         with sqlite3.connect(old_db) as conn:
@@ -195,9 +237,11 @@ class StoreAndWorkerTests(unittest.TestCase):
 
         with store.connect() as conn:
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(issues)").fetchall()}
-            row = conn.execute("SELECT last_scheduled_at FROM issues WHERE id = 1").fetchone()
+            row = conn.execute("SELECT last_scheduled_at, blocked_summary FROM issues WHERE id = 1").fetchone()
         self.assertIn("last_scheduled_at", columns)
+        self.assertIn("blocked_summary", columns)
         self.assertIsNone(row["last_scheduled_at"])
+        self.assertIsNone(row["blocked_summary"])
 
     def test_schema_migration_adds_run_next_phase(self) -> None:
         old_db = self.home / "old-runs-state.db"
@@ -1159,6 +1203,38 @@ class StoreAndWorkerTests(unittest.TestCase):
         self.assertIn("debug output", log_text)
         history = json.loads((self.config.artifacts_dir / str(issue.id) / "history.jsonl").read_text(encoding="utf-8").strip())
         self.assertEqual(history["log_path"], str(logs[0]))
+
+    def test_orchestrator_persists_agent_blocked_summary(self) -> None:
+        issue = self.store.create_issue("title", "desc", repo_path="/tmp/repo", ready=True)
+
+        class BlockingRunner(AgentRunner):
+            name = "blocking"
+
+            def run(self, phase: str, issue: Issue, context: Dict[str, str]) -> AgentResult:
+                return AgentResult(
+                    status="blocked",
+                    summary="Verbose runner failed with many implementation details.",
+                    artifact_markdown=(
+                        "The runner cannot continue.\n\n"
+                        "Blocked summary: Missing repository credentials. Add the credentials and rerun research.\n"
+                        "Recommendation: `blocked`"
+                    ),
+                    suggested_next_phase="blocked",
+                    error="Verbose runner failed with many implementation details.",
+                    blocked_summary="Missing repository credentials. Add the credentials and rerun research.",
+                )
+
+        result = Orchestrator(self.store, self.artifacts, self.config, runner=BlockingRunner()).process_next()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.next_phase, "blocked")
+        blocked = self.store.get_issue(issue.id)
+        self.assertEqual(
+            blocked.blocked_summary,
+            "Missing repository credentials. Add the credentials and rerun research.",
+        )
+        history = json.loads((self.config.artifacts_dir / str(issue.id) / "history.jsonl").read_text(encoding="utf-8").strip())
+        self.assertEqual(history["blocked_summary"], blocked.blocked_summary)
 
     def test_dry_run_flow_blocks_merge_without_workspace(self) -> None:
         issue = self.store.create_issue("title", "desc", ready=True)

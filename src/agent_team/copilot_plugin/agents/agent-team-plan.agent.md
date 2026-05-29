@@ -55,3 +55,5 @@ The phase artifact must contain all seven required sections:
 The orchestrator will convert `ready_for_implementation` into its human plan-approval gate. If planning needs a critical human decision, use `awaiting_human_input` and include the structured request section. If planning cannot proceed for non-human-input reasons, use the `blocked` recommendation and include the reason in the risks section.
 
 Before finishing, self-check that the artifact begins with `1. Executive Summary` and ends with exactly one valid `Recommendation:` line. Omitting or misformatting this final recommendation will block the issue.
+
+If the final recommendation is `blocked`, include exactly one `Blocked summary:` line immediately before the final `Recommendation:` line. The blocked summary must be 1-2 plain-language sentences explaining what prevents progress and what would unblock it.

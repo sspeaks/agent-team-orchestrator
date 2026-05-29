@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from .artifacts import ArtifactStore
+from .blocked_summary import summarize_blocked_reason
 from .config import AppConfig
 from .db import IssueStore
 from .lifecycle import delete_issue, reset_issue_to_draft
@@ -1486,6 +1487,7 @@ def _issue_payload(issue: Issue) -> dict[str, Any]:
         "lock_owner": issue.lock_owner,
         "lock_expires_at": issue.lock_expires_at,
         "current_run_id": issue.current_run_id,
+        "blocked_summary": issue.blocked_summary,
         "created_at": issue.created_at,
         "updated_at": issue.updated_at,
     }
@@ -1778,44 +1780,68 @@ def _blocked_reason_payload(
     if transition is not None:
         transition_run_id = transition["run_id"]
         if transition_run_id is None:
-            return _with_blocked_suggested_transition(_blocked_transition_payload(issue, transition), suggested_transition)
+            return _finalize_blocked_reason_payload(issue, _blocked_transition_payload(issue, transition), suggested_transition)
         run = runs_by_id.get(str(transition_run_id))
         if run is not None and str(run["status"]) != "success":
-            return _with_blocked_suggested_transition(
+            return _finalize_blocked_reason_payload(
+                issue,
                 _blocked_run_payload(issue, run, artifacts_by_path, artifact_excerpt_reader),
                 suggested_transition,
             )
-        return _with_blocked_suggested_transition(_blocked_transition_payload(issue, transition), suggested_transition)
+        return _finalize_blocked_reason_payload(issue, _blocked_transition_payload(issue, transition), suggested_transition)
 
     for run in reversed(runs):
         status = str(run["status"])
         if status == "success":
             continue
-        return _with_blocked_suggested_transition(
+        return _finalize_blocked_reason_payload(
+            issue,
             _blocked_run_payload(issue, run, artifacts_by_path, artifact_excerpt_reader),
             suggested_transition,
         )
 
-    return _with_blocked_suggested_transition({
-        "source": "fallback",
-        "title": "No blocked reason recorded",
-        "headline": "No blocked reason was recorded.",
-        "summary": "No blocked reason was recorded. Review recent activity, runs, logs, and artifacts.",
-        "error": None,
-        "run_id": None,
-        "phase": issue.phase,
-        "status": issue.status,
-        "started_at": None,
-        "completed_at": issue.updated_at,
-        "artifact": None,
-        "log": None,
-    }, suggested_transition)
+    return _finalize_blocked_reason_payload(
+        issue,
+        {
+            "source": "fallback",
+            "title": "No blocked reason recorded",
+            "headline": "No blocked reason was recorded.",
+            "summary": "No blocked reason was recorded. Review recent activity, runs, logs, and artifacts.",
+            "error": None,
+            "run_id": None,
+            "phase": issue.phase,
+            "status": issue.status,
+            "started_at": None,
+            "completed_at": issue.updated_at,
+            "artifact": None,
+            "log": None,
+        },
+        suggested_transition,
+    )
 
 
-def _with_blocked_suggested_transition(
+def _finalize_blocked_reason_payload(
+    issue: Issue,
     payload: dict[str, Any],
     suggested_transition: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    original_summary = str(payload.get("summary") or payload.get("headline") or payload.get("error") or "").strip()
+    stored_summary = issue.blocked_summary
+    if (
+        stored_summary
+        and payload.get("artifact_excerpt")
+        and _is_generic_blocked_run_reason(stored_summary, "", str(payload.get("phase") or ""))
+    ):
+        stored_summary = None
+    summary_source = stored_summary or original_summary
+    concise_summary = summarize_blocked_reason(summary_source)
+    if original_summary and original_summary != concise_summary:
+        payload["technical_summary"] = original_summary
+    else:
+        payload["technical_summary"] = None
+    payload["blocked_summary"] = concise_summary
+    payload["headline"] = concise_summary
+    payload["summary"] = concise_summary
     payload["suggested_transition"] = suggested_transition
     return payload
 

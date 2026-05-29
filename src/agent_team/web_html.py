@@ -124,21 +124,18 @@ def _render_blocked_reason(reason: dict[str, Any] | None) -> str:
     if reason is None:
         return '<section data-blocked-reason hidden></section>'
 
-    details = _blocked_reason_details(reason)
-    error = f'<pre class="blocked-reason-error">{_esc(reason["error"])}</pre>' if reason.get("error") else ""
     summary = reason.get("summary") or reason.get("headline")
-    artifact_excerpt = ""
-    if reason.get("artifact_excerpt") and reason["artifact_excerpt"] != summary:
-        artifact_excerpt = f'<p class="blocked-reason-artifact-excerpt">{_esc(reason["artifact_excerpt"])}</p>'
-    links = _blocked_reason_links(reason)
+    suggested_transition = reason.get("suggested_transition")
+    retry = ""
+    if isinstance(suggested_transition, dict) and suggested_transition.get("label"):
+        retry = f'<p class="muted">Suggested retry: {_esc(suggested_transition["label"])}</p>'
+    technical_details = _blocked_reason_technical_details(reason, summary)
     return f"""
             <section class="panel attention blocked-reason-panel" data-blocked-reason>
               <h2>Blocked reason</h2>
               <p class="blocked-reason-summary">{_esc(summary)}</p>
-              <p class="muted">{_esc(details)}</p>
-              {error}
-              {artifact_excerpt}
-              {links}
+              {retry}
+              {technical_details}
             </section>
     """
 
@@ -246,6 +243,30 @@ def _blocked_reason_details(reason: dict[str, Any]) -> str:
     if isinstance(suggested_transition, dict) and suggested_transition.get("label"):
         parts.append(f"Suggested retry: {suggested_transition['label']}")
     return " - ".join(parts)
+
+
+def _blocked_reason_technical_details(reason: dict[str, Any], summary: object) -> str:
+    technical_summary = reason.get("technical_summary")
+    run_summary = reason.get("run_summary")
+    artifact_excerpt = reason.get("artifact_excerpt")
+    blocks = [f'<p class="muted">{_esc(_blocked_reason_details(reason))}</p>']
+    if technical_summary and technical_summary != summary:
+        blocks.append(f'<p class="blocked-reason-technical-summary">{_esc(technical_summary)}</p>')
+    if run_summary and run_summary not in {summary, technical_summary}:
+        blocks.append(f'<p class="blocked-reason-run-summary">{_esc(run_summary)}</p>')
+    if reason.get("error"):
+        blocks.append(f'<pre class="blocked-reason-error">{_esc(reason["error"])}</pre>')
+    if artifact_excerpt and artifact_excerpt not in {summary, technical_summary, run_summary}:
+        blocks.append(f'<p class="blocked-reason-artifact-excerpt">{_esc(artifact_excerpt)}</p>')
+    links = _blocked_reason_links(reason)
+    if links:
+        blocks.append(links)
+    return (
+        '<details class="blocked-reason-technical">'
+        '<summary>Technical details</summary>'
+        f'{"".join(blocks)}'
+        '</details>'
+    )
 
 
 def _blocked_reason_links(reason: dict[str, Any]) -> str:
@@ -440,11 +461,30 @@ def _open_issues_table(rows: list[Any], repo_context: RepoContext | None = None)
         f"<td>P{row['priority']}</td>"
         f"<td>{_esc(phase_label(row['phase']))}<br><code>{_esc(row['phase'])}</code></td>"
         f"<td>{_esc(row['updated_at'])}</td>"
-        f"<td>{_esc(_shorten(row['title']))}</td>"
+        f"<td>{_open_issue_title_cell(row)}</td>"
         "</tr>"
         for row in rows
     )
     return f"<table><thead><tr><th>Issue</th><th>Priority</th><th>Phase</th><th>Updated</th><th>Title</th></tr></thead><tbody>{body}</tbody></table>"
+
+
+def _open_issue_title_cell(row: Any) -> str:
+    title = f"{_esc(_shorten(row['title']))}"
+    blocked_summary = _row_value(row, "blocked_summary")
+    if not blocked_summary:
+        return title
+    return (
+        f"{title}<br>"
+        f'<span class="muted blocked-summary-inline">{_esc(_shorten(blocked_summary, 140))}</span>'
+    )
+
+
+def _row_value(row: Any, key: str) -> Any:
+    if hasattr(row, "keys") and key in row.keys():
+        return row[key]
+    if isinstance(row, dict):
+        return row.get(key)
+    return None
 
 
 def _recent_runs_table(rows: list[Any], repo_context: RepoContext | None = None) -> str:

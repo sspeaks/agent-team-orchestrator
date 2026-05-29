@@ -45,3 +45,5 @@ The phase artifact must contain:
 5. Recommendation: `ready_for_review`, `ready_for_implementation`, `awaiting_human_input`, or `blocked`
 
 Use `ready_for_review` only when validation passed well enough for review. Use `ready_for_implementation` when fixes are needed. Use `awaiting_human_input` when validation needs a critical human decision and include the structured request section. Use `blocked` only for environmental or unrecoverable validation blockers.
+
+If the final recommendation is `blocked`, include exactly one `Blocked summary:` line immediately before the final `Recommendation:` line. The blocked summary must be 1-2 plain-language sentences explaining what prevents progress and what would unblock it.

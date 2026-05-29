@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
+from .blocked_summary import summarize_blocked_reason
 from .locks import is_live_same_host_owner
 from .models import HumanInputRequest, HumanInputRequestDraft, Issue, utc_now_iso
 from .state_machine import (
@@ -38,6 +39,7 @@ CREATE TABLE IF NOT EXISTS issues (
   lock_expires_at TEXT,
   current_run_id TEXT,
   last_scheduled_at TEXT,
+  blocked_summary TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -403,7 +405,8 @@ class IssueStore:
             ).fetchall()
             active_locks = conn.execute(
                 f"""
-                SELECT id, title, phase, priority, updated_at, lock_owner, lock_expires_at, current_run_id
+                SELECT id, title, phase, priority, updated_at, lock_owner, lock_expires_at, current_run_id,
+                       blocked_summary
                 FROM issues
                 WHERE lock_expires_at IS NOT NULL AND lock_expires_at >= ?
                 {issue_and}
@@ -436,7 +439,7 @@ class IssueStore:
             ).fetchall()
             open_issues = conn.execute(
                 f"""
-                SELECT id, title, phase, priority, updated_at
+                SELECT id, title, phase, priority, updated_at, blocked_summary
                 FROM issues
                 WHERE status = 'open'
                 {issue_and}
@@ -448,7 +451,7 @@ class IssueStore:
             awaiting_plan_approval = conn.execute(
                 f"""
                 SELECT id, title, phase, status, priority, updated_at,
-                       lock_owner, lock_expires_at, current_run_id
+                       lock_owner, lock_expires_at, current_run_id, blocked_summary
                 FROM issues
                 WHERE status = 'open' AND phase = 'awaiting_plan_approval'
                 {issue_and}
@@ -469,7 +472,7 @@ class IssueStore:
             awaiting_merge_approval = conn.execute(
                 f"""
                 SELECT id, title, phase, status, priority, updated_at,
-                       lock_owner, lock_expires_at, current_run_id
+                       lock_owner, lock_expires_at, current_run_id, blocked_summary
                 FROM issues
                 WHERE status = 'open' AND phase = 'awaiting_merge_approval'
                 {issue_and}
@@ -490,7 +493,7 @@ class IssueStore:
             human_input_needed = conn.execute(
                 f"""
                 SELECT issues.id, issues.title, issues.phase, issues.status, issues.priority, issues.updated_at,
-                       issues.lock_owner, issues.lock_expires_at, issues.current_run_id,
+                       issues.lock_owner, issues.lock_expires_at, issues.current_run_id, issues.blocked_summary,
                        human_input_requests.id AS request_id,
                        human_input_requests.question,
                        human_input_requests.resume_phase
@@ -517,7 +520,7 @@ class IssueStore:
             blocked_issues = conn.execute(
                 f"""
                 SELECT id, title, phase, status, priority, updated_at,
-                       lock_owner, lock_expires_at, current_run_id
+                       lock_owner, lock_expires_at, current_run_id, blocked_summary
                 FROM issues
                 WHERE status = 'open' AND phase = 'blocked'
                 {issue_and}
@@ -538,7 +541,7 @@ class IssueStore:
             draft_issues = conn.execute(
                 f"""
                 SELECT id, title, phase, status, priority, updated_at,
-                       lock_owner, lock_expires_at, current_run_id
+                       lock_owner, lock_expires_at, current_run_id, blocked_summary
                 FROM issues
                 WHERE status = 'open' AND phase = 'draft'
                 {issue_and}
@@ -562,7 +565,7 @@ class IssueStore:
             ready_issues = conn.execute(
                 f"""
                 SELECT id, title, phase, status, priority, updated_at,
-                       lock_owner, lock_expires_at, current_run_id
+                       lock_owner, lock_expires_at, current_run_id, blocked_summary
                 FROM issues
                 WHERE status = 'open'
                   AND phase IN ({ready_placeholders})
@@ -825,6 +828,7 @@ class IssueStore:
                     lock_expires_at = NULL,
                     current_run_id = NULL,
                     last_scheduled_at = NULL,
+                    blocked_summary = NULL,
                     updated_at = ?
                 WHERE id = ? AND lock_owner = ?
                 """,
@@ -868,7 +872,15 @@ class IssueStore:
             if cur.rowcount == 1:
                 self._add_event(conn, issue_id, run_id, "lock.released", f"{owner} released lock")
 
-    def transition_issue(self, issue_id: int, next_phase: str, run_id: str | None = None, message: str | None = None) -> Issue:
+    def transition_issue(
+        self,
+        issue_id: int,
+        next_phase: str,
+        run_id: str | None = None,
+        message: str | None = None,
+        *,
+        blocked_summary: str | None = None,
+    ) -> Issue:
         issue = self.get_issue(issue_id)
         if issue.phase == "awaiting_human_input":
             raise ValueError(
@@ -881,21 +893,26 @@ class IssueStore:
             )
         validate_transition(issue.phase, next_phase)
         status = "closed" if next_phase == "done" else "open"
+        stored_blocked_summary = (
+            summarize_blocked_reason(blocked_summary or message)
+            if next_phase == "blocked"
+            else None
+        )
         now = utc_now_iso()
         with self.connect() as conn:
             if run_id is None:
                 cur = conn.execute(
-                    "UPDATE issues SET phase = ?, status = ?, updated_at = ? WHERE id = ?",
-                    (next_phase, status, now, issue_id),
+                    "UPDATE issues SET phase = ?, status = ?, blocked_summary = ?, updated_at = ? WHERE id = ?",
+                    (next_phase, status, stored_blocked_summary, now, issue_id),
                 )
             else:
                 cur = conn.execute(
                     """
                     UPDATE issues
-                    SET phase = ?, status = ?, updated_at = ?
+                    SET phase = ?, status = ?, blocked_summary = ?, updated_at = ?
                     WHERE id = ? AND current_run_id = ?
                     """,
-                    (next_phase, status, now, issue_id, run_id),
+                    (next_phase, status, stored_blocked_summary, now, issue_id, run_id),
                 )
             if cur.rowcount != 1:
                 raise RuntimeError(f"Run {run_id} is no longer current for issue {issue_id}")
@@ -1306,7 +1323,7 @@ class IssueStore:
             ):
                 return None
             run_id = row["current_run_id"]
-            if not self._apply_recovery_issue_update(conn, row, next_phase, now_iso):
+            if not self._apply_recovery_issue_update(conn, row, next_phase, now_iso, summary):
                 return None
             run = self._run_for_recovery(conn, issue_id, run_id, "merge")
             if run is not None:
@@ -1387,7 +1404,7 @@ class IssueStore:
         else:
             next_phase, action, summary = self._terminal_recovery_target(run, phase, terminal_next_phase_resolver)
 
-        if not self._apply_recovery_issue_update(conn, row, next_phase, now_iso):
+        if not self._apply_recovery_issue_update(conn, row, next_phase, now_iso, summary):
             return None
         if run is not None and str(run["status"]) == "running":
             self._complete_recovered_run(conn, run, "interrupted", summary, next_phase, now_iso, None, summary)
@@ -1417,7 +1434,7 @@ class IssueStore:
         if run is not None and str(run["status"]) == "running":
             summary = f"Recovered interrupted {agent_phase} run {run['id']} before phase transition; kept {phase} ready."
             action = "ready_run_interrupted"
-        if not self._apply_recovery_issue_update(conn, row, phase, now_iso):
+        if not self._apply_recovery_issue_update(conn, row, phase, now_iso, summary):
             return None
         if run is not None and str(run["status"]) == "running":
             self._complete_recovered_run(conn, run, "interrupted", summary, phase, now_iso, None, summary)
@@ -1444,7 +1461,7 @@ class IssueStore:
             return None
         run_id = str(run["id"])
         summary = f"Cleared stale lock for completed {run['phase']} run {run_id} after issue reached {phase}."
-        if not self._apply_recovery_issue_update(conn, row, phase, now_iso):
+        if not self._apply_recovery_issue_update(conn, row, phase, now_iso, summary):
             return None
         if run["next_phase"] is None:
             conn.execute("UPDATE runs SET next_phase = ? WHERE id = ? AND next_phase IS NULL", (phase, run_id))
@@ -1569,10 +1586,13 @@ class IssueStore:
         row: sqlite3.Row,
         next_phase: str,
         now_iso: str,
+        summary: str | None,
     ) -> bool:
+        blocked_summary = summarize_blocked_reason(summary) if next_phase == "blocked" else None
         params: list[object] = [
             next_phase,
             "closed" if next_phase == "done" else "open",
+            blocked_summary,
             now_iso,
             int(row["id"]),
             row["phase"],
@@ -1586,7 +1606,7 @@ class IssueStore:
             f"""
             UPDATE issues
             SET phase = ?, status = ?, lock_owner = NULL, lock_expires_at = NULL,
-                current_run_id = NULL, updated_at = ?
+                current_run_id = NULL, blocked_summary = ?, updated_at = ?
             WHERE id = ? AND phase = ?
               {''.join(guards)}
             """,
@@ -1662,6 +1682,8 @@ class IssueStore:
         columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(issues)").fetchall()}
         if "last_scheduled_at" not in columns:
             conn.execute("ALTER TABLE issues ADD COLUMN last_scheduled_at TEXT")
+        if "blocked_summary" not in columns:
+            conn.execute("ALTER TABLE issues ADD COLUMN blocked_summary TEXT")
 
     @staticmethod
     def _migrate_runs_schema(conn: sqlite3.Connection) -> None:

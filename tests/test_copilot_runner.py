@@ -134,6 +134,28 @@ class CopilotCliRunnerTests(unittest.TestCase):
         )
         self.assertEqual(recommended, "blocked")
 
+    def test_blocked_summary_line_is_parsed_from_blocked_artifact(self) -> None:
+        summary = CopilotCliRunner._blocked_summary_from_artifact(
+            "1. Summary\n\n"
+            "The raw logs are very long.\n\n"
+            "Blocked summary: Source checkout credentials are missing. Add them and rerun research.\n"
+            "Recommendation: `blocked`"
+        )
+
+        self.assertEqual(
+            summary,
+            "Source checkout credentials are missing. Add them and rerun research.",
+        )
+
+    def test_blocked_summary_line_without_blocked_recommendation_is_ignored_by_run(self) -> None:
+        self.assertEqual(
+            CopilotCliRunner._recommended_next_phase(
+                "research",
+                "Blocked summary: Not actually blocked.\nRecommendation: `ready_for_plan`",
+            ),
+            "ready_for_plan",
+        )
+
     def test_bold_colon_recommendation_is_accepted(self) -> None:
         recommended = CopilotCliRunner._recommended_next_phase(
             "research",
@@ -833,6 +855,35 @@ print("1. Summary\\n\\nChanged the files.\\n\\n6. Recommendation: `ready_for_imp
         self.assertIn("## Orchestrator diagnostic", result.artifact_markdown)
         self.assertIn("Recommendation: `blocked`", result.artifact_markdown)
         self.assertEqual(CopilotCliRunner._recommended_next_phase("implementation", result.artifact_markdown), "blocked")
+
+    def test_run_returns_blocked_summary_for_blocked_recommendation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "fake-copilot"
+            script.write_text(
+                """#!/usr/bin/env python3
+print('''1. Summary
+
+Research cannot continue.
+
+Blocked summary: The source checkout is unavailable. Restore the checkout and rerun research.
+Recommendation: `blocked`
+''')
+""",
+                encoding="utf-8",
+            )
+            script.chmod(0o755)
+
+            result = CopilotCliRunner(command=str(script)).run(
+                "research",
+                self.issue,
+                {"prompt_template": "Body {title}"},
+            )
+
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(
+            result.blocked_summary,
+            "The source checkout is unavailable. Restore the checkout and rerun research.",
+        )
 
     def test_plan_run_blocks_missing_recommendation_with_diagnostic_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
