@@ -1,0 +1,6 @@
+{
+  "name": "agent-team-orchestrator",
+  "description": "Custom agents for the local agent-team orchestrator phases",
+  "version": "0.1.0",
+  "agents": "agents/"
+}

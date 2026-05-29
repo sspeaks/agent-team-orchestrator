@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-team-orchestrator"
+version = "0.1.0"
+description = "Local-first state-machine orchestrator for AI engineering agent teams"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Seth Speaks" }]
+maintainers = [{ name = "Seth Speaks" }]
+requires-python = ">=3.10"
+keywords = ["agent-orchestration", "ai-agents", "cli", "git-worktrees", "sqlite"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development",
+    "Topic :: Software Development :: Version Control :: Git",
+]
+dependencies = []
+
+[project.scripts]
+agent-team = "agent_team.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+agent_team = ["prompts/*.md", "copilot_plugin/plugin.json", "copilot_plugin/agents/*.agent.md", "web_static/*.js", "web_static/*.css"]
+"agent_team.web_static" = ["*.js", "*.css"]
