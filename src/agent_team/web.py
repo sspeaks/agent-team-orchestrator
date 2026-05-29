@@ -62,6 +62,7 @@ SYNOPSIS_ARTIFACT_READ_CHARS = 4_000
 CLOSED_SYNOPSIS_EXCERPT_CHARS = 700
 SERVER_THREAD_JOIN_SECONDS = 5.0
 WORKER_THREAD_JOIN_SECONDS = 5.0
+SUBMIT_DRAFT_FOR_RESEARCH_MESSAGE = "Submitted draft for research"
 
 
 def _vscode_file_uri(path: Any) -> str | None:
@@ -255,6 +256,27 @@ class AgentTeamWebApp:
                 )
                 self.artifacts.write_issue_snapshot(updated)
                 self._redirect(handler, _context_url(f"/issues/{issue_id}", context, flash="Draft issue edited"))
+                return
+            if action == "submit-for-research":
+                issue = self.store.get_issue(issue_id)
+                if issue.status != "open" or issue.phase != "draft":
+                    raise WebError(HTTPStatus.BAD_REQUEST, f"Issue {issue.id} is not an open draft")
+                issue = self._ensure_no_active_lock(issue, "submit this draft for research")
+                self._ensure_no_active_job(issue_id, "submit this draft for research")
+                if issue.status != "open" or issue.phase != "draft":
+                    raise WebError(HTTPStatus.BAD_REQUEST, f"Issue {issue.id} is not an open draft")
+                message = form.get("message", SUBMIT_DRAFT_FOR_RESEARCH_MESSAGE).strip()
+                updated = self.store.transition_issue(
+                    issue_id,
+                    "needs_research",
+                    None,
+                    message or SUBMIT_DRAFT_FOR_RESEARCH_MESSAGE,
+                )
+                self.artifacts.write_issue_snapshot(updated)
+                self._redirect(
+                    handler,
+                    _context_url(f"/issues/{issue_id}", context, flash=SUBMIT_DRAFT_FOR_RESEARCH_MESSAGE),
+                )
                 return
             if action == "approve-plan":
                 issue = self.store.get_issue(issue_id)
@@ -806,6 +828,21 @@ class AgentTeamWebApp:
                 }
             )
         if issue.status == "open" and issue.phase == "draft":
+            controls.append(
+                {
+                    "action": _context_url(f"/issues/{issue.id}/actions/submit-for-research", repo_context),
+                    "method": "post",
+                    "button": "Submit for research",
+                    "group": "primary",
+                    "fields": [
+                        {
+                            "type": "hidden",
+                            "name": "message",
+                            "value": SUBMIT_DRAFT_FOR_RESEARCH_MESSAGE,
+                        }
+                    ],
+                }
+            )
             edit_url = _context_url(f"/issues/{issue.id}/edit", repo_context)
             controls.append(
                 {
@@ -1630,7 +1667,7 @@ def _next_manager_action(
     if runnable is not None:
         return f"Ready to run the {runnable} agent."
     if issue.phase == "draft":
-        return "Draft backlog: edit it as needed, then publish to needs_research when it is ready for agents."
+        return "Draft backlog: edit it as needed, then submit it for research when it is ready for agents."
     if issue.phase == "awaiting_plan_approval":
         return "Review the plan, then approve it or send feedback."
     if issue.phase == "awaiting_human_input":
