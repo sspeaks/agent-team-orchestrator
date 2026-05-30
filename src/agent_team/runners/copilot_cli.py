@@ -56,6 +56,7 @@ class PhasePermissionPolicy:
 
 
 READ_ONLY_ALLOW_TOOLS = (
+    "read",
     "shell(git status)",
     "shell(git status:*)",
     "shell(git diff)",
@@ -74,6 +75,8 @@ READ_ONLY_ALLOW_TOOLS = (
     "shell(head:*)",
     "shell(tail:*)",
     "shell(wc:*)",
+    "shell(cat:*)",
+    "shell(grep:*)",
 )
 
 VALIDATION_ALLOW_TOOLS = READ_ONLY_ALLOW_TOOLS + (
