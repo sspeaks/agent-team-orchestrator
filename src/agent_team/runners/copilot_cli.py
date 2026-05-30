@@ -55,10 +55,11 @@ class PhasePermissionPolicy:
     deny_urls: tuple[str, ...] = ()
 
 
-READ_ONLY_ALLOW_TOOLS = (
+GIT_INSPECTION_ALLOW_TOOLS = (
     "shell(git status)",
     "shell(git status:*)",
     "shell(git diff)",
+    # Covers read-only diff summaries such as `git diff --stat`.
     "shell(git diff:*)",
     "shell(git log)",
     "shell(git log:*)",
@@ -67,6 +68,9 @@ READ_ONLY_ALLOW_TOOLS = (
     "shell(git grep:*)",
     "shell(git ls-files)",
     "shell(git ls-files:*)",
+)
+
+FILE_INSPECTION_ALLOW_TOOLS = (
     "shell(rg:*)",
     "shell(ls)",
     "shell(ls:*)",
@@ -75,6 +79,8 @@ READ_ONLY_ALLOW_TOOLS = (
     "shell(tail:*)",
     "shell(wc:*)",
 )
+
+READ_ONLY_ALLOW_TOOLS = GIT_INSPECTION_ALLOW_TOOLS + FILE_INSPECTION_ALLOW_TOOLS
 
 VALIDATION_ALLOW_TOOLS = READ_ONLY_ALLOW_TOOLS + (
     "shell(python -m unittest)",

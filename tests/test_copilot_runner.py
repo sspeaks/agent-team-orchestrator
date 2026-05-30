@@ -540,6 +540,37 @@ Recommendation: `awaiting_human_input`
                 command = runner._build_command(phase, "prompt", Path("/tmp/repo"))
                 self.assertNotIn("write", self._permission_values(command, "--allow-tool"))
 
+    def test_review_phase_policy_allows_git_status_and_diff_inspection(self) -> None:
+        runner = CopilotCliRunner()
+        command = runner._build_command("review", "prompt", Path("/tmp/repo"))
+        allowed = set(self._permission_values(command, "--allow-tool"))
+
+        self.assertTrue(
+            {
+                "shell(git status)",
+                "shell(git status:*)",
+                "shell(git diff)",
+                "shell(git diff:*)",
+            }.issubset(allowed)
+        )
+        self.assertNotIn("shell(git:*)", allowed)
+        self.assertNotIn("write", allowed)
+
+    def test_all_phase_policies_allow_git_status_and_diff_inspection(self) -> None:
+        runner = CopilotCliRunner()
+        expected = {
+            "shell(git status)",
+            "shell(git status:*)",
+            "shell(git diff)",
+            "shell(git diff:*)",
+        }
+
+        for phase in PHASE_AGENTS:
+            with self.subTest(phase=phase):
+                command = runner._build_command(phase, "prompt", Path("/tmp/repo"))
+                allowed = set(self._permission_values(command, "--allow-tool"))
+                self.assertTrue(expected.issubset(allowed))
+
     def test_only_research_phase_policy_allows_url_access(self) -> None:
         runner = CopilotCliRunner()
         for phase in PHASE_AGENTS:
