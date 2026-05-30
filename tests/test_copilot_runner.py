@@ -540,6 +540,22 @@ Recommendation: `awaiting_human_input`
                 command = runner._build_command(phase, "prompt", Path("/tmp/repo"))
                 self.assertNotIn("write", self._permission_values(command, "--allow-tool"))
 
+    def test_all_phases_allow_abstract_read_tool(self) -> None:
+        runner = CopilotCliRunner()
+        for phase in PHASE_AGENTS:
+            with self.subTest(phase=phase):
+                command = runner._build_command(phase, "prompt", Path("/tmp/repo"))
+                self.assertIn("read", self._permission_values(command, "--allow-tool"))
+
+    def test_read_only_phases_allow_basic_file_inspection_tools(self) -> None:
+        runner = CopilotCliRunner()
+        for phase in ("research", "plan", "review"):
+            with self.subTest(phase=phase):
+                command = runner._build_command(phase, "prompt", Path("/tmp/repo"))
+                allowed = self._permission_values(command, "--allow-tool")
+                self.assertIn("shell(cat:*)", allowed)
+                self.assertIn("shell(grep:*)", allowed)
+
     def test_only_research_phase_policy_allows_url_access(self) -> None:
         runner = CopilotCliRunner()
         for phase in PHASE_AGENTS:
