@@ -22,6 +22,7 @@ import agent_team.web as web_module
 from agent_team.cli import build_parser
 from agent_team.config import AppConfig
 from agent_team.models import HumanInputRequestDraft, utc_now_iso
+from agent_team.orchestrator import Orchestrator
 from agent_team.web import AgentTeamWebApp, LOG_TAIL_BYTES, WebJob, serve_web, serve_web_and_worker
 
 
@@ -670,6 +671,112 @@ class WebTests(unittest.TestCase):
         self.assertNotIn("content", reason["artifact"])
         self.assertNotIn("content", reason["log"])
 
+    def test_issue_detail_uses_persisted_blocked_summary_as_primary_reason(self) -> None:
+        issue = self.store.create_issue("blocked summary issue", "desc", ready=True)
+        self._block_with_run(
+            issue.id,
+            run_id="run-summary",
+            summary="Verbose runner output includes stack traces and internal retry metadata.",
+            error="Runner failed on <unsafe> output",
+            blocked_summary="Credentials are missing. Add them and rerun research.",
+        )
+
+        html = self.get(f"/issues/{issue.id}")
+        payload, _headers = self.get_json(f"/api/issues/{issue.id}")
+        reason = payload["blocked_reason"]
+        prominent_html = html[: html.index("Phase timeline")]
+        primary_html = prominent_html[: prominent_html.index("<details")]
+
+        self.assertEqual(payload["issue"]["blocked_summary"], "Credentials are missing. Add them and rerun research.")
+        self.assertEqual(reason["summary"], "Credentials are missing. Add them and rerun research.")
+        self.assertEqual(reason["technical_summary"], "Verbose runner output includes stack traces and internal retry metadata.")
+        self.assertIn("Credentials are missing. Add them and rerun research.", primary_html)
+        self.assertNotIn("Runner failed", primary_html)
+        self.assertIn("<summary>Technical details</summary>", prominent_html)
+        self.assertIn("Runner failed on &lt;unsafe&gt; output", prominent_html)
+
+        dashboard = self.get("/")
+        dashboard_payload, _headers = self.get_json("/api/dashboard")
+        self.assertEqual(
+            dashboard_payload["blocked_issues"][0]["blocked_summary"],
+            "Credentials are missing. Add them and rerun research.",
+        )
+        self.assertIn("Credentials are missing. Add them and rerun research.", dashboard)
+
+    def test_issue_detail_keeps_agent_summary_when_run_error_is_generic(self) -> None:
+        issue = self.store.create_issue("agent summary issue", "desc", ready=True)
+        run_id = "run-agent-summary"
+        phase = "research"
+        artifact_markdown = (
+            "1. Summary\n\n"
+            "Verbose artifact preface should stay secondary.\n\n"
+            "Blocked summary: Source checkout credentials are missing. Add them and rerun research.\n"
+            "Recommendation: `blocked`\n"
+        )
+        self.assertTrue(self.store.acquire_lock(issue.id, "worker", 60, run_id))
+        self.store.transition_issue(issue.id, "researching", run_id, "Starting research")
+        self.store.create_run(run_id, issue.id, phase, "copilot")
+        artifact_path = self.artifacts.write_phase_artifact(issue.id, phase, run_id, artifact_markdown)
+        self.store.complete_run(
+            run_id,
+            issue.id,
+            "blocked",
+            f"Copilot CLI {phase} recommended blocked for issue {issue.id}",
+            str(artifact_path),
+            f"Copilot CLI {phase} recommended blocked",
+        )
+        self.store.transition_issue(
+            issue.id,
+            "blocked",
+            run_id,
+            f"Copilot CLI {phase} recommended blocked for issue {issue.id}",
+            blocked_summary="Source checkout credentials are missing. Add them and rerun research.",
+        )
+        self.store.release_lock(issue.id, "worker", run_id)
+
+        payload, _headers = self.get_json(f"/api/issues/{issue.id}")
+        reason = payload["blocked_reason"]
+
+        self.assertEqual(
+            reason["summary"],
+            "Source checkout credentials are missing. Add them and rerun research.",
+        )
+        self.assertIn("Verbose artifact preface", reason["artifact_excerpt"])
+
+    def test_recovered_terminal_run_exposes_artifact_blocked_summary(self) -> None:
+        issue = self.store.create_issue("recovered blocked summary issue", "desc", ready=True)
+        blocked_summary = "The source checkout credentials are missing. Add them and rerun research."
+        self.assertTrue(self.store.acquire_lock(issue.id, "legacy-worker", 60, "failed-run"))
+        self.store.transition_issue(issue.id, "researching", "failed-run")
+        self.store.create_run("failed-run", issue.id, "research", "copilot")
+        artifact_path = self.artifacts.write_phase_artifact(
+            issue.id,
+            "research",
+            "failed-run",
+            (
+                "Verbose recovery diagnostics should stay secondary.\n\n"
+                f"Blocked summary: {blocked_summary}\n"
+                "Recommendation: `blocked`\n"
+            ),
+        )
+        self.store.complete_run(
+            "failed-run",
+            issue.id,
+            "failed",
+            "Copilot CLI failed with generic recovery details.",
+            str(artifact_path),
+            "Generic subprocess failure details.",
+        )
+        self._expire_lock(issue.id)
+
+        result = Orchestrator(self.store, self.artifacts, self.config).recover_interrupted_issue(issue.id)
+        payload, _headers = self.get_json(f"/api/issues/{issue.id}")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(payload["issue"]["blocked_summary"], blocked_summary)
+        self.assertEqual(payload["blocked_reason"]["summary"], blocked_summary)
+        self.assertNotIn("Recovered terminal", payload["blocked_reason"]["summary"])
+
     def test_blocked_run_exposes_primary_retry_transition(self) -> None:
         issue = self.store.create_issue("retry blocked issue", "desc", ready=True)
         self._block_with_run(issue.id, run_id="run-retry", summary="Transient research failure")
@@ -842,7 +949,8 @@ class WebTests(unittest.TestCase):
         self.assertNotIn("FULL_BODY_SENTINEL", reason["summary"])
         self.assertNotIn("content", reason["artifact"])
         self.assertIn("deployment slot is missing &lt;prod&gt; credentials", prominent_html)
-        self.assertNotIn("Copilot CLI research recommended blocked", prominent_html)
+        primary_html = prominent_html[: prominent_html.index("<details")]
+        self.assertNotIn("Copilot CLI research recommended blocked", primary_html)
 
     def test_issue_detail_uses_artifact_excerpt_for_legacy_recommendation_parse_block(self) -> None:
         issue = self.store.create_issue("legacy recommendation block issue", "desc", ready=True)
@@ -873,8 +981,8 @@ class WebTests(unittest.TestCase):
         self.assertEqual(reason["artifact"]["relative_path"], "research.md")
         self.assertEqual(reason["log"]["relative_path"], f"logs/{phase}-{run_id}.md")
         self.assertIn("source checkout needs &lt;manual&gt; repair", prominent_html)
-        headline_html = prominent_html[: prominent_html.index('<pre class="blocked-reason-error">')]
-        self.assertNotIn("Copilot CLI research did not provide a valid Recommendation", headline_html)
+        primary_html = prominent_html[: prominent_html.index("<details")]
+        self.assertNotIn("Copilot CLI research did not provide a valid Recommendation", primary_html)
 
     def test_issue_detail_keeps_new_recommendation_diagnostic_detail(self) -> None:
         issue = self.store.create_issue("new recommendation block issue", "desc", ready=True)
@@ -1057,10 +1165,16 @@ setTimeout(() => {{
   function collectText(node) {{
     return (node.textContent || "") + (node.children || []).map(collectText).join("");
   }}
+  function collectLinks(node) {{
+    const links = [];
+    if (node.href) links.push(node.href);
+    (node.children || []).forEach((child) => links.push.apply(links, collectLinks(child)));
+    return links;
+  }}
   const blockedText = collectText(blockedReason);
   assert(blockedText.includes("Blocked <summary>"));
   assert(blockedText.includes("Detailed <error>"));
-  assert.strictEqual(blockedReason.children[4].children[0].href, "/artifacts/{issue.id}/research.md");
+  assert(collectLinks(blockedReason).includes("/artifacts/{issue.id}/research.md"));
 }}, 0);
 """
         result = subprocess.run([node, "-e", test_script], capture_output=True, text=True, timeout=5, check=False)
@@ -2526,14 +2640,21 @@ setTimeout(() => {{
                 ("2000-01-01T00:00:00+00:00", issue_id),
             )
 
-    def _block_with_run(self, issue_id: int, run_id: str, summary: str, error: str | None = None) -> None:
+    def _block_with_run(
+        self,
+        issue_id: int,
+        run_id: str,
+        summary: str,
+        error: str | None = None,
+        blocked_summary: str | None = None,
+    ) -> None:
         self.assertTrue(self.store.acquire_lock(issue_id, "worker", 60, run_id))
         self.store.transition_issue(issue_id, "researching", run_id, "Starting research")
         self.store.create_run(run_id, issue_id, "research", "dry-run")
         artifact_path = self.artifacts.write_phase_artifact(issue_id, "research", run_id, "Blocked artifact details")
         self.artifacts.run_log_path(issue_id, "research", run_id).write_text("Blocked run log", encoding="utf-8")
         self.store.complete_run(run_id, issue_id, "blocked", summary, str(artifact_path), error)
-        self.store.transition_issue(issue_id, "blocked", run_id, summary)
+        self.store.transition_issue(issue_id, "blocked", run_id, summary, blocked_summary=blocked_summary)
         self.store.release_lock(issue_id, "worker", run_id)
 
 

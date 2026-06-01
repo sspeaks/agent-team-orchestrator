@@ -27,9 +27,11 @@ class Issue:
     current_run_id: str | None
     created_at: str
     updated_at: str
+    blocked_summary: str | None = None
 
     @classmethod
     def from_row(cls, row: Any) -> "Issue":
+        blocked_summary = row["blocked_summary"] if _has_row_key(row, "blocked_summary") else None
         return cls(
             id=int(row["id"]),
             title=str(row["title"]),
@@ -46,6 +48,7 @@ class Issue:
             current_run_id=row["current_run_id"],
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
+            blocked_summary=blocked_summary,
         )
 
 
@@ -58,6 +61,7 @@ class AgentResult:
     error: str | None = None
     raw_stdout: str | None = None
     raw_stderr: str | None = None
+    blocked_summary: str | None = None
 
 
 @dataclass(frozen=True)
@@ -114,3 +118,9 @@ class HumanInputRequest:
             answer=row["answer"],
             answered_by=row["answered_by"],
         )
+
+
+def _has_row_key(row: Any, key: str) -> bool:
+    if not hasattr(row, "keys"):
+        return False
+    return key in row.keys()

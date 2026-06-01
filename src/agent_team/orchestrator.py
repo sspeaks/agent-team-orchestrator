@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .artifacts import ArtifactStore
+from .blocked_summary import summarize_blocked_reason
 from .config import AppConfig
 from .db import IssueStore, RecoveryResult
 from .locks import is_definitely_dead_same_host_owner, make_lock_owner
@@ -141,7 +142,19 @@ class Orchestrator:
                 self.artifacts.finish_run_log(log_path, result.raw_stdout, result.raw_stderr)
             elif self.runner.name != "copilot-cli" or not runner_invoked:
                 self.artifacts.finish_run_log(log_path)
-            artifact_path = self.artifacts.write_phase_artifact(issue.id, phase, run_id, result.artifact_markdown)
+            try:
+                artifact_path = self.artifacts.write_phase_artifact(issue.id, phase, run_id, result.artifact_markdown)
+            except OSError as exc:
+                message = f"Phase artifact persistence failed: {exc}"
+                result = AgentResult(
+                    status="blocked",
+                    summary=message,
+                    artifact_markdown="",
+                    suggested_next_phase="blocked",
+                    error=message,
+                    blocked_summary=summarize_blocked_reason(message),
+                )
+                artifact_path = None
             next_phase = result.suggested_next_phase or default_next_phase(phase)
             if result.status == "requeued" and result.suggested_next_phase is not None:
                 next_phase = result.suggested_next_phase
@@ -151,6 +164,7 @@ class Orchestrator:
             final_status = result.status
             final_summary = result.summary
             final_error = result.error
+            final_blocked_summary = result.blocked_summary
             if result.status == "success" and next_phase == "awaiting_human_input":
                 try:
                     human_input_request = CopilotCliRunner._human_input_request_from_artifact(
@@ -161,6 +175,7 @@ class Orchestrator:
                     final_status = "blocked"
                     final_summary = f"Invalid human input request: {exc}"
                     final_error = final_summary
+                    final_blocked_summary = summarize_blocked_reason(final_summary)
                     next_phase = "blocked"
             if phase == "plan" and result.status == "success" and next_phase == "awaiting_plan_approval":
                 self.artifacts.clear_plan_rejection_context(issue.id)
@@ -180,6 +195,7 @@ class Orchestrator:
                     final_status = "blocked"
                     final_summary = f"Workspace snapshot commit failed: {exc}"
                     final_error = final_summary
+                    final_blocked_summary = summarize_blocked_reason(final_summary)
                     next_phase = "blocked"
                     human_input_request = None
                     artifact_path = self.artifacts.write_phase_artifact(
@@ -193,7 +209,7 @@ class Orchestrator:
                 "phase": phase,
                 "status": final_status,
                 "summary": final_summary,
-                "artifact_path": str(artifact_path),
+                "artifact_path": str(artifact_path) if artifact_path is not None else None,
                 "log_path": str(log_path),
             }
             if human_input_request is not None:
@@ -216,6 +232,11 @@ class Orchestrator:
                 )
             if workspace_commit is not None:
                 history_event["workspace_commit"] = workspace_commit
+            if next_phase == "blocked":
+                final_blocked_summary = final_blocked_summary or summarize_blocked_reason(
+                    result.artifact_markdown or final_error or result.error or final_summary
+                )
+                history_event["blocked_summary"] = final_blocked_summary
             self.artifacts.append_history(issue.id, history_event)
             if human_input_request is not None:
                 created_request = self.store.complete_run_and_request_human_input(
@@ -237,12 +258,18 @@ class Orchestrator:
                     issue.id,
                     final_status,
                     final_summary,
-                    str(artifact_path),
+                    str(artifact_path) if artifact_path is not None else None,
                     final_error,
                     next_phase=next_phase,
                 )
 
-                updated_issue = self.store.transition_issue(issue.id, next_phase, run_id, final_summary)
+                updated_issue = self.store.transition_issue(
+                    issue.id,
+                    next_phase,
+                    run_id,
+                    final_summary,
+                    blocked_summary=final_blocked_summary,
+                )
             self.artifacts.write_issue_snapshot(updated_issue)
             return ProcessResult(
                 issue_id=issue.id,
@@ -419,9 +446,14 @@ class Orchestrator:
         return AgentResult(
             status="blocked",
             summary=message,
-            artifact_markdown=f"**Recommendation: `blocked`**\n\n{message}",
+            artifact_markdown=(
+                f"{message}\n\n"
+                f"Blocked summary: {summarize_blocked_reason(message)}\n"
+                "Recommendation: `blocked`"
+            ),
             suggested_next_phase="blocked",
             error=message,
+            blocked_summary=summarize_blocked_reason(message),
         )
 
     @staticmethod
@@ -441,7 +473,7 @@ class Orchestrator:
     @staticmethod
     def _snapshot_blocked_artifact(phase: str, message: str) -> str:
         title = phase.replace("_", " ").title()
-        return f"# {title} Blocked\n\n{message}\n\nRecommendation: `blocked`"
+        return f"# {title} Blocked\n\n{message}\n\nBlocked summary: {summarize_blocked_reason(message)}\nRecommendation: `blocked`"
 
 
 def build_runner(config: AppConfig) -> AgentRunner:

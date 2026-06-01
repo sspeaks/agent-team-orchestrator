@@ -53,6 +53,9 @@ legend { font-weight: 800; margin-bottom: 0.45rem; }
 .blocked-reason-summary { font-size: 1.05rem; font-weight: 800; }
 .blocked-reason-error { max-height: 14rem; }
 .blocked-reason-links .button { margin-right: 0.5rem; }
+.blocked-reason-technical { margin-top: 0.75rem; }
+.blocked-reason-technical summary { cursor: pointer; font-weight: 800; }
+.blocked-summary-inline { display: inline-block; margin-top: 0.2rem; }
 .closed-synopsis-panel { border-left: 6px solid var(--ok); }
 .closed-synopsis-summary { font-size: 1.05rem; font-weight: 800; }
 .section-header { align-items: center; display: flex; gap: 1rem; justify-content: space-between; }
