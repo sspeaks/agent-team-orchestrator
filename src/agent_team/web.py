@@ -14,7 +14,7 @@ from .artifacts import ArtifactStore
 from .blocked_summary import summarize_blocked_reason
 from .config import AppConfig
 from .db import IssueStore
-from .lifecycle import delete_issue, reset_issue_to_draft
+from .lifecycle import delete_issue, reset_issue_to_draft, stop_issue
 from .models import HumanInputRequest, Issue, utc_now_iso
 from .orchestrator import Orchestrator, ProcessResult
 from .state_machine import (
@@ -343,6 +343,21 @@ class AgentTeamWebApp:
                     ),
                 )
                 return
+            if action == "stop":
+                issue = self.store.get_issue(issue_id)
+                issue = self._ensure_no_active_lock(issue, "stop this issue")
+                self._ensure_no_active_job(issue_id, "stop this issue")
+                message = form.get("message", "").strip() or None
+                result = stop_issue(self.config, self.store, self.artifacts, issue.id, message, stopped_by="web")
+                self._redirect(
+                    handler,
+                    _context_url(
+                        f"/issues/{issue_id}",
+                        context,
+                        flash=f"Issue {issue_id} stopped at {result.issue.phase}",
+                    ),
+                )
+                return
             if action == "approve-merge":
                 issue = self.store.get_issue(issue_id)
                 issue = self._ensure_no_active_lock(issue, "approve a merge")
@@ -490,6 +505,8 @@ class AgentTeamWebApp:
         if issue.current_run_id is not None or issue.lock_expires_at is not None:
             Orchestrator(self.store, self.artifacts, self.config).recover_interrupted_issue(issue.id)
             issue = self.store.get_issue(issue.id)
+        if issue.current_run_id is not None:
+            raise WebError(HTTPStatus.CONFLICT, f"Cannot {action} while issue {issue.id} has an active run")
         lock_expires_at = issue.lock_expires_at
         if lock_expires_at is not None and lock_expires_at >= utc_now_iso():
             raise WebError(HTTPStatus.CONFLICT, f"Cannot {action} while issue {issue.id} has an active run")
@@ -824,6 +841,25 @@ class AgentTeamWebApp:
                             "rows": 6,
                             "required": True,
                             "placeholder": "Provide the decision, approval, or context the agent requested.",
+                        }
+                    ],
+                }
+            )
+        if issue.status == "open" and issue.phase not in {"draft", "blocked"}:
+            controls.append(
+                {
+                    "action": _context_url(f"/issues/{issue.id}/actions/stop", repo_context),
+                    "method": "post",
+                    "button": "Stop issue",
+                    "group": "primary",
+                    "class_name": "stack",
+                    "fields": [
+                        {
+                            "type": "textarea",
+                            "name": "message",
+                            "label": "Stop reason",
+                            "rows": 3,
+                            "placeholder": "Optional reason; defaults to a manager stop note.",
                         }
                     ],
                 }

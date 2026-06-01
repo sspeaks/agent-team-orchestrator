@@ -6,8 +6,11 @@ from dataclasses import dataclass
 from .artifacts import ArtifactStore
 from .config import AppConfig
 from .db import IssueStore
-from .models import Issue
+from .models import HumanInputRequest, Issue
 from .workspaces import WorkspaceManager
+
+
+DEFAULT_STOP_MESSAGE = "Issue stopped by manager"
 
 
 @dataclass(frozen=True)
@@ -31,6 +34,40 @@ class DeleteIssueResult:
     deleted_artifacts: int
     removed_workspace_paths: tuple[str, ...]
     warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class StopIssueResult:
+    issue_id: int
+    prior_phase: str
+    issue: Issue
+    stopped_human_input_request: HumanInputRequest | None = None
+
+
+def stop_issue(
+    config: AppConfig,
+    store: IssueStore,
+    artifacts: ArtifactStore,
+    issue_id: int,
+    message: str | None = None,
+    *,
+    stopped_by: str = "cli",
+) -> StopIssueResult:
+    from .orchestrator import Orchestrator
+
+    Orchestrator(store, artifacts, config).recover_interrupted_issue(issue_id)
+    stop_message = (message or "").strip() or DEFAULT_STOP_MESSAGE
+    stopped = store.stop_issue(issue_id, stop_message, stopped_by=stopped_by)
+    if stopped.stopped_human_input_request is not None:
+        artifacts.append_human_input_stop(stopped.stopped_human_input_request)
+        artifacts.write_human_input_summary(issue_id, store.list_human_input_requests(issue_id))
+    artifacts.write_issue_snapshot(stopped.issue)
+    return StopIssueResult(
+        issue_id=stopped.issue_id,
+        prior_phase=stopped.prior_phase,
+        issue=stopped.issue,
+        stopped_human_input_request=stopped.stopped_human_input_request,
+    )
 
 
 def reset_issue_to_draft(
