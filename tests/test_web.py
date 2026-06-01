@@ -181,6 +181,29 @@ class WebTests(unittest.TestCase):
         self.assertNotIn("Research body", html)
         self.assertNotIn("&lt;script&gt;timeline&lt;/script&gt;", html)
 
+    def test_issue_detail_artifacts_section_is_scroll_bounded(self) -> None:
+        issue = self.store.create_issue("long artifact issue", "desc", ready=True)
+        self.artifacts.write_phase_artifact(issue.id, "research", "run-research", "Research body")
+        self.artifacts.write_phase_artifact(issue.id, "plan", "run-plan", "Plan body")
+        for index in range(8):
+            self.artifacts.run_log_path(issue.id, "research", f"run-{index}").write_text(
+                f"research log {index}",
+                encoding="utf-8",
+            )
+
+        html = self.get(f"/issues/{issue.id}")
+
+        self.assertIn('<div class="artifact-list-viewer" data-issue-artifacts>', html)
+        artifact_section = html[
+            html.index('<div class="artifact-list-viewer" data-issue-artifacts>') : html.index(
+                '<div class="panel current-log-panel">'
+            )
+        ]
+        self.assertIn(f'href="/artifacts/{issue.id}/research.md"', artifact_section)
+        self.assertIn(f'href="/artifacts/{issue.id}/plan.md"', artifact_section)
+        self.assertIn(f'href="/artifacts/{issue.id}/logs/research-run-0.md"', artifact_section)
+        self.assertIn(f'href="/artifacts/{issue.id}/logs/research-run-7.md"', artifact_section)
+
     def test_issue_detail_links_existing_phase_artifacts_when_blocked(self) -> None:
         issue = self.store.create_issue("blocked artifact issue", "desc", ready=True)
         self.artifacts.write_phase_artifact(issue.id, "research", "run-1", "Blocked issue research")
@@ -1486,6 +1509,7 @@ setTimeout(() => {{
         self.assertIn(".diagnostics-grid > * { min-width: 0; }", styles)
         self.assertIn(".diagnostics [data-dashboard-list] { max-width: 100%; overflow-x: auto; }", styles)
         self.assertIn(".diagnostics table { table-layout: fixed; }", styles)
+        self.assertIn(".artifact-list-viewer { max-height: 18rem; overflow: auto; }", styles)
         self.assertIn(
             ".diagnostics th, .diagnostics td, .diagnostics code, .diagnostics .muted { overflow-wrap: anywhere; }",
             styles,
