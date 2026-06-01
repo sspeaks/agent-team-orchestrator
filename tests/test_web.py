@@ -61,12 +61,31 @@ class WebRenderingTests(unittest.TestCase):
 
         self.assertIn('<a href="https://github.com/owner/repo/pull/7" rel="noreferrer">Pull request #7</a>', rendered)
 
+    def test_server_closed_synopsis_does_not_link_credential_bearing_pull_request_url(self) -> None:
+        rendered = _render_closed_synopsis(
+            {
+                "summary": "Finalized by PR",
+                "pull_request": {
+                    "number": 7,
+                    "url": "https://user:secret@github.com/owner/repo/pull/7",
+                    "source_branch": "agent-team/issue-7",
+                    "target_branch": "main",
+                    "status": "OPEN",
+                },
+            }
+        )
+
+        self.assertIn("Pull request #7", rendered)
+        self.assertNotIn("<a ", rendered)
+        self.assertNotIn("user:secret", rendered)
+
     def test_browser_closed_synopsis_checks_pr_url_scheme_before_linking(self) -> None:
         script = (Path(web_module.__file__).with_name("web_static") / "app.js").read_text(encoding="utf-8")
 
         self.assertIn("function isSafeHttpUrl", script)
         self.assertIn("if (isSafeHttpUrl(pullRequest.url))", script)
         self.assertIn("!/^https?:\\/\\//i.test(text)", script)
+        self.assertIn("!parsed.username && !parsed.password", script)
         self.assertNotIn("if (pullRequest.url) {\n      var link", script)
 
 

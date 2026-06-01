@@ -14,6 +14,7 @@ from agent_team.pull_requests import (
     PullRequestRequest,
     SubprocessCommandRunner,
     create_or_get_pull_request,
+    is_safe_pull_request_url,
     parse_azure_devops_remote,
     parse_github_remote,
     parse_pull_request_remote,
@@ -238,6 +239,37 @@ class PullRequestProviderTests(unittest.TestCase):
         with self.assertRaisesRegex(PullRequestError, "unsafe pull request URL scheme"):
             create_or_get_pull_request(remote, request, runner)
 
+    def test_github_rejects_credential_bearing_pull_request_url_from_provider(self) -> None:
+        remote = parse_pull_request_remote("origin", "https://github.com/owner/repo.git")
+        assert remote is not None
+        request = PullRequestRequest(
+            source_branch="feature",
+            target_branch="main",
+            title="Add feature",
+            body_path=Path("body.md"),
+        )
+        runner = FakeRunner(
+            [
+                command_result(
+                    [
+                        {
+                            "number": 42,
+                            "url": "https://user:secret@github.com/owner/repo/pull/42",
+                            "title": "Existing PR",
+                            "headRefName": "feature",
+                            "baseRefName": "main",
+                            "state": "OPEN",
+                        }
+                    ]
+                )
+            ]
+        )
+
+        with self.assertRaisesRegex(PullRequestError, "credential-bearing pull request URL"):
+            create_or_get_pull_request(remote, request, runner)
+
+        self.assertFalse(is_safe_pull_request_url("https://user:secret@github.com/owner/repo/pull/42"))
+
     def test_github_rejects_unsafe_create_url_before_viewing(self) -> None:
         remote = parse_pull_request_remote("origin", "https://github.com/owner/repo.git")
         assert remote is not None
@@ -250,6 +282,21 @@ class PullRequestProviderTests(unittest.TestCase):
         runner = FakeRunner([command_result([]), command_result("javascript:alert(1)\n")])
 
         with self.assertRaisesRegex(PullRequestError, "unsafe pull request URL scheme"):
+            create_or_get_pull_request(remote, request, runner)
+        self.assertEqual(len(runner.calls), 2)
+
+    def test_github_rejects_credential_bearing_create_url_before_viewing(self) -> None:
+        remote = parse_pull_request_remote("origin", "https://github.com/owner/repo.git")
+        assert remote is not None
+        request = PullRequestRequest(
+            source_branch="feature",
+            target_branch="main",
+            title="Add feature",
+            body_path=Path("body.md"),
+        )
+        runner = FakeRunner([command_result([]), command_result("https://user:secret@github.com/owner/repo/pull/43\n")])
+
+        with self.assertRaisesRegex(PullRequestError, "credential-bearing pull request URL"):
             create_or_get_pull_request(remote, request, runner)
         self.assertEqual(len(runner.calls), 2)
 

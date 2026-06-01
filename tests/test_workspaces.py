@@ -362,6 +362,70 @@ class WorkspaceManagerTests(unittest.TestCase):
         self.assertIn("Merge approval: looks good", merge_message)
         self.assertIn("feature", merge_message)
 
+    def test_merge_rejects_symbolic_target_branch(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        source_head = self._git(self.repo, "rev-parse", "HEAD")
+        self.artifacts.write_merge_request(issue.id, target_branch="HEAD", message="approved", mode="local")
+
+        with self.assertRaisesRegex(WorkspaceError, "existing local branch name"):
+            self.manager.merge_and_cleanup(issue)
+
+        self.assertTrue(info.worktree_root.exists())
+        self.assertEqual(self._git(self.repo, "rev-parse", "HEAD"), source_head)
+        self.assertFalse((self.repo / "feature.txt").exists())
+
+    def test_merge_rejects_tag_target_branch(self) -> None:
+        self._git(self.repo, "tag", "release")
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        self.artifacts.write_merge_request(issue.id, target_branch="release", message="approved", mode="local")
+
+        with self.assertRaisesRegex(WorkspaceError, "not an existing local branch"):
+            self.manager.merge_and_cleanup(issue)
+
+        self.assertTrue(info.worktree_root.exists())
+        self.assertFalse((self.repo / "feature.txt").exists())
+
+    def test_merge_rejects_remote_tracking_target_branch(self) -> None:
+        default_branch = self._git(self.repo, "rev-parse", "--abbrev-ref", "HEAD")
+        bare_remote = self.home / "origin.git"
+        self._git(self.home, "init", "--bare", str(bare_remote))
+        self._git(self.repo, "remote", "add", "origin", str(bare_remote))
+        self._git(self.repo, "push", "-u", "origin", default_branch)
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        self.artifacts.write_merge_request(
+            issue.id,
+            target_branch=f"origin/{default_branch}",
+            message="approved",
+            mode="local",
+        )
+
+        with self.assertRaisesRegex(WorkspaceError, "not an existing local branch"):
+            self.manager.merge_and_cleanup(issue)
+
+        self.assertTrue(info.worktree_root.exists())
+        self.assertFalse((self.repo / "feature.txt").exists())
+
+    def test_merge_does_not_reset_or_delete_existing_predictable_merge_branch(self) -> None:
+        user_branch_head = self._git(self.repo, "rev-parse", "HEAD")
+        self._git(self.repo, "branch", "agent-team/issue-1-merge")
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        self.artifacts.write_merge_request(issue.id, target_branch=None, message="approved", mode="local")
+
+        result = self.manager.merge_and_cleanup(issue)
+
+        self.assertEqual(result.status, "merged")
+        self.assertEqual(self._git(self.repo, "rev-parse", "agent-team/issue-1-merge"), user_branch_head)
+        self.assertEqual((self.repo / "feature.txt").read_text(encoding="utf-8"), "feature\n")
+        self.assertEqual(self._git(self.repo, "branch", "--list", "agent-team/issue-1-merge-*"), "")
+
     def test_concurrent_same_repo_merges_are_serialized(self) -> None:
         first_issue = self._issue(1, self.repo)
         second_issue = self._issue(2, self.repo)

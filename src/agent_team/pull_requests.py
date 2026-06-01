@@ -197,8 +197,16 @@ def is_safe_pull_request_url(url: object) -> bool:
     text = "" if url is None else str(url).strip()
     if not text:
         return False
-    parsed = urlparse(text)
-    return parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.lower() in {"http", "https"}
+        and bool(parsed.netloc)
+        and parsed.username is None
+        and parsed.password is None
+    )
 
 
 def _github_create_or_get(
@@ -524,13 +532,14 @@ def _validated_result_url(value: Any, command: str) -> str:
 
 
 def _validate_pull_request_url(url: str, command: str) -> str:
-    if is_safe_pull_request_url(url):
-        return _canonical_url(url)
-    raise PullRequestError(f"{command} returned an unsafe pull request URL scheme; expected http or https.")
-
-
-def _canonical_url(url: str) -> str:
-    parsed = urlparse(url.strip())
+    try:
+        parsed = urlparse(url.strip())
+    except ValueError as exc:
+        raise PullRequestError(f"{command} returned an invalid pull request URL: {exc}") from exc
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        raise PullRequestError(f"{command} returned an unsafe pull request URL scheme; expected http or https.")
+    if parsed.username is not None or parsed.password is not None:
+        raise PullRequestError(f"{command} returned a credential-bearing pull request URL.")
     return urlunparse(parsed._replace(scheme=parsed.scheme.lower()))
 
 

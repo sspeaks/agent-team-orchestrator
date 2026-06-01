@@ -429,12 +429,14 @@ class WorkspaceManager:
             merged_metadata = {**merged_metadata, "cleanup_removed": True}
             self.artifacts.write_merged_workspace_metadata(issue.id, merged_metadata)
         self.artifacts.delete_workspace_metadata(issue.id)
-        merge_branch = f"agent-team/issue-{issue.id}-merge"
-        if info.source_root.is_dir() and self._git_check(info.source_root, "rev-parse", "--verify", merge_branch):
-            try:
-                self._git(info.source_root, "branch", "-d", merge_branch)
-            except WorkspaceError:
-                pass
+        merge_branch = _clean_optional_string(merged_metadata.get("merge_branch"))
+        self._delete_internal_merge_branch(
+            issue.id,
+            info.source_root,
+            merge_branch,
+            _clean_optional_string(merged_metadata.get("worktree_head")),
+            force=False,
+        )
         merge_commit = _clean_optional_string(merged_metadata.get("merge_commit"))
         target_branch = _clean_optional_string(merged_metadata.get("merge_target_branch"))
         suffix = f" at {merge_commit[:12]}" if merge_commit else ""
@@ -467,12 +469,14 @@ class WorkspaceManager:
             pull_request_metadata = {**pull_request_metadata, "cleanup_removed": True}
             self.artifacts.write_pull_request_metadata(issue.id, pull_request_metadata)
         self.artifacts.delete_workspace_metadata(issue.id)
-        merge_branch = _clean_optional_string(pull_request_metadata.get("merge_branch")) or f"agent-team/issue-{issue.id}-merge"
-        if info.source_root.is_dir() and self._git_check(info.source_root, "rev-parse", "--verify", merge_branch):
-            try:
-                self._git(info.source_root, "branch", "-D", merge_branch)
-            except WorkspaceError:
-                pass
+        self._delete_internal_merge_branch(
+            issue.id,
+            info.source_root,
+            _clean_optional_string(pull_request_metadata.get("merge_branch")),
+            _clean_optional_string(pull_request_metadata.get("head_commit"))
+            or _clean_optional_string(pull_request_metadata.get("worktree_head")),
+            force=True,
+        )
         result = self._pull_request_result_from_metadata(
             issue,
             pull_request_metadata,
@@ -490,8 +494,10 @@ class WorkspaceManager:
             self._ensure_clean_repo(info.source_root, "source repo")
         except WorkspaceError as exc:
             return _merge_recovery_blocked(str(exc))
-        if not self._git_check(info.source_root, "rev-parse", "--verify", branch):
-            return _merge_recovery_blocked(f"Target branch does not exist in source repo: {branch}")
+        try:
+            branch = self._validate_local_target_branch(info.source_root, branch)
+        except WorkspaceError as exc:
+            return _merge_recovery_blocked(str(exc))
 
         conflict_files = tuple(
             line
@@ -571,8 +577,11 @@ class WorkspaceManager:
         if preflight.status == "conflicts":
             return WorkspaceMergeResult(
                 status="conflicts",
-                summary=f"Merge conflicts require AI resolution before finalizing issue {issue.id} into {branch}.",
-                target_branch=branch,
+                summary=(
+                    "Merge conflicts require AI resolution before finalizing "
+                    f"issue {issue.id} into {preflight.target_branch}."
+                ),
+                target_branch=preflight.target_branch,
                 worktree_head=preflight.worktree_head,
                 merge_commit=None,
                 worktree_commit=preflight.worktree_commit,
@@ -601,8 +610,7 @@ class WorkspaceManager:
         branch: str,
     ) -> _MergePreflightResult:
         self._ensure_clean_repo(info.source_root, "source repo")
-        if not self._git_check(info.source_root, "rev-parse", "--verify", branch):
-            raise WorkspaceError(f"Target branch does not exist in source repo: {branch}")
+        branch = self._validate_local_target_branch(info.source_root, branch)
         worktree_commit = self._commit_dirty_worktree(issue, info)
         self._ensure_clean_repo(info.worktree_root, "issue worktree")
         worktree_head = self._git(info.worktree_root, "rev-parse", "HEAD")
@@ -611,8 +619,8 @@ class WorkspaceManager:
                 f"Worktree has no commits beyond source HEAD {info.source_head[:12]}; nothing can be merged."
             )
 
-        merge_branch = f"agent-team/issue-{issue.id}-merge"
-        self._git(info.worktree_root, "checkout", "-B", merge_branch, worktree_head)
+        merge_branch = self._merge_branch_name(issue.id, worktree_head)
+        self._checkout_internal_merge_branch(info, merge_branch, worktree_head)
 
         if not self._git_check(info.worktree_root, "merge-base", "--is-ancestor", branch, "HEAD"):
             try:
@@ -698,14 +706,14 @@ class WorkspaceManager:
             "merged_at": utc_now_iso(),
             "worktree_head": integrated_head,
             "worktree_commit": preflight.worktree_commit,
+            "merge_branch": merge_branch,
         }
         self.artifacts.write_merged_workspace_metadata(issue.id, merged_metadata)
         self._git(info.source_root, "worktree", "remove", str(info.worktree_root))
         merged_metadata["cleanup_removed"] = True
         self.artifacts.write_merged_workspace_metadata(issue.id, merged_metadata)
         self.artifacts.delete_workspace_metadata(issue.id)
-        if self._git_check(info.source_root, "rev-parse", "--verify", merge_branch):
-            self._git(info.source_root, "branch", "-d", merge_branch)
+        self._delete_internal_merge_branch(issue.id, info.source_root, merge_branch, integrated_head, force=False)
         return WorkspaceMergeResult(
             status="merged",
             summary=f"Merged issue {issue.id} worktree into {branch} at {merge_commit[:12]}.",
@@ -758,9 +766,79 @@ class WorkspaceManager:
         metadata["cleanup_removed"] = True
         self.artifacts.write_pull_request_metadata(issue.id, metadata)
         self.artifacts.delete_workspace_metadata(issue.id)
-        if self._git_check(info.source_root, "rev-parse", "--verify", preflight.merge_branch):
-            self._git(info.source_root, "branch", "-D", preflight.merge_branch)
+        self._delete_internal_merge_branch(
+            issue.id,
+            info.source_root,
+            preflight.merge_branch,
+            integrated_head,
+            force=True,
+        )
         return self._pull_request_result_from_metadata(issue, metadata)
+
+    def _validate_local_target_branch(self, source_root: Path, branch: str) -> str:
+        target = _clean_optional_string(branch)
+        if target is None:
+            raise WorkspaceError("Target branch is empty.")
+        if target == "HEAD" or target.startswith("refs/") or "@{" in target:
+            raise WorkspaceError(
+                f"Target branch must be an existing local branch name, not a revision or full ref: {target}"
+            )
+        if not self._git_check(source_root, "check-ref-format", "--branch", target):
+            raise WorkspaceError(f"Target branch is not a valid local branch name: {target}")
+        if not self._git_check(source_root, "show-ref", "--verify", "--quiet", f"refs/heads/{target}"):
+            raise WorkspaceError(f"Target branch is not an existing local branch in source repo: {target}")
+        return target
+
+    @staticmethod
+    def _merge_branch_name(issue_id: int, worktree_head: str) -> str:
+        return f"agent-team/issue-{issue_id}-merge-{worktree_head[:12]}"
+
+    def _checkout_internal_merge_branch(
+        self,
+        info: WorkspaceInfo,
+        merge_branch: str,
+        worktree_head: str,
+    ) -> None:
+        ref = f"refs/heads/{merge_branch}"
+        if self._git_check(info.source_root, "show-ref", "--verify", "--quiet", ref):
+            existing_head = self._git(info.source_root, "rev-parse", ref)
+            if existing_head != worktree_head:
+                raise WorkspaceError(
+                    f"Internal merge branch '{merge_branch}' already exists at {existing_head[:12]}, "
+                    f"not prepared worktree head {worktree_head[:12]}. Refusing to reset it."
+                )
+            self._git(info.worktree_root, "checkout", merge_branch)
+            return
+        self._git(info.worktree_root, "checkout", "-b", merge_branch, worktree_head)
+
+    def _delete_internal_merge_branch(
+        self,
+        issue_id: int,
+        source_root: Path,
+        merge_branch: str | None,
+        expected_head: str | None,
+        *,
+        force: bool,
+    ) -> None:
+        if (
+            merge_branch is None
+            or expected_head is None
+            or not source_root.is_dir()
+            or not self._is_internal_merge_branch(issue_id, merge_branch)
+        ):
+            return
+        ref = f"refs/heads/{merge_branch}"
+        if not self._git_check(source_root, "show-ref", "--verify", "--quiet", ref):
+            return
+        if self._git(source_root, "rev-parse", ref) != expected_head:
+            return
+        self._git(source_root, "branch", "-D" if force else "-d", merge_branch)
+
+    @staticmethod
+    def _is_internal_merge_branch(issue_id: int, merge_branch: str) -> bool:
+        prefix = f"agent-team/issue-{issue_id}-merge-"
+        suffix = merge_branch[len(prefix) :] if merge_branch.startswith(prefix) else ""
+        return bool(re.fullmatch(r"[0-9a-f]{12}", suffix))
 
     def _select_finalization_mode(
         self,
