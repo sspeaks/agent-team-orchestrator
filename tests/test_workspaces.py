@@ -499,6 +499,19 @@ class WorkspaceManagerTests(unittest.TestCase):
         with self.assertRaisesRegex(WorkspaceError, "push URL does not resolve to a supported"):
             self.manager._select_finalization_mode(info, "pull_request", "origin")
 
+    def test_pull_request_remote_blocks_credential_bearing_push_url(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._git(self.repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
+        self._git(self.repo, "remote", "set-url", "--push", "origin", "https://token:secret@github.com/owner/repo.git")
+
+        with self.assertRaisesRegex(WorkspaceError, "push URL embeds credentials") as caught:
+            self.manager._select_finalization_mode(info, "pull_request", "origin")
+
+        message = str(caught.exception)
+        self.assertNotIn("token:secret", message)
+        self.assertNotIn("secret@github.com", message)
+
     def test_push_pull_request_branch_uses_validated_push_url_directly(self) -> None:
         bare_remote = self.home / "validated-push.git"
         self._git(bare_remote.parent, "init", "--bare", str(bare_remote))
@@ -523,18 +536,20 @@ class WorkspaceManagerTests(unittest.TestCase):
             head,
         )
 
-    def test_remote_branch_probe_redacts_credentials_in_git_errors(self) -> None:
-        with self.assertRaises(WorkspaceError) as caught:
-            self.manager._remote_branch_head(
-                self.repo,
-                "https://token:secret@127.0.0.1:1/owner/repo.git",
-                "agent-team/issue-1",
-            )
+    def test_remote_branch_probe_rejects_credential_bearing_url_before_git(self) -> None:
+        with patch("agent_team.workspaces.subprocess.run") as run:
+            with self.assertRaisesRegex(WorkspaceError, "credential-bearing HTTPS remote URL") as caught:
+                self.manager._remote_branch_head(
+                    self.repo,
+                    "https://token:secret@github.com/owner/repo.git",
+                    "agent-team/issue-1",
+                )
 
+        run.assert_not_called()
         message = str(caught.exception)
-        self.assertIn("https://[redacted]@127.0.0.1", message)
+        self.assertIn("Refusing to pass a credential-bearing HTTPS remote URL", message)
         self.assertNotIn("token:secret", message)
-        self.assertNotIn("secret@127.0.0.1", message)
+        self.assertNotIn("secret@github.com", message)
 
     def test_auto_unsupported_remote_blocks_instead_of_local_merge(self) -> None:
         self._git(self.repo, "remote", "add", "origin", "https://example.com/owner/repo.git")

@@ -1656,6 +1656,23 @@ setTimeout(() => {{
         self.assertIsNotNone(request)
         self.assertEqual(request["target_branch"], "main")
         self.assertEqual(request["message"], "merge approved")
+        self.assertEqual(request["mode"], "auto")
+
+    def test_approve_merge_action_defaults_to_configured_merge_mode(self) -> None:
+        self.app.config = replace(self.app.config, merge_mode="local")
+        issue = self.store.create_issue("merge issue", "desc")
+        self._move_to_merge_approval(issue.id)
+
+        self.post(
+            f"/issues/{issue.id}/actions/approve-merge",
+            {"branch": "main", "message": "merge approved"},
+        )
+
+        self.assertEqual(self.store.get_issue(issue.id).phase, "ready_for_merge")
+        request = self.artifacts.read_merge_request(issue.id)
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertEqual(request["mode"], "local")
 
     def test_approve_merge_rejects_wrong_phase(self) -> None:
         issue = self.store.create_issue("not ready", "desc")
@@ -1730,7 +1747,21 @@ setTimeout(() => {{
         self.assertIn("/actions/approve-merge", html)
         self.assertIn("Target branch", html)
         self.assertIn('value="main"', html)
+        self.assertIn("Finalization mode", html)
+        self.assertIn('<option value="auto" selected>', html)
+        self.assertIn("PR remote (optional)", html)
         self.assertIn("Approve merge", html)
+
+    def test_issue_detail_approve_merge_form_defaults_to_configured_mode_and_remote(self) -> None:
+        self.app.config = replace(self.app.config, merge_mode="local", pr_remote="upstream")
+        issue = self.store.create_issue("merge form issue", "desc")
+        self._move_to_merge_approval(issue.id)
+        self.artifacts.write_workspace_metadata(issue.id, {"source_branch": "main"})
+
+        html = self.get(f"/issues/{issue.id}")
+
+        self.assertIn('<option value="local" selected>', html)
+        self.assertIn('name="remote" value="upstream"', html)
 
     def test_post_requires_csrf_token(self) -> None:
         with self.assertRaises(urllib.error.HTTPError) as caught:

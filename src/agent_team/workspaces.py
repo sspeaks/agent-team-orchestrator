@@ -812,6 +812,12 @@ class WorkspaceManager:
         return None
 
     def _validate_pull_request_push_url(self, remote: PullRequestRemote, push_url: str) -> None:
+        if _remote_url_embeds_credentials(push_url):
+            raise WorkspaceError(
+                f"Remote '{remote.remote_name}' push URL embeds credentials. Refusing to pass "
+                "credential-bearing HTTPS URLs to git; use a Git credential helper, an authenticated SSH remote, "
+                "or approve with --mode local to merge locally instead."
+            )
         push_remote = parse_pull_request_remote(remote.remote_name, push_url)
         if push_remote is None:
             raise WorkspaceError(
@@ -869,8 +875,13 @@ class WorkspaceManager:
         )
         self._git(info.source_root, *push_args)
 
-    def _remote_branch_head(self, source_root: Path, remote_name: str, branch: str) -> str | None:
-        output = self._git(source_root, "ls-remote", "--heads", remote_name, branch)
+    def _remote_branch_head(self, source_root: Path, remote_ref: str, branch: str) -> str | None:
+        if _remote_url_embeds_credentials(remote_ref):
+            raise WorkspaceError(
+                "Refusing to pass a credential-bearing HTTPS remote URL to git. Use a Git credential helper "
+                "or an authenticated SSH remote instead."
+            )
+        output = self._git(source_root, "ls-remote", "--heads", remote_ref, branch)
         for line in output.splitlines():
             parts = line.split()
             if len(parts) >= 2 and parts[1] == f"refs/heads/{branch}":
@@ -1723,6 +1734,16 @@ def _redact_remote_url(value: str) -> str:
         port = None
     netloc = f"{host}:{port}" if port is not None else host
     return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+
+
+def _remote_url_embeds_credentials(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return False
+    return parsed.username is not None or parsed.password is not None
 
 
 _CREDENTIAL_URL_RE = re.compile(r"\b(https?://)([^/\s:@]+(?::[^/\s@]*)?@)", re.IGNORECASE)

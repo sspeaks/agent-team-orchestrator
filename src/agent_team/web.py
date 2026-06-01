@@ -329,7 +329,7 @@ class AgentTeamWebApp:
                         f"Issue {issue.id} is in phase {issue.phase!r}, not 'awaiting_merge_approval'",
                     )
                 branch = form.get("branch", "").strip() or None
-                mode = form.get("mode", "auto").strip().lower().replace("-", "_")
+                mode = (form.get("mode", "").strip() or self.config.merge_mode).lower().replace("-", "_")
                 if mode not in {"auto", "local", "pull_request"}:
                     raise WebError(HTTPStatus.BAD_REQUEST, "merge mode must be auto, local, or pull-request")
                 remote = form.get("remote", "").strip() or None
@@ -763,7 +763,7 @@ class AgentTeamWebApp:
                 workspace_metadata,
             )
             merge_request = self.artifacts.read_merge_request(issue.id)
-            mode_hint = str((merge_request or {}).get("mode") or "auto").replace("_", "-")
+            mode_hint = str((merge_request or {}).get("mode") or self.config.merge_mode).replace("_", "-")
             remote_hint = str((merge_request or {}).get("remote_name") or self.config.pr_remote or "")
             vscode_uri = _vscode_workspace_uri(
                 workspace_metadata.get("workspace_repo_path") if workspace_metadata else None,

@@ -111,8 +111,8 @@ def build_parser() -> argparse.ArgumentParser:
     approve_merge.add_argument(
         "--mode",
         choices=["auto", "local", "pull-request"],
-        default="auto",
-        help="Finalize locally, by pull request, or auto-select based on remotes.",
+        default=None,
+        help="Finalize locally, by pull request, or auto-select based on remotes. Defaults to AGENT_TEAM_MERGE_MODE.",
     )
     approve_merge.add_argument("--remote", help="Optional remote name to use for pull-request mode.")
     approve_merge.add_argument("--message", default="Human approved worktree merge and cleanup")
@@ -316,7 +316,7 @@ def handle_issue(
         if issue.phase != "awaiting_merge_approval":
             raise ValueError(f"Issue {issue.id} is in phase {issue.phase!r}, not 'awaiting_merge_approval'")
         branch = args.branch.strip() if args.branch else None
-        mode = _merge_mode_arg(args.mode)
+        mode = _merge_mode_arg(args.mode) if args.mode else (config.merge_mode if config else "auto")
         remote = args.remote.strip() if args.remote else None
         message = args.message.strip() or "Human approved worktree merge and cleanup"
         artifacts.write_merge_request(issue.id, target_branch=branch, message=message, mode=mode, remote_name=remote)
