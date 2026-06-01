@@ -1482,6 +1482,15 @@ setTimeout(() => {{
             self.assertEqual(response.headers.get("Cache-Control"), "no-store")
             self.assertEqual(response.headers.get("X-Content-Type-Options"), "nosniff")
         self.assertIn(".danger-zone", styles)
+        self.assertIn(".diagnostics-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr));", styles)
+        self.assertIn(".diagnostics-grid > * { min-width: 0; }", styles)
+        self.assertIn(".diagnostics [data-dashboard-list] { max-width: 100%; overflow-x: auto; }", styles)
+        self.assertIn(".diagnostics table { table-layout: fixed; }", styles)
+        self.assertIn(
+            ".diagnostics th, .diagnostics td, .diagnostics code, .diagnostics .muted { overflow-wrap: anywhere; }",
+            styles,
+        )
+        self.assertIn(".diagnostics code { white-space: normal; }", styles)
         self.assertIn('<link rel="stylesheet" href="/static/styles.css">', self.get("/"))
 
         issue = self.store.create_issue("job api issue", "desc", ready=True)
