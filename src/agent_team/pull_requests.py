@@ -84,7 +84,9 @@ class SubprocessCommandRunner:
         )
 
 
-AZURE_DEVOPS_DESCRIPTION_MAX_BYTES = 24_000
+_AZURE_DEVOPS_SAFE_DESCRIPTION = (
+    "Created by agent-team orchestrator. Full implementation context remains in local agent-team artifacts."
+)
 _COMMAND_OUTPUT_MAX_CHARS = 2_000
 _GITHUB_SCP_RE = re.compile(r"^git@github\.com:(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$")
 _ADO_SCP_RE = re.compile(
@@ -307,8 +309,6 @@ def _ado_create_or_get(
     if existing is not None:
         return _ado_result(remote, request, existing, is_existing=True)
 
-    description = _description(request)
-    _ensure_ado_description_size(description)
     created = runner.run(
         [
             "az",
@@ -328,7 +328,7 @@ def _ado_create_or_get(
             "--title",
             request.title,
             "--description",
-            description,
+            _AZURE_DEVOPS_SAFE_DESCRIPTION,
             "--output",
             "json",
         ]
@@ -447,25 +447,6 @@ def _ado_branch(branch: str) -> str:
 def _strip_heads(branch: str) -> str:
     prefix = "refs/heads/"
     return branch[len(prefix) :] if branch.startswith(prefix) else branch
-
-
-def _description(request: PullRequestRequest) -> str:
-    if request.description:
-        return request.description
-    if request.body_path is None:
-        return ""
-    return Path(request.body_path).read_text(encoding="utf-8")
-
-
-def _ensure_ado_description_size(description: str) -> None:
-    size = len(description.encode("utf-8"))
-    if size <= AZURE_DEVOPS_DESCRIPTION_MAX_BYTES:
-        return
-    raise PullRequestError(
-        "Azure DevOps pull request descriptions are passed to 'az repos pr create' as a command-line "
-        f"argument and must be at most {AZURE_DEVOPS_DESCRIPTION_MAX_BYTES} bytes; got {size} bytes. "
-        "Shorten the issue description or PR body before retrying."
-    )
 
 
 def _ensure_success(command: str, result: CommandResult, hint: str) -> None:

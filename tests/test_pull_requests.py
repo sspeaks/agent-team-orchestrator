@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
 from collections.abc import Sequence
 from pathlib import Path
 from unittest.mock import patch
 
 from agent_team.pull_requests import (
-    AZURE_DEVOPS_DESCRIPTION_MAX_BYTES,
     CommandResult,
     PullRequestError,
     PullRequestRemote,
@@ -314,12 +314,7 @@ class PullRequestProviderTests(unittest.TestCase):
     def test_azure_devops_create_pull_request(self) -> None:
         remote = parse_pull_request_remote("origin", "ssh://git@ssh.dev.azure.com/v3/org/project/repo")
         assert remote is not None
-        request = PullRequestRequest(
-            source_branch="feature",
-            target_branch="main",
-            title="Add feature",
-            description="Body text",
-        )
+        sensitive_body = "Body text with token=do-not-leak"
         runner = FakeRunner(
             [
                 command_result([]),
@@ -341,13 +336,31 @@ class PullRequestProviderTests(unittest.TestCase):
             ]
         )
 
-        result = create_or_get_pull_request(remote, request, runner)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            body_path = Path(temp_dir) / "body.md"
+            body_path.write_text(sensitive_body, encoding="utf-8")
+            request = PullRequestRequest(
+                source_branch="feature",
+                target_branch="main",
+                title="Add feature",
+                body_path=body_path,
+                description="Merge approval secret=do-not-leak",
+            )
+
+            result = create_or_get_pull_request(remote, request, runner)
 
         self.assertFalse(result.is_existing)
         self.assertEqual(result.number, 18)
         self.assertEqual(result.url, "https://dev.azure.com/org/project/_git/repo/pullrequest/18")
+        create_args = runner.calls[1]
+        description = create_args[create_args.index("--description") + 1]
+        self.assertIn("agent-team orchestrator", description)
+        self.assertNotIn("Body text", description)
+        self.assertNotIn("secret=do-not-leak", description)
+        self.assertFalse(any(sensitive_body in arg for arg in create_args))
+        self.assertFalse(any("secret=do-not-leak" in arg for arg in create_args))
         self.assertEqual(
-            runner.calls[1],
+            create_args,
             (
                 "az",
                 "repos",
@@ -366,26 +379,52 @@ class PullRequestProviderTests(unittest.TestCase):
                 "--title",
                 "Add feature",
                 "--description",
-                "Body text",
+                "Created by agent-team orchestrator. Full implementation context remains in local agent-team artifacts.",
                 "--output",
                 "json",
             ),
         )
 
-    def test_azure_devops_rejects_oversized_description_before_create(self) -> None:
+    def test_azure_devops_does_not_read_or_pass_oversized_body(self) -> None:
         remote = parse_pull_request_remote("origin", "https://dev.azure.com/org/project/_git/repo")
         assert remote is not None
-        request = PullRequestRequest(
-            source_branch="feature",
-            target_branch="main",
-            title="Add feature",
-            description="x" * (AZURE_DEVOPS_DESCRIPTION_MAX_BYTES + 1),
+        runner = FakeRunner(
+            [
+                command_result([]),
+                command_result(
+                    {
+                        "pullRequestId": 18,
+                        "_links": {
+                            "web": {
+                                "href": "https://dev.azure.com/org/project/_git/repo/pullrequest/18",
+                            },
+                        },
+                        "title": "Add feature",
+                        "status": "active",
+                        "sourceRefName": "refs/heads/feature",
+                        "targetRefName": "refs/heads/main",
+                    }
+                ),
+            ]
         )
-        runner = FakeRunner([command_result([])])
 
-        with self.assertRaisesRegex(PullRequestError, "must be at most"):
-            create_or_get_pull_request(remote, request, runner)
-        self.assertEqual(len(runner.calls), 1)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            body_path = Path(temp_dir) / "body.md"
+            body_path.write_text("sensitive " + ("x" * 50_000), encoding="utf-8")
+            result = create_or_get_pull_request(
+                remote,
+                PullRequestRequest(
+                    source_branch="feature",
+                    target_branch="main",
+                    title="Add feature",
+                    body_path=body_path,
+                ),
+                runner,
+            )
+
+        self.assertFalse(result.is_existing)
+        self.assertEqual(len(runner.calls), 2)
+        self.assertFalse(any("sensitive" in arg or "x" * 100 in arg for call in runner.calls for arg in call))
 
     def test_cli_failure_surfaces_actionable_error(self) -> None:
         remote = parse_pull_request_remote("origin", "https://github.com/owner/repo.git")

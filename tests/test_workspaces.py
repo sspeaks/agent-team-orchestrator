@@ -536,6 +536,86 @@ class WorkspaceManagerTests(unittest.TestCase):
             head,
         )
 
+    def test_push_pull_request_branch_skips_existing_matching_remote_head(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        selected_remote = _SelectedRemote(
+            remote=PullRequestRemote(
+                provider="github",
+                remote_name="origin",
+                url="https://github.com/owner/repo.git",
+                repo="repo",
+                owner="owner",
+            ),
+            push_url="https://github.com/owner/repo.git",
+        )
+        head = self._git(info.worktree_root, "rev-parse", "HEAD")
+
+        with patch.object(self.manager, "_remote_branch_head", return_value=head):
+            with patch.object(self.manager, "_git", wraps=self.manager._git) as git:
+                self.manager._push_pull_request_branch(issue, info, selected_remote, "agent-team/issue-1", head)
+
+        git.assert_not_called()
+
+    def test_push_pull_request_branch_blocks_remote_collision_without_metadata(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        selected_remote = _SelectedRemote(
+            remote=PullRequestRemote(
+                provider="github",
+                remote_name="origin",
+                url="https://github.com/owner/repo.git",
+                repo="repo",
+                owner="owner",
+            ),
+            push_url="https://github.com/owner/repo.git",
+        )
+        source_branch = "agent-team/issue-1"
+        existing_remote_head = self._git(self.repo, "rev-parse", "HEAD")
+        integrated_head = self._git(info.worktree_root, "rev-parse", "HEAD")
+
+        with patch.object(self.manager, "_remote_branch_head", return_value=existing_remote_head):
+            with self.assertRaisesRegex(WorkspaceError, "Refusing to overwrite it without existing pull_request.json"):
+                self.manager._push_pull_request_branch(issue, info, selected_remote, source_branch, integrated_head)
+
+    def test_push_pull_request_branch_uses_force_with_lease_for_owned_retry(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        selected_remote = _SelectedRemote(
+            remote=PullRequestRemote(
+                provider="github",
+                remote_name="origin",
+                url="https://github.com/owner/repo.git",
+                repo="repo",
+                owner="owner",
+            ),
+            push_url="https://github.com/owner/repo.git",
+        )
+        source_branch = "agent-team/issue-1"
+        existing_remote_head = self._git(self.repo, "rev-parse", "HEAD")
+        integrated_head = self._git(info.worktree_root, "rev-parse", "HEAD")
+        self.artifacts.write_pull_request_metadata(
+            issue.id,
+            {
+                "remote_name": "origin",
+                "source_branch": source_branch,
+            },
+        )
+
+        with patch.object(self.manager, "_remote_branch_head", return_value=existing_remote_head):
+            with patch.object(self.manager, "_git", return_value="") as git:
+                self.manager._push_pull_request_branch(issue, info, selected_remote, source_branch, integrated_head)
+
+        git.assert_called_once_with(
+            info.source_root,
+            "push",
+            f"--force-with-lease=refs/heads/{source_branch}:{existing_remote_head}",
+            "https://github.com/owner/repo.git",
+            f"{integrated_head}:refs/heads/{source_branch}",
+        )
+
     def test_remote_branch_probe_rejects_credential_bearing_url_before_git(self) -> None:
         with patch("agent_team.workspaces.subprocess.run") as run:
             with self.assertRaisesRegex(WorkspaceError, "credential-bearing HTTPS remote URL") as caught:

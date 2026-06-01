@@ -27,6 +27,7 @@ from agent_team.lifecycle import delete_issue, reset_issue_to_draft
 from agent_team.locks import make_lock_owner
 from agent_team.models import AgentResult, HumanInputRequestDraft, Issue
 from agent_team.orchestrator import Orchestrator, ProcessResult
+from agent_team.pull_requests import PullRequestResult
 from agent_team.runners.base import AgentRunner
 from agent_team.worker import process_batch, run_worker_loop
 from agent_team.workspaces import WorkspaceManager, WorkspaceMergeRecovery
@@ -2645,6 +2646,77 @@ class StoreAndWorkerTests(unittest.TestCase):
         self.assertTrue(self.artifacts.merged_workspace_metadata_path(issue.id).is_file())
         runs = self.store.list_runs(issue.id)
         self.assertEqual(runs[-1]["runner"], "workspace-merge")
+
+    @unittest.skipUnless(shutil.which("git"), "git is required for workspace tests")
+    def test_merge_phase_pull_request_mode_opens_pr_and_closes_issue(self) -> None:
+        repo = self._create_repo("source")
+        self._git(repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
+        target_branch = self._git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+        source_head = self._git(repo, "rev-parse", "HEAD")
+        issue = self.store.create_issue("merge title", "sensitive token=do-not-leak", repo_path=str(repo))
+        info = WorkspaceManager(self.config.worktrees_dir, self.artifacts, self.config.locks_dir).prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        self._move_to_merge_approval(issue.id)
+        self.artifacts.write_merge_request(
+            issue.id,
+            target_branch=None,
+            message="approved with secret=do-not-leak",
+            mode="pull_request",
+            remote_name="origin",
+        )
+        self.store.transition_issue(issue.id, "ready_for_merge", message="approved")
+        pr_result = PullRequestResult(
+            provider="github",
+            remote_name="origin",
+            source_branch=f"agent-team/issue-{issue.id}",
+            target_branch=target_branch,
+            title=f"Issue {issue.id}: merge title",
+            url="https://github.com/owner/repo/pull/7",
+            id="7",
+            number=7,
+            status="OPEN",
+            is_existing=False,
+            raw={"number": 7},
+        )
+
+        with patch.object(WorkspaceManager, "_push_pull_request_branch") as push_branch:
+            with patch("agent_team.workspaces.create_or_get_pull_request", return_value=pr_result) as create_pr:
+                result = Orchestrator(self.store, self.artifacts, self.config).process_next()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.phase, "merge")
+        self.assertEqual(result.status, "success")
+        self.assertEqual(result.next_phase, "done")
+        self.assertEqual(
+            result.summary,
+            f"Opened pull request for issue {issue.id} into {target_branch}: https://github.com/owner/repo/pull/7",
+        )
+        self.assertEqual(self.store.get_issue(issue.id).phase, "done")
+        self.assertEqual(self._git(repo, "rev-parse", "HEAD"), source_head)
+        self.assertFalse((repo / "feature.txt").exists())
+        self.assertFalse(info.worktree_root.exists())
+        push_branch.assert_called_once()
+        self.assertEqual(push_branch.call_args.args[3], f"agent-team/issue-{issue.id}")
+        request = create_pr.call_args.args[1]
+        self.assertEqual(request.source_branch, f"agent-team/issue-{issue.id}")
+        self.assertEqual(request.target_branch, target_branch)
+        self.assertIsNotNone(request.body_path)
+        pr_metadata = self.artifacts.read_pull_request_metadata(issue.id)
+        self.assertIsNotNone(pr_metadata)
+        assert pr_metadata is not None
+        self.assertTrue(pr_metadata["cleanup_removed"])
+        self.assertEqual(pr_metadata["url"], "https://github.com/owner/repo/pull/7")
+        self.assertEqual(pr_metadata["provider"], "github")
+        self.assertEqual(pr_metadata["remote_name"], "origin")
+        self.assertEqual(pr_metadata["source_branch"], f"agent-team/issue-{issue.id}")
+        self.assertIsNone(self.artifacts.read_workspace_metadata(issue.id))
+        self.assertFalse(self.artifacts.merged_workspace_metadata_path(issue.id).exists())
+        merge_artifact = (self.config.artifacts_dir / str(issue.id) / "merge.md").read_text(encoding="utf-8")
+        self.assertIn("- Status: `pull_request`", merge_artifact)
+        self.assertIn("Pull request URL: https://github.com/owner/repo/pull/7", merge_artifact)
+        runs = self.store.list_runs(issue.id)
+        self.assertEqual(runs[-1]["runner"], "workspace-merge")
+        self.assertEqual(runs[-1]["status"], "success")
 
     @unittest.skipUnless(shutil.which("git"), "git is required for workspace tests")
     def test_merge_phase_commits_uncommitted_workspace_changes(self) -> None:
