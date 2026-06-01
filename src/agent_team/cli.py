@@ -18,7 +18,7 @@ from .worker import process_batch, run_worker_loop
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    config = load_config()
+    config = load_config(args.config)
     ensure_home(config)
     store = IssueStore(config.db_path)
     store.init_schema()
@@ -39,20 +39,26 @@ def main(argv: list[str] | None = None) -> int:
         print(render_dashboard(store))
         return 0
     if args.command == "web":
+        host = _string_setting(args.host, config.web_host)
+        port = _int_setting(args.port, config.web_port)
         web_workers = _positive_setting(args.web_workers, config.web_workers)
-        return serve_web(config, args.host, args.port, web_workers, args.unsafe_allow_remote)
+        unsafe_allow_remote = _bool_setting(args.unsafe_allow_remote, config.web_unsafe_allow_remote)
+        return serve_web(config, host, port, web_workers, unsafe_allow_remote)
     if args.command == "serve":
+        host = _string_setting(args.host, config.web_host)
+        port = _int_setting(args.port, config.web_port)
         web_workers = _positive_setting(args.web_workers, config.web_workers)
         worker_concurrency = _positive_setting(args.worker_concurrency, config.worker_concurrency)
         interval_seconds = _non_negative_setting(args.interval, config.worker_interval_seconds)
+        unsafe_allow_remote = _bool_setting(args.unsafe_allow_remote, config.web_unsafe_allow_remote)
         return serve_web_and_worker(
             config,
-            host=args.host,
-            port=args.port,
+            host=host,
+            port=port,
             web_workers=web_workers,
             worker_concurrency=worker_concurrency,
             interval_seconds=interval_seconds,
-            unsafe_allow_remote=args.unsafe_allow_remote,
+            unsafe_allow_remote=unsafe_allow_remote,
         )
 
     parser.print_help()
@@ -61,6 +67,10 @@ def main(argv: list[str] | None = None) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agent-team")
+    parser.add_argument(
+        "--config",
+        help="Path to a JSONC config file. Must appear before the subcommand.",
+    )
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("init")
 
@@ -148,8 +158,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("dashboard")
 
     web = sub.add_parser("web")
-    web.add_argument("--host", default="127.0.0.1")
-    web.add_argument("--port", type=int, default=8765)
+    web.add_argument("--host", default=None)
+    web.add_argument("--port", type=int, default=None)
     web.add_argument(
         "--web-workers",
         "--workers",
@@ -158,15 +168,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Maximum queued web background jobs. --workers is kept as a compatibility alias.",
     )
-    web.add_argument(
-        "--unsafe-allow-remote",
-        action="store_true",
-        help="Allow binding the unauthenticated web UI to a non-loopback address.",
-    )
+    _add_unsafe_allow_remote_argument(web)
 
     serve = sub.add_parser("serve", help="Run the web UI and continuous ready-queue worker together.")
-    serve.add_argument("--host", default="127.0.0.1")
-    serve.add_argument("--port", type=int, default=8765)
+    serve.add_argument("--host", default=None)
+    serve.add_argument("--port", type=int, default=None)
     serve.add_argument(
         "--web-workers",
         type=int,
@@ -180,11 +186,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum autonomous ready-queue issue runs.",
     )
     serve.add_argument("--interval", type=int, default=None, help="Seconds to sleep between idle worker batches.")
-    serve.add_argument(
-        "--unsafe-allow-remote",
-        action="store_true",
-        help="Allow binding the unauthenticated web UI to a non-loopback address.",
-    )
+    _add_unsafe_allow_remote_argument(serve)
 
     worker = sub.add_parser("worker")
     worker_sub = worker.add_subparsers(dest="worker_command", required=True)
@@ -390,6 +392,34 @@ def _positive_setting(value: int | None, default: int) -> int:
 
 def _non_negative_setting(value: int | None, default: int) -> int:
     return max(0, default if value is None else value)
+
+
+def _string_setting(value: str | None, default: str) -> str:
+    return default if value is None else value
+
+
+def _int_setting(value: int | None, default: int) -> int:
+    return default if value is None else value
+
+
+def _bool_setting(value: bool | None, default: bool) -> bool:
+    return default if value is None else value
+
+
+def _add_unsafe_allow_remote_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--unsafe-allow-remote",
+        dest="unsafe_allow_remote",
+        action="store_true",
+        default=None,
+        help="Allow binding the unauthenticated web UI to a non-loopback address.",
+    )
+    parser.add_argument(
+        "--no-unsafe-allow-remote",
+        dest="unsafe_allow_remote",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
 
 
 def read_description(description: str | None, description_file: str | None) -> str:

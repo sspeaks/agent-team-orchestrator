@@ -1,13 +1,243 @@
+from __future__ import annotations
+
 import os
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 from unittest.mock import patch
 
 from agent_team.config import AppConfig, ensure_home, load_config
 
 
 class ConfigTests(unittest.TestCase):
+    @contextmanager
+    def _cwd(self, path: Path) -> Iterator[None]:
+        previous = Path.cwd()
+        os.chdir(path)
+        try:
+            yield
+        finally:
+            os.chdir(previous)
+
+    def _write_config(self, directory: str | Path, content: str, name: str = "agent-team.config.jsonc") -> Path:
+        path = Path(directory) / name
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def test_explicit_jsonc_config_loads_comments_and_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_config(
+                tmp,
+                """
+                {
+                  // Line comments are ignored.
+                  "home": "~/agent-team-jsonc-home",
+                  "worktrees_dir": "~/agent-team-jsonc-worktrees",
+                  "runner": "dry-run",
+                  "runner_timeout_seconds": 2400,
+                  "lock_ttl_seconds": 120,
+                  "copilot": {
+                    "command": "copilot-dev",
+                    "permission_mode": "yolo",
+                    "plugin_dir": "~/agent-team-jsonc-plugin",
+                    "available_tools": ["read", "edit"],
+                    "excluded_tools": "web_search",
+                    "allow_tool": "shell(npm test)",
+                    "deny_tool": "shell(git push)",
+                    "allow_url": "https://example.test/*",
+                    "deny_url": "http://*",
+                    "allow_all_tools": true,
+                    "allow_all_urls": true,
+                    "extra_args": ["--model", "gpt-5.5", "--note=http://example.test//not-comment/*"]
+                  },
+                  "web": {
+                    "host": "127.0.0.2",
+                    "port": 9876,
+                    "web_workers": 2,
+                    "unsafe_allow_remote": true,
+                    "vscode_wsl_distro": ""
+                  },
+                  "worker": {
+                    "worker_concurrency": 3,
+                    "worker_interval_seconds": 0
+                  }
+                }
+                """,
+            )
+
+            with patch.dict(os.environ, {}, clear=True):
+                config = load_config(path)
+
+        self.assertEqual(config.home, Path("~/agent-team-jsonc-home").expanduser())
+        self.assertEqual(config.worktrees_dir, Path("~/agent-team-jsonc-worktrees").expanduser())
+        self.assertEqual(config.runner, "dry-run")
+        self.assertEqual(config.runner_timeout_seconds, 2400)
+        self.assertEqual(config.lock_ttl_seconds, 120)
+        self.assertEqual(config.copilot_command, "copilot-dev")
+        self.assertEqual(config.copilot_permission_mode, "yolo")
+        self.assertEqual(config.copilot_plugin_dir, Path("~/agent-team-jsonc-plugin").expanduser())
+        self.assertEqual(
+            config.copilot_args,
+            (
+                "--available-tools=read,edit",
+                "--excluded-tools=web_search",
+                "--allow-tool=shell(npm test)",
+                "--deny-tool=shell(git push)",
+                "--allow-url=https://example.test/*",
+                "--deny-url=http://*",
+                "--allow-all-tools",
+                "--allow-all-urls",
+                "--model",
+                "gpt-5.5",
+                "--note=http://example.test//not-comment/*",
+            ),
+        )
+        self.assertEqual(config.web_host, "127.0.0.2")
+        self.assertEqual(config.web_port, 9876)
+        self.assertEqual(config.web_workers, 2)
+        self.assertTrue(config.web_unsafe_allow_remote)
+        self.assertEqual(config.worker_concurrency, 3)
+        self.assertEqual(config.worker_interval_seconds, 0)
+        self.assertIsNone(config.vscode_wsl_distro)
+
+    def test_default_config_file_is_discovered_in_current_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_config(root, '{"home": "./state", "runner": "dry-run"}')
+            with patch.dict(os.environ, {}, clear=True), self._cwd(root):
+                config = load_config()
+
+        self.assertEqual(config.home, Path("state"))
+        self.assertEqual(config.runner, "dry-run")
+
+    def test_config_file_can_be_selected_with_environment_variable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_config(tmp, '{"runner": "dry-run"}', "selected.jsonc")
+            with patch.dict(os.environ, {"AGENT_TEAM_CONFIG_FILE": str(path)}, clear=True):
+                config = load_config()
+
+        self.assertEqual(config.runner, "dry-run")
+
+    def test_explicit_config_path_takes_precedence_over_environment_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = self._write_config(tmp, '{"runner": "copilot-cli"}', "env.jsonc")
+            explicit_path = self._write_config(tmp, '{"runner": "dry-run"}', "explicit.jsonc")
+            with patch.dict(os.environ, {"AGENT_TEAM_CONFIG_FILE": str(env_path)}, clear=True):
+                config = load_config(explicit_path)
+
+        self.assertEqual(config.runner, "dry-run")
+
+    def test_missing_default_config_file_is_not_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {}, clear=True), self._cwd(Path(tmp)):
+                config = load_config()
+
+        self.assertEqual(config.runner, "copilot-cli")
+
+    def test_missing_explicit_config_file_is_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "missing.jsonc"
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(ValueError, "Config file not found"):
+                    load_config(missing)
+
+    def test_invalid_config_files_are_rejected(self) -> None:
+        cases = (
+            ("invalid.jsonc", "{", "Invalid JSONC"),
+            ("array.jsonc", "[]", "must contain a JSON object"),
+            ("unknown.jsonc", '{"unknown": true}', "Unknown config key 'unknown'"),
+            ("unknown-nested.jsonc", '{"copilot": {"unknown": true}}', "Unknown config key 'copilot.unknown'"),
+            ("bad-section.jsonc", '{"web": []}', "web must be an object"),
+            ("bad-int.jsonc", '{"runner_timeout_seconds": 0}', "runner_timeout_seconds must be at least 1"),
+            ("bad-bool.jsonc", '{"web": {"unsafe_allow_remote": "yes"}}', "unsafe_allow_remote must be a boolean"),
+            ("bad-extra.jsonc", '{"copilot": {"extra_args": [1]}}', "copilot.extra_args"),
+            ("bad-comment.jsonc", '{"runner": "dry-run" /* unterminated', "Unterminated block comment"),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, content, message in cases:
+                with self.subTest(name=name):
+                    path = self._write_config(tmp, content, name)
+                    with patch.dict(os.environ, {}, clear=True):
+                        with self.assertRaisesRegex(ValueError, message):
+                            load_config(path)
+
+    def test_configured_runner_timeout_drives_default_lock_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_config(tmp, '{"runner_timeout_seconds": 2400}')
+            with patch.dict(os.environ, {}, clear=True):
+                config = load_config(path)
+
+        self.assertEqual(config.runner_timeout_seconds, 2400)
+        self.assertEqual(config.lock_ttl_seconds, 2400)
+
+    def test_environment_overrides_config_file_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_config(
+                tmp,
+                """
+                {
+                  "home": "/tmp/file-home",
+                  "runner": "copilot-cli",
+                  "runner_timeout_seconds": 1200,
+                  "copilot": {
+                    "allow_tool": "shell(file-test)",
+                    "allow_all_tools": true,
+                    "extra_args": ["--model", "file-model"]
+                  },
+                  "web": {"web_workers": 2},
+                  "worker": {"worker_concurrency": 2, "worker_interval_seconds": 15}
+                }
+                """,
+            )
+            env = {
+                "AGENT_TEAM_HOME": "/tmp/env-home",
+                "AGENT_TEAM_RUNNER": "dry-run",
+                "AGENT_TEAM_RUNNER_TIMEOUT_SECONDS": "2400",
+                "AGENT_TEAM_COPILOT_ALLOW_TOOL": "shell(env-test)",
+                "AGENT_TEAM_COPILOT_ALLOW_ALL_TOOLS": "false",
+                "AGENT_TEAM_COPILOT_ARGS": "--model env-model",
+                "AGENT_TEAM_WEB_WORKERS": "5",
+                "AGENT_TEAM_WORKER_CONCURRENCY": "6",
+                "AGENT_TEAM_WORKER_INTERVAL_SECONDS": "7",
+            }
+            with patch.dict(os.environ, env, clear=True):
+                config = load_config(path)
+
+        self.assertEqual(config.home, Path("/tmp/env-home"))
+        self.assertEqual(config.runner, "dry-run")
+        self.assertEqual(config.runner_timeout_seconds, 2400)
+        self.assertEqual(config.lock_ttl_seconds, 2400)
+        self.assertEqual(config.web_workers, 5)
+        self.assertEqual(config.worker_concurrency, 6)
+        self.assertEqual(config.worker_interval_seconds, 7)
+        self.assertLess(
+            config.copilot_args.index("--allow-tool=shell(file-test)"),
+            config.copilot_args.index("--allow-tool=shell(env-test)"),
+        )
+        self.assertNotIn("--allow-all-tools", config.copilot_args)
+        self.assertEqual(config.copilot_args[-2:], ("--model", "env-model"))
+
+    def test_config_can_disable_wsl_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_config(tmp, '{"web": {"vscode_wsl_distro": null}}')
+            with patch.dict(os.environ, {"WSL_DISTRO_NAME": "Ubuntu"}, clear=True):
+                config = load_config(path)
+
+        self.assertIsNone(config.vscode_wsl_distro)
+
+    def test_example_config_is_valid_and_actual_config_is_ignored(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        example_path = repo_root / "agent-team.config.example.jsonc"
+        gitignore = (repo_root / ".gitignore").read_text(encoding="utf-8")
+
+        self.assertTrue(example_path.is_file())
+        self.assertIn("/agent-team.config.jsonc", gitignore)
+        with patch.dict(os.environ, {}, clear=True):
+            config = load_config(example_path)
+        self.assertEqual(config.runner, "copilot-cli")
+
     def test_copilot_permission_args_from_env(self) -> None:
         env = {
             "AGENT_TEAM_COPILOT_AVAILABLE_TOOLS": "bash,edit,view",

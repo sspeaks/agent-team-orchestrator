@@ -30,8 +30,11 @@ PYTHONPATH=src python3 -m agent_team.cli init
 
 ## Quick start
 
+Start from a local config file and uncomment only the values you need:
+
 ```bash
-export AGENT_TEAM_RUNNER=dry-run
+cp agent-team.config.example.jsonc agent-team.config.jsonc
+# Edit agent-team.config.jsonc. For smoke checks, uncomment runner and set it to "dry-run".
 
 agent-team init
 agent-team issue create \
@@ -48,9 +51,27 @@ agent-team issue show 1
 agent-team serve --worker-concurrency 3
 ```
 
-Use `AGENT_TEAM_HOME=/path/to/state` to change where SQLite state and artifacts are stored. By default, state lives under `~/.local/share/agent-team-orchestrator`.
-Use `AGENT_TEAM_WORKTREES_DIR=/path/to/worktrees` to change where isolated per-issue Git worktrees are stored. By default, worktrees live under `$AGENT_TEAM_HOME/worktrees`.
-When the web server runs under WSL, the Open in VS Code button uses `WSL_DISTRO_NAME` to build a VS Code Remote-WSL link for Windows browsers. Set `AGENT_TEAM_VSCODE_WSL_DISTRO=Ubuntu-22.04` to override the distro name, or set `AGENT_TEAM_VSCODE_WSL_DISTRO=` to force local file links.
+The default runner is `copilot-cli`. Use `runner: "dry-run"` in `agent-team.config.jsonc` for local development, tests, and smoke checks that must not invoke Copilot.
+
+## Configuration
+
+Copy `agent-team.config.example.jsonc` to the ignored local file `agent-team.config.jsonc` and uncomment persistent defaults as needed. Left untouched, the example is an empty config and built-in defaults apply.
+
+Config discovery order:
+
+1. `agent-team --config PATH <subcommand>` uses an explicit file. `--config` is a top-level option and must appear before the subcommand.
+2. `AGENT_TEAM_CONFIG_FILE=/path/to/agent-team.config.jsonc` selects a file for compatibility with scripts.
+3. `agent-team.config.jsonc` in the current working directory is used when present.
+4. If no file is found, built-in defaults are used.
+
+Precedence is: built-in defaults -> config file -> environment variables -> CLI runtime flags. Legacy `AGENT_TEAM_*` environment variables remain supported as backward-compatible overrides; the example file lists the related env var for each persistent option. Runtime flags such as `serve --host`, `serve --port`, `serve --web-workers`, `serve --worker-concurrency`, `serve --interval`, `worker --concurrency`, and `--unsafe-allow-remote` affect only that command invocation.
+
+Examples:
+
+```bash
+agent-team --config ./agent-team.config.jsonc init
+AGENT_TEAM_RUNNER=dry-run agent-team worker once
+```
 
 ## Development and tests
 
@@ -66,7 +87,7 @@ After `python3 -m pip install -e .`, the same commands can use the `agent-team` 
 ## Safety model
 
 - The default runner is `copilot-cli`, which invokes Copilot CLI for phase work with least-privilege, phase-specific tool approvals.
-- Broad Copilot permissions require the explicit `AGENT_TEAM_COPILOT_PERMISSION_MODE=yolo` escape hatch and should only be used in isolated throwaway environments.
+- Broad Copilot permissions require the explicit `copilot.permission_mode = "yolo"` setting or legacy `AGENT_TEAM_COPILOT_PERMISSION_MODE=yolo` escape hatch and should only be used in isolated throwaway environments.
 - The orchestrator owns state transitions; runners may suggest a next state but cannot bypass validation.
 - Copilot output must include a valid `Recommendation: ...`; `blocked` recommendations or missing recommendations leave the issue blocked instead of silently advancing.
 - CLI-created local issues start as editable `draft` backlog items unless created with `--ready`; the web create form defaults to runnable and can be unchecked to keep an editable draft. Workers and web Run-next ignore drafts until a manager publishes them to `needs_research`.
@@ -78,7 +99,7 @@ After `python3 -m pip install -e .`, the same commands can use the `agent-team` 
 - Critical open-ended questions use `awaiting_human_input`. Agents can recommend this state only with a structured `Human input request`; the request is persisted in SQLite, projected to `human_input.jsonl` and `human_input.md`, and later prompts receive the answered decision history as quoted context.
 - Every run and state transition is recorded in SQLite and `history.jsonl`. Phase artifacts such as `research.md` and `plan.md` are the clean deliverables; a per-run log file is created under each issue's `logs/` directory as soon as the phase starts, and Copilot output streams there while the phase is running.
 - Worker, direct-run, and web startup paths recover interrupted runs before scheduling new work. Recovery only reclaims expired locks or lock owners that are definitely dead on the same host, preserves issue worktrees, archives prior phase artifacts before reruns, and routes ambiguous merge states to `blocked` instead of guessing.
-- The web interface binds to `127.0.0.1` by default, uses same-origin/CSRF checks for POST controls, and refuses non-loopback binds unless `--unsafe-allow-remote` is passed. It still has no authentication; do not expose it on a shared network without adding protection.
+- The web interface binds to `127.0.0.1` by default, uses same-origin/CSRF checks for POST controls, and refuses non-loopback binds unless `web.unsafe_allow_remote = true` or `--unsafe-allow-remote` is used. It still has no authentication; do not expose it on a shared network without adding protection.
 - `agent-team serve` runs the web UI and autonomous ready-queue worker loop in one local process. Shutdown stops scheduling new batches and lets already-started issue runs drain according to the existing runner behavior; hard kills may leave leases active until their TTL expires.
 - For development/tests, set `AGENT_TEAM_RUNNER=dry-run` to avoid invoking any AI tool.
 
@@ -111,38 +132,43 @@ If the merge detects conflicts, it leaves the conflict markers in the isolated w
 
 ## Unattended tool permissions
 
-Copilot CLI can use read-only tools automatically, but write tools, non-read-only shell commands, URL access, and other potentially risky tools need approval. Because this orchestrator runs Copilot CLI with `--no-ask-user`, the default `AGENT_TEAM_COPILOT_PERMISSION_MODE=phase` supplies phase-specific approval policies instead of `--yolo` or `--allow-all-tools`.
+Copilot CLI can use read-only tools automatically, but write tools, non-read-only shell commands, URL access, and other potentially risky tools need approval. Because this orchestrator runs Copilot CLI with `--no-ask-user`, the default `copilot.permission_mode = "phase"` supplies phase-specific approval policies instead of `--yolo` or `--allow-all-tools`.
 
-Default phase policies approve narrowly read-only repository/artifact inspection commands for `research`, `plan`, and `review`, including Git diagnostics such as `git status`, `git status --short`, `git diff`, and `git diff --stat`; add explicit test/check commands such as `python3 -m unittest`, `pytest`, `npm test`, `npm run test`, and ecosystem test runners for `validation`; and add `write` only for `implementation` and `merge_conflict_resolution`, which operate in isolated worktrees. Validation intentionally excludes arbitrary interpreter and package-script approvals such as `python3:*`, `node:*`, and `npm run:*`; add a specific `AGENT_TEAM_COPILOT_ALLOW_TOOL` override when a repo needs another check command. Broad shell or Git approvals such as `shell(git:*)`, plus commands that can mutate in-place, such as `find:*` and `sed:*`, are intentionally excluded from read-only policies. Phase mode also denies clearly unsafe operations such as `git push`, `gh pr create`, `gh pr merge`, `rm -rf`, and `sudo`.
+Default phase policies approve narrowly read-only repository/artifact inspection commands for `research`, `plan`, and `review`, including Git diagnostics such as `git status`, `git status --short`, `git diff`, and `git diff --stat`; add explicit test/check commands such as `python3 -m unittest`, `pytest`, `npm test`, `npm run test`, and ecosystem test runners for `validation`; and add `write` only for `implementation` and `merge_conflict_resolution`, which operate in isolated worktrees. Validation intentionally excludes arbitrary interpreter and package-script approvals such as `python3:*`, `node:*`, and `npm run:*`; add a specific `copilot.allow_tool` override when a repo needs another check command. Broad shell or Git approvals such as `shell(git:*)`, plus commands that can mutate in-place, such as `find:*` and `sed:*`, are intentionally excluded from read-only policies. Phase mode also denies clearly unsafe operations such as `git push`, `gh pr create`, `gh pr merge`, `rm -rf`, and `sudo`.
 
-Research is the only phase that also allows web URL access by default (`--allow-url=https://*,http://*`) so the custom research agent can match Copilot CLI `/research` behavior with current documentation and GitHub/web-backed investigation. This does not grant write tools or broad path access, and the read-only source mutation guard still applies. Operators can narrow or block URL access for a run with the existing URL pass-through flags below, such as `AGENT_TEAM_COPILOT_DENY_URL`.
+Research is the only phase that also allows web URL access by default (`--allow-url=https://*,http://*`) so the custom research agent can match Copilot CLI `/research` behavior with current documentation and GitHub/web-backed investigation. This does not grant write tools or broad path access, and the read-only source mutation guard still applies. Operators can narrow or block URL access with `copilot.deny_url` or the matching legacy env override.
 
-Set `AGENT_TEAM_COPILOT_PERMISSION_MODE=yolo` only as an explicit escape hatch. Yolo mode emits `--yolo` and skips the phase policy, while still adding the repo/workspace and per-issue artifact directories with `--add-dir`.
+Set `copilot.permission_mode = "yolo"` only as an explicit escape hatch. Yolo mode emits `--yolo` and skips the phase policy, while still adding the repo/workspace and per-issue artifact directories with `--add-dir`.
 
-The runner passes these environment variables through to Copilot CLI:
+Persistent config keys and backward-compatible env overrides:
 
-| Environment variable | Copilot CLI flag |
-|---|---|
-| `AGENT_TEAM_COPILOT_PERMISSION_MODE=phase|yolo` | select least-privilege phase policies or explicit `--yolo` escape hatch |
-| `AGENT_TEAM_COPILOT_AVAILABLE_TOOLS` | `--available-tools=...` |
-| `AGENT_TEAM_COPILOT_EXCLUDED_TOOLS` | `--excluded-tools=...` |
-| `AGENT_TEAM_COPILOT_ALLOW_TOOL` | `--allow-tool=...` |
-| `AGENT_TEAM_COPILOT_DENY_TOOL` | `--deny-tool=...` |
-| `AGENT_TEAM_COPILOT_ALLOW_URL` | `--allow-url=...` |
-| `AGENT_TEAM_COPILOT_DENY_URL` | `--deny-url=...` |
-| `AGENT_TEAM_COPILOT_ALLOW_ALL_TOOLS=true` | `--allow-all-tools` |
-| `AGENT_TEAM_COPILOT_ALLOW_ALL_URLS=true` | `--allow-all-urls` |
-| `AGENT_TEAM_COPILOT_PLUGIN_DIR` | override the bundled custom-agent plugin directory |
-| `AGENT_TEAM_COPILOT_ARGS` | extra raw Copilot CLI args |
+| Config key | Legacy environment variable | Copilot CLI effect |
+|---|---|---|
+| `copilot.command` | `AGENT_TEAM_COPILOT_COMMAND` | executable to invoke |
+| `copilot.permission_mode` | `AGENT_TEAM_COPILOT_PERMISSION_MODE` | select phase policies or explicit `--yolo` escape hatch |
+| `copilot.plugin_dir` | `AGENT_TEAM_COPILOT_PLUGIN_DIR` | override bundled `--plugin-dir` |
+| `copilot.available_tools` | `AGENT_TEAM_COPILOT_AVAILABLE_TOOLS` | `--available-tools=...` |
+| `copilot.excluded_tools` | `AGENT_TEAM_COPILOT_EXCLUDED_TOOLS` | `--excluded-tools=...` |
+| `copilot.allow_tool` | `AGENT_TEAM_COPILOT_ALLOW_TOOL` | `--allow-tool=...` |
+| `copilot.deny_tool` | `AGENT_TEAM_COPILOT_DENY_TOOL` | `--deny-tool=...` |
+| `copilot.allow_url` | `AGENT_TEAM_COPILOT_ALLOW_URL` | `--allow-url=...` |
+| `copilot.deny_url` | `AGENT_TEAM_COPILOT_DENY_URL` | `--deny-url=...` |
+| `copilot.allow_all_tools` | `AGENT_TEAM_COPILOT_ALLOW_ALL_TOOLS` | `--allow-all-tools` |
+| `copilot.allow_all_urls` | `AGENT_TEAM_COPILOT_ALLOW_ALL_URLS` | `--allow-all-urls` |
+| `copilot.extra_args` | `AGENT_TEAM_COPILOT_ARGS` | extra raw Copilot CLI args appended last |
 
 These advanced pass-throughs are appended after the default phase policy and can weaken the least-privilege defaults. Prefer additive approvals for a known missing command, for example:
 
-```bash
-export AGENT_TEAM_COPILOT_ALLOW_TOOL='shell(npm run lint),shell(npm run lint:*)'
-export AGENT_TEAM_COPILOT_DENY_TOOL='shell(git push),shell(git push:*),shell(rm -rf:*)'
+```jsonc
+{
+  "copilot": {
+    "allow_tool": "shell(npm run lint),shell(npm run lint:*)",
+    "deny_tool": "shell(git push),shell(git push:*),shell(rm -rf:*)"
+  }
+}
 ```
 
-Avoid `--allow-all`/`--yolo` outside an isolated throwaway environment.
+Avoid `copilot.allow_all_tools`, `copilot.allow_all_urls`, and `copilot.permission_mode = "yolo"` outside an isolated throwaway environment.
 
 ## CLI overview
 
@@ -218,11 +244,11 @@ Start the normal local control surface with:
 agent-team serve --worker-concurrency 3
 ```
 
-By default it listens on `http://127.0.0.1:8765` and uses the same `AGENT_TEAM_HOME` state directory as the CLI. `serve` starts both the browser UI and a continuous autonomous ready-queue worker loop. Use `--web-workers` to set how many explicitly queued browser actions can run, `--worker-concurrency` to set how many autonomous issue runs can run at once, and `--interval` to set the idle poll interval. The dashboard and `/api/dashboard` show the current runtime mode and these concurrency settings.
+By default it listens on `http://127.0.0.1:8765` and uses the same configured state directory as the CLI. `serve` starts both the browser UI and a continuous autonomous ready-queue worker loop. Use `--web-workers` to set how many explicitly queued browser actions can run, `--worker-concurrency` to set how many autonomous issue runs can run at once, and `--interval` to set the idle poll interval. The dashboard and `/api/dashboard` show the current runtime mode and these concurrency settings.
 
-Use `agent-team web` when you want only the UI without the autonomous scheduler. Its `--web-workers` option controls queued browser actions triggered from the UI, such as "Run next ready issue"; the older `--workers` spelling remains as a compatibility alias. `--host` accepts loopback addresses by default for both `web` and `serve`; non-loopback binds require `--unsafe-allow-remote`, which has no built-in authentication and should only be used behind your own network/auth protections.
+Use `agent-team web` when you want only the UI without the autonomous scheduler. Its `--web-workers` option controls queued browser actions triggered from the UI, such as "Run next ready issue"; the older `--workers` spelling remains as a compatibility alias. `--host` accepts loopback addresses by default for both `web` and `serve`; non-loopback binds require `web.unsafe_allow_remote = true` or `--unsafe-allow-remote`, which has no built-in authentication and should only be used behind your own network/auth protections. If config enables remote binding, pass `--no-unsafe-allow-remote` for a one-off local-only invocation.
 
-Default runtime settings can also be configured with `AGENT_TEAM_WEB_WORKERS`, `AGENT_TEAM_WORKER_CONCURRENCY`, and `AGENT_TEAM_WORKER_INTERVAL_SECONDS`.
+Persistent runtime defaults can be configured with `web.web_workers`, `worker.worker_concurrency`, and `worker.worker_interval_seconds`; legacy env vars `AGENT_TEAM_WEB_WORKERS`, `AGENT_TEAM_WORKER_CONCURRENCY`, and `AGENT_TEAM_WORKER_INTERVAL_SECONDS` still override the config file.
 
 The web UI is a manager cockpit for the local agent team. It live-refreshes dashboard and issue-detail state without a full page reload. The dashboard leads with manager decisions: active work, approval gates, human-input requests, blocked issues, drafts, ready work, recently merged issues, and compact run activity. Recent events, phase counts, open issue dumps, and queued browser action history are still available in a collapsed diagnostics section.
 
