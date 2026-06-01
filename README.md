@@ -232,7 +232,7 @@ The web UI lets you:
 
 - view manager-first dashboard cards for active work, approval gates, human input, blocked issues, draft backlog, ready work, recently merged issues, and compact run activity
 - create local issues with description, target repo, priority, and tags; generated titles appear in issue lists and detail pages; "Make runnable now" is checked by default to start in `needs_research`, and unchecking it keeps the issue as an editable draft
-- edit local draft issues with description, target repo, priority, and tags before publishing
+- edit local draft issues with description, target repo, priority, and tags, then use the issue-detail "Submit for research" action when the draft is ready for agents
 - list and filter issues, then open detail pages organized around status, next action, primary controls, workflow progress, evidence, collapsed diagnostics, advanced phase overrides, and a distinct danger zone
 - queue a run for the next ready issue or for the current issue's next runnable phase
 - answer human-input requests, approve plans, approve worktree merges, and manually transition issues through the existing state-machine validation

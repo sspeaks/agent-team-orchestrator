@@ -1846,25 +1846,67 @@ setTimeout(() => {{
         self.assertEqual(self.store.get_issue(draft.id).phase, "draft")
         self.assertEqual(self.store.get_issue(issue.id).phase, "ready_for_plan")
 
-    def test_draft_issue_detail_has_publish_control_but_no_run_control(self) -> None:
+    def test_draft_issue_detail_has_submit_control_but_no_run_control(self) -> None:
         issue = self.store.create_issue("draft issue", "desc")
 
         payload, _headers = self.get_json(f"/api/issues/{issue.id}")
         html = self.get(f"/issues/{issue.id}")
 
-        self.assertIn("publish to needs_research", payload["next_action"])
+        self.assertIn("submit it for research", payload["next_action"])
         actions = {control["action"] for control in payload["manager_controls"]}
+        submit_control = next(
+            control for control in payload["manager_controls"] if control["action"].endswith("/actions/submit-for-research")
+        )
+        submit_fields = {field["name"]: field for field in submit_control["fields"]}
+        self.assertEqual(submit_control["button"], "Submit for research")
+        self.assertEqual(submit_control["group"], "primary")
+        self.assertEqual(submit_fields["message"]["type"], "hidden")
+        self.assertEqual(submit_fields["message"]["value"], "Submitted draft for research")
         edit_control = next(control for control in payload["manager_controls"] if control["action"].endswith("/edit"))
         self.assertEqual(edit_control["kind"], "link")
         self.assertEqual(edit_control["button"], "Edit draft")
+        self.assertIn(f"/issues/{issue.id}/actions/submit-for-research", actions)
         self.assertIn(f"/issues/{issue.id}/edit", actions)
         self.assertNotIn(f"/issues/{issue.id}/actions/run", actions)
         transition = next(control for control in payload["manager_controls"] if control["action"].endswith("/actions/transition"))
         options = transition["fields"][0]["options"]
         self.assertEqual(options, [{"value": "needs_research", "label": "Needs research (needs_research)"}])
+        self.assertIn(f"/issues/{issue.id}/actions/submit-for-research", html)
+        self.assertIn("Submit for research", html)
         self.assertIn(f"/issues/{issue.id}/edit", html)
         self.assertIn("Edit draft", html)
         self.assertNotIn(f"/issues/{issue.id}/actions/run", html)
+        self.assertLess(html.index("Submit for research"), html.index("Advanced actions: override phase"))
+
+    def test_web_submit_for_research_publishes_draft_snapshot_and_event(self) -> None:
+        issue = self.store.create_issue("draft issue", "desc")
+
+        html_text = self.post(
+            f"/issues/{issue.id}/actions/submit-for-research",
+            {"message": "Submit from draft button"},
+        )
+
+        updated = self.store.get_issue(issue.id)
+        self.assertEqual(updated.phase, "needs_research")
+        self.assertEqual(updated.status, "open")
+        snapshot = json.loads((self.config.artifacts_dir / str(issue.id) / "issue.json").read_text(encoding="utf-8"))
+        self.assertEqual(snapshot["phase"], "needs_research")
+        self.assertEqual(snapshot["status"], "open")
+        events = self.store.list_events(issue.id)
+        self.assertEqual(events[-1]["event_type"], "issue.transitioned")
+        self.assertEqual(events[-1]["message"], "Submit from draft button")
+        self.assertIn("Submitted draft for research", html_text)
+
+    def test_web_submit_for_research_rejects_non_draft_or_closed_issue(self) -> None:
+        ready = self.store.create_issue("ready issue", "desc", ready=True)
+        closed_draft = self.store.create_issue("closed draft", "desc")
+        with self.store.connect() as conn:
+            conn.execute("UPDATE issues SET status = 'closed' WHERE id = ?", (closed_draft.id,))
+
+        for issue in (ready, closed_draft):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                self.post(f"/issues/{issue.id}/actions/submit-for-research", {})
+            self.assertEqual(caught.exception.code, 400)
 
     def test_non_draft_issue_detail_does_not_expose_edit_control(self) -> None:
         issue = self.store.create_issue("ready issue", "desc", ready=True)

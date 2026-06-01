@@ -55,7 +55,8 @@ class PhasePermissionPolicy:
     deny_urls: tuple[str, ...] = ()
 
 
-GIT_INSPECTION_ALLOW_TOOLS = (
+READ_ONLY_ALLOW_TOOLS = (
+    "read",
     "shell(git status)",
     "shell(git status:*)",
     "shell(git diff)",
@@ -68,9 +69,6 @@ GIT_INSPECTION_ALLOW_TOOLS = (
     "shell(git grep:*)",
     "shell(git ls-files)",
     "shell(git ls-files:*)",
-)
-
-FILE_INSPECTION_ALLOW_TOOLS = (
     "shell(rg:*)",
     "shell(ls)",
     "shell(ls:*)",
@@ -78,9 +76,9 @@ FILE_INSPECTION_ALLOW_TOOLS = (
     "shell(head:*)",
     "shell(tail:*)",
     "shell(wc:*)",
+    "shell(cat:*)",
+    "shell(grep:*)",
 )
-
-READ_ONLY_ALLOW_TOOLS = GIT_INSPECTION_ALLOW_TOOLS + FILE_INSPECTION_ALLOW_TOOLS
 
 VALIDATION_ALLOW_TOOLS = READ_ONLY_ALLOW_TOOLS + (
     "shell(python -m unittest)",
