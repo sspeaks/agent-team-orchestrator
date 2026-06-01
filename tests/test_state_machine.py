@@ -152,6 +152,11 @@ class StateMachineTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_human_input_resume_phase("implementation", "ready_for_review")
 
+    def test_human_input_can_stop_to_blocked_but_draft_cannot(self) -> None:
+        validate_transition("awaiting_human_input", "blocked")
+        with self.assertRaises(ValueError):
+            validate_transition("draft", "blocked")
+
 
 if __name__ == "__main__":
     unittest.main()
