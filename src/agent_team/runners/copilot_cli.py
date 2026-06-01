@@ -61,6 +61,7 @@ READ_ONLY_ALLOW_TOOLS = (
     "shell(git status)",
     "shell(git status:*)",
     "shell(git diff)",
+    # Covers read-only diff summaries such as `git diff --stat`.
     "shell(git diff:*)",
     "shell(git log)",
     "shell(git log:*)",
