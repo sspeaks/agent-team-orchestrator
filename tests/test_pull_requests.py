@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from agent_team.pull_requests import (
+    AZURE_DEVOPS_DESCRIPTION_MAX_BYTES,
     CommandResult,
     PullRequestError,
     PullRequestRemote,
@@ -206,6 +207,50 @@ class PullRequestProviderTests(unittest.TestCase):
             ),
         )
 
+    def test_github_rejects_unsafe_pull_request_url_from_provider(self) -> None:
+        remote = parse_pull_request_remote("origin", "https://github.com/owner/repo.git")
+        assert remote is not None
+        request = PullRequestRequest(
+            source_branch="feature",
+            target_branch="main",
+            title="Add feature",
+            body_path=Path("body.md"),
+        )
+        runner = FakeRunner(
+            [
+                command_result(
+                    [
+                        {
+                            "number": 42,
+                            "url": "javascript:alert(1)",
+                            "title": "Existing PR",
+                            "headRefName": "feature",
+                            "baseRefName": "main",
+                            "state": "OPEN",
+                        }
+                    ]
+                )
+            ]
+        )
+
+        with self.assertRaisesRegex(PullRequestError, "unsafe pull request URL scheme"):
+            create_or_get_pull_request(remote, request, runner)
+
+    def test_github_rejects_unsafe_create_url_before_viewing(self) -> None:
+        remote = parse_pull_request_remote("origin", "https://github.com/owner/repo.git")
+        assert remote is not None
+        request = PullRequestRequest(
+            source_branch="feature",
+            target_branch="main",
+            title="Add feature",
+            body_path=Path("body.md"),
+        )
+        runner = FakeRunner([command_result([]), command_result("javascript:alert(1)\n")])
+
+        with self.assertRaisesRegex(PullRequestError, "unsafe pull request URL scheme"):
+            create_or_get_pull_request(remote, request, runner)
+        self.assertEqual(len(runner.calls), 2)
+
     def test_azure_devops_reuses_existing_active_pull_request(self) -> None:
         remote = parse_pull_request_remote("origin", "https://dev.azure.com/org/project/_git/repo")
         assert remote is not None
@@ -318,6 +363,21 @@ class PullRequestProviderTests(unittest.TestCase):
             ),
         )
 
+    def test_azure_devops_rejects_oversized_description_before_create(self) -> None:
+        remote = parse_pull_request_remote("origin", "https://dev.azure.com/org/project/_git/repo")
+        assert remote is not None
+        request = PullRequestRequest(
+            source_branch="feature",
+            target_branch="main",
+            title="Add feature",
+            description="x" * (AZURE_DEVOPS_DESCRIPTION_MAX_BYTES + 1),
+        )
+        runner = FakeRunner([command_result([])])
+
+        with self.assertRaisesRegex(PullRequestError, "must be at most"):
+            create_or_get_pull_request(remote, request, runner)
+        self.assertEqual(len(runner.calls), 1)
+
     def test_cli_failure_surfaces_actionable_error(self) -> None:
         remote = parse_pull_request_remote("origin", "https://github.com/owner/repo.git")
         assert remote is not None
@@ -334,6 +394,37 @@ class PullRequestProviderTests(unittest.TestCase):
                 ),
                 runner,
             )
+
+    def test_cli_failure_redacts_and_truncates_sensitive_output(self) -> None:
+        remote = parse_pull_request_remote("origin", "https://github.com/owner/repo.git")
+        assert remote is not None
+        sensitive = (
+            "failed https://user:secret@example.com/repo.git "
+            "Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz123456 "
+            "token=plain-secret "
+            + ("x" * 3000)
+        )
+        runner = FakeRunner([command_result("", returncode=1, stderr=sensitive)])
+
+        with self.assertRaises(PullRequestError) as caught:
+            create_or_get_pull_request(
+                remote,
+                PullRequestRequest(
+                    source_branch="feature",
+                    target_branch="main",
+                    title="Add feature",
+                    body_path=Path("body.md"),
+                ),
+                runner,
+            )
+
+        message = str(caught.exception)
+        self.assertIn("[redacted]", message)
+        self.assertIn("[truncated]", message)
+        self.assertNotIn("secret@example.com", message)
+        self.assertNotIn("plain-secret", message)
+        self.assertNotIn("ghp_abcdefghijklmnopqrstuvwxyz123456", message)
+        self.assertLess(len(message), 2300)
 
     def test_unsupported_provider_is_explicit(self) -> None:
         remote = PullRequestRemote(provider="unsupported", remote_name="origin", url="local://repo", repo="repo")

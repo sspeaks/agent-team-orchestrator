@@ -6,7 +6,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, Sequence
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, urlunparse
 
 
 class PullRequestError(RuntimeError):
@@ -77,11 +77,21 @@ class SubprocessCommandRunner:
         )
 
 
+AZURE_DEVOPS_DESCRIPTION_MAX_BYTES = 24_000
+_COMMAND_OUTPUT_MAX_CHARS = 2_000
 _GITHUB_SCP_RE = re.compile(r"^git@github\.com:(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$")
 _ADO_SCP_RE = re.compile(
     r"^(?:git@)?ssh\.dev\.azure\.com:v3/"
     r"(?P<org>[^/]+)/(?P<project>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$"
 )
+_CREDENTIAL_URL_RE = re.compile(r"\b(https?://)([^/\s:@]+(?::[^/\s@]*)?@)", re.IGNORECASE)
+_AUTH_HEADER_RE = re.compile(r"(?i)\b(authorization\s*[:=]\s*(?:bearer|basic|token)\s+)([^\s,;]+)")
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b("
+    r"access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd|pat|secret|sig|token"
+    r")(\s*[:=]\s*)([^\s&;,]+)"
+)
+_GH_TOKEN_RE = re.compile(r"\b(gh[pousr]_[A-Za-z0-9_]{20,})\b")
 
 
 def parse_pull_request_remote(remote_name: str, remote_url: str) -> PullRequestRemote | None:
@@ -174,6 +184,14 @@ def create_or_get_pull_request(
     )
 
 
+def is_safe_pull_request_url(url: object) -> bool:
+    text = "" if url is None else str(url).strip()
+    if not text:
+        return False
+    parsed = urlparse(text)
+    return parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
+
+
 def _github_create_or_get(
     remote: PullRequestRemote,
     request: PullRequestRequest,
@@ -225,6 +243,7 @@ def _github_create_or_get(
     url = _first_non_empty_line(created.stdout)
     if not url:
         raise PullRequestError("gh pr create succeeded but did not return a pull request URL.")
+    _validate_pull_request_url(url, "gh pr create")
 
     viewed = runner.run(
         [
@@ -281,6 +300,8 @@ def _ado_create_or_get(
     if existing is not None:
         return _ado_result(remote, request, existing, is_existing=True)
 
+    description = _description(request)
+    _ensure_ado_description_size(description)
     created = runner.run(
         [
             "az",
@@ -300,7 +321,7 @@ def _ado_create_or_get(
             "--title",
             request.title,
             "--description",
-            _description(request),
+            description,
             "--output",
             "json",
         ]
@@ -322,13 +343,14 @@ def _github_result(
     is_existing: bool,
 ) -> PullRequestResult:
     number = _as_int(raw.get("number"))
+    url = _validated_result_url(raw.get("url"), "gh pr result")
     return PullRequestResult(
         provider=remote.provider,
         remote_name=remote.remote_name,
         source_branch=str(raw.get("headRefName") or request.source_branch),
         target_branch=str(raw.get("baseRefName") or request.target_branch),
         title=str(raw.get("title") or request.title),
-        url=str(raw.get("url") or ""),
+        url=url,
         id=str(number) if number is not None else None,
         number=number,
         status=str(raw.get("state") or ""),
@@ -345,13 +367,14 @@ def _ado_result(
     is_existing: bool,
 ) -> PullRequestResult:
     number = _as_int(raw.get("pullRequestId"))
+    url = _validated_result_url(raw.get("url"), "az repos pr result")
     return PullRequestResult(
         provider=remote.provider,
         remote_name=remote.remote_name,
         source_branch=_strip_heads(str(raw.get("sourceRefName") or request.source_branch)),
         target_branch=_strip_heads(str(raw.get("targetRefName") or request.target_branch)),
         title=str(raw.get("title") or request.title),
-        url=str(raw.get("url") or ""),
+        url=url,
         id=str(number) if number is not None else None,
         number=number,
         status=str(raw.get("status") or ""),
@@ -416,11 +439,36 @@ def _description(request: PullRequestRequest) -> str:
     return Path(request.body_path).read_text(encoding="utf-8")
 
 
+def _ensure_ado_description_size(description: str) -> None:
+    size = len(description.encode("utf-8"))
+    if size <= AZURE_DEVOPS_DESCRIPTION_MAX_BYTES:
+        return
+    raise PullRequestError(
+        "Azure DevOps pull request descriptions are passed to 'az repos pr create' as a command-line "
+        f"argument and must be at most {AZURE_DEVOPS_DESCRIPTION_MAX_BYTES} bytes; got {size} bytes. "
+        "Shorten the issue description or PR body before retrying."
+    )
+
+
 def _ensure_success(command: str, result: CommandResult, hint: str) -> None:
     if result.returncode == 0:
         return
-    detail = (result.stderr or result.stdout).strip() or "no output"
+    detail = _safe_command_output(result.stderr or result.stdout)
     raise PullRequestError(f"{command} failed with exit code {result.returncode}: {detail}. {hint}")
+
+
+def _safe_command_output(output: str) -> str:
+    redacted = _redact_command_output(output).strip() or "no output"
+    if len(redacted) <= _COMMAND_OUTPUT_MAX_CHARS:
+        return redacted
+    return f"{redacted[:_COMMAND_OUTPUT_MAX_CHARS]}... [truncated]"
+
+
+def _redact_command_output(output: str) -> str:
+    redacted = _CREDENTIAL_URL_RE.sub(r"\1[redacted]@", output)
+    redacted = _AUTH_HEADER_RE.sub(r"\1[redacted]", redacted)
+    redacted = _SECRET_ASSIGNMENT_RE.sub(r"\1\2[redacted]", redacted)
+    return _GH_TOKEN_RE.sub("[redacted]", redacted)
 
 
 def _load_json(stdout: str, command: str) -> Any:
@@ -451,6 +499,24 @@ def _first_non_empty_line(stdout: str) -> str:
         if stripped:
             return stripped
     return ""
+
+
+def _validated_result_url(value: Any, command: str) -> str:
+    url = str(value or "").strip()
+    if not url:
+        return ""
+    return _validate_pull_request_url(url, command)
+
+
+def _validate_pull_request_url(url: str, command: str) -> str:
+    if is_safe_pull_request_url(url):
+        return _canonical_url(url)
+    raise PullRequestError(f"{command} returned an unsafe pull request URL scheme; expected http or https.")
+
+
+def _canonical_url(url: str) -> str:
+    parsed = urlparse(url.strip())
+    return urlunparse(parsed._replace(scheme=parsed.scheme.lower()))
 
 
 def _as_int(value: Any) -> int | None:

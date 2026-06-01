@@ -4,6 +4,7 @@ import html
 import json
 from typing import Any
 
+from .pull_requests import is_safe_pull_request_url
 from .web_jobs import WebJob
 from .web_models import RepoContext
 from .web_routing import issue_url as _issue_url
@@ -232,7 +233,7 @@ def _closed_synopsis_pull_request_html(synopsis: dict[str, Any]) -> str:
     label = f"Pull request #{number}" if number else "Pull request"
     link = (
         f'<a href="{_esc(url)}" rel="noreferrer">{_esc(label)}</a>'
-        if url
+        if is_safe_pull_request_url(url)
         else _esc(label)
     )
     details = " - ".join(

@@ -36,6 +36,19 @@
     node.classList.toggle("stale", !!stale);
   }
 
+  function isSafeHttpUrl(value) {
+    var text = String(value || "").trim();
+    if (!/^https?:\/\//i.test(text)) {
+      return false;
+    }
+    try {
+      var parsed = new URL(text);
+      return parsed.protocol === "http:" || parsed.protocol === "https:";
+    } catch (error) {
+      return false;
+    }
+  }
+
   function fetchJson(path) {
     return fetch(path, { cache: "no-store", headers: { "Accept": "application/json" } }).then(function (response) {
       if (!response.ok) {
@@ -379,7 +392,7 @@
   function renderPullRequestSynopsis(pullRequest) {
     var paragraph = el("p", "closed-synopsis-pr");
     var label = pullRequest.number || pullRequest.id ? "Pull request #" + (pullRequest.number || pullRequest.id) : "Pull request";
-    if (pullRequest.url) {
+    if (isSafeHttpUrl(pullRequest.url)) {
       var link = el("a", null, label);
       link.href = pullRequest.url;
       link.rel = "noreferrer";
