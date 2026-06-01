@@ -80,10 +80,10 @@ def render_dashboard(store: IssueStore) -> str:
         lines.append("No open issues.")
     lines.append("")
 
-    lines.append("Recently merged")
+    lines.append("Recently finalized")
     recently_merged = data["recently_merged"]
     if recently_merged:
-        lines.append("issue | merged | run | summary | title")
+        lines.append("issue | finalized | run | summary | title")
         lines.append("--- | --- | --- | --- | ---")
         for row in recently_merged:
             lines.append(
@@ -92,7 +92,7 @@ def render_dashboard(store: IssueStore) -> str:
                 f"{_shorten(row['title'], 60)}"
             )
     else:
-        lines.append("No merged issues yet.")
+        lines.append("No finalized issues yet.")
     lines.append("")
 
     lines.append("Recent runs")

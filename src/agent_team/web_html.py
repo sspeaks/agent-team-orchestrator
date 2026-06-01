@@ -153,6 +153,7 @@ def _render_closed_synopsis(synopsis: dict[str, Any] | None) -> str:
     merge_summary = ""
     if synopsis.get("merge_summary"):
         merge_summary = f'<p class="closed-synopsis-merge">{_esc(synopsis["merge_summary"])}</p>'
+    pull_request = _closed_synopsis_pull_request_html(synopsis)
     links = _closed_synopsis_links_html(synopsis)
     return f"""
             <section class="panel closed-synopsis-panel" data-closed-synopsis>
@@ -161,6 +162,7 @@ def _render_closed_synopsis(synopsis: dict[str, Any] | None) -> str:
               <p class="muted">{_esc(_closed_synopsis_details(synopsis))}</p>
               {change_excerpt}
               {merge_summary}
+              {pull_request}
               {links}
             </section>
     """
@@ -210,7 +212,40 @@ def _closed_synopsis_details(synopsis: dict[str, Any]) -> str:
         parts.append(f"Merge commit: {synopsis['merge_commit']}")
     if synopsis.get("worktree_commit"):
         parts.append(f"Worktree commit: {synopsis['worktree_commit']}")
+    pull_request = synopsis.get("pull_request")
+    if isinstance(pull_request, dict):
+        if pull_request.get("provider"):
+            parts.append(f"PR provider: {pull_request['provider']}")
+        if pull_request.get("target_branch") and not synopsis.get("target_branch"):
+            parts.append(f"Target branch: {pull_request['target_branch']}")
+        if pull_request.get("head_commit"):
+            parts.append(f"PR head: {pull_request['head_commit']}")
     return " - ".join(parts)
+
+
+def _closed_synopsis_pull_request_html(synopsis: dict[str, Any]) -> str:
+    pull_request = synopsis.get("pull_request")
+    if not isinstance(pull_request, dict):
+        return ""
+    url = pull_request.get("url")
+    number = pull_request.get("number") or pull_request.get("id") or ""
+    label = f"Pull request #{number}" if number else "Pull request"
+    link = (
+        f'<a href="{_esc(url)}" rel="noreferrer">{_esc(label)}</a>'
+        if url
+        else _esc(label)
+    )
+    details = " - ".join(
+        part
+        for part in (
+            f"source {pull_request.get('source_branch')}" if pull_request.get("source_branch") else "",
+            f"target {pull_request.get('target_branch')}" if pull_request.get("target_branch") else "",
+            str(pull_request.get("status") or ""),
+        )
+        if part
+    )
+    details_html = f'<span class="muted"> {_esc(details)}</span>' if details else ""
+    return f'<p class="closed-synopsis-pr">{link}{details_html}</p>'
 
 
 def _closed_synopsis_links_html(synopsis: dict[str, Any]) -> str:
@@ -462,7 +497,7 @@ def _recent_runs_table(rows: list[Any], repo_context: RepoContext | None = None)
 
 def _recently_merged_table(rows: list[Any], repo_context: RepoContext | None = None) -> str:
     if not rows:
-        return "<p>No merged issues yet.</p>"
+        return "<p>No finalized issues yet.</p>"
     body = "".join(
         "<tr>"
         f'<td><a href="{_esc(_issue_url(row["issue_id"], repo_context))}">#{row["issue_id"]}</a></td>'
@@ -473,7 +508,7 @@ def _recently_merged_table(rows: list[Any], repo_context: RepoContext | None = N
         "</tr>"
         for row in rows
     )
-    return f"<table><thead><tr><th>Issue</th><th>Merged</th><th>Run</th><th>Summary</th><th>Title</th></tr></thead><tbody>{body}</tbody></table>"
+    return f"<table><thead><tr><th>Issue</th><th>Finalized</th><th>Run</th><th>Summary</th><th>Title</th></tr></thead><tbody>{body}</tbody></table>"
 
 
 def _recent_events_table(rows: list[Any], repo_context: RepoContext | None = None) -> str:

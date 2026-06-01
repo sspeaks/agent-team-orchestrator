@@ -329,9 +329,19 @@ class AgentTeamWebApp:
                         f"Issue {issue.id} is in phase {issue.phase!r}, not 'awaiting_merge_approval'",
                     )
                 branch = form.get("branch", "").strip() or None
+                mode = form.get("mode", "auto").strip().lower().replace("-", "_")
+                if mode not in {"auto", "local", "pull_request"}:
+                    raise WebError(HTTPStatus.BAD_REQUEST, "merge mode must be auto, local, or pull-request")
+                remote = form.get("remote", "").strip() or None
                 message = form.get("message", "Human approved worktree merge and cleanup").strip()
                 message = message or "Human approved worktree merge and cleanup"
-                self.artifacts.write_merge_request(issue.id, target_branch=branch, message=message)
+                self.artifacts.write_merge_request(
+                    issue.id,
+                    target_branch=branch,
+                    message=message,
+                    mode=mode,
+                    remote_name=remote,
+                )
                 updated = self.store.transition_issue(issue_id, "ready_for_merge", None, message)
                 self.artifacts.write_issue_snapshot(updated)
                 self._redirect(handler, _context_url(f"/issues/{issue_id}", context, flash="Merge approved"))
@@ -554,6 +564,7 @@ class AgentTeamWebApp:
         blocked_reason = _blocked_reason_payload(issue, runs, events, artifacts, self._blocked_artifact_excerpt)
         manager_controls = self._manager_controls_payload(issue, repo_context, blocked_reason)
         merged_metadata = self.artifacts.read_merged_workspace_metadata(issue.id) if issue.status == "closed" else None
+        pull_request_metadata = self.artifacts.read_pull_request_metadata(issue.id) if issue.status == "closed" else None
         return {
             "generated_at": utc_now_iso(),
             "issue": _issue_payload(issue),
@@ -567,6 +578,7 @@ class AgentTeamWebApp:
                 runs,
                 artifacts,
                 merged_metadata,
+                pull_request_metadata,
                 self._synopsis_artifact_excerpt,
             ),
             "human_input": {
@@ -750,6 +762,9 @@ class AgentTeamWebApp:
                 self.artifacts.read_merge_request(issue.id),
                 workspace_metadata,
             )
+            merge_request = self.artifacts.read_merge_request(issue.id)
+            mode_hint = str((merge_request or {}).get("mode") or "auto").replace("_", "-")
+            remote_hint = str((merge_request or {}).get("remote_name") or self.config.pr_remote or "")
             vscode_uri = _vscode_workspace_uri(
                 workspace_metadata.get("workspace_repo_path") if workspace_metadata else None,
                 self.config.vscode_wsl_distro,
@@ -777,6 +792,33 @@ class AgentTeamWebApp:
                             "label": "Target branch",
                             "value": branch_hint,
                             "placeholder": "main",
+                        },
+                        {
+                            "type": "select",
+                            "name": "mode",
+                            "label": "Finalization mode",
+                            "value": mode_hint,
+                            "options": [
+                                {
+                                    "value": "auto",
+                                    "label": "Auto: PR for supported remotes, local when no remote",
+                                },
+                                {
+                                    "value": "pull-request",
+                                    "label": "Pull request only",
+                                },
+                                {
+                                    "value": "local",
+                                    "label": "Local merge",
+                                },
+                            ],
+                        },
+                        {
+                            "type": "input",
+                            "name": "remote",
+                            "label": "PR remote (optional)",
+                            "value": remote_hint,
+                            "placeholder": "origin",
                         },
                         {
                             "type": "input",
@@ -1511,6 +1553,7 @@ def _closed_synopsis_payload(
     runs: list[Any],
     artifacts: list[dict[str, Any]],
     merged_metadata: dict[str, Any] | None,
+    pull_request_metadata: dict[str, Any] | None,
     artifact_excerpt_reader: Callable[[int, str], str | None] | None = None,
 ) -> dict[str, Any] | None:
     if issue.status != "closed":
@@ -1548,6 +1591,8 @@ def _closed_synopsis_payload(
         completed_at = latest_merge["completed_at"] or latest_merge["started_at"]
     if not completed_at and merged_metadata:
         completed_at = merged_metadata.get("merged_at")
+    if not completed_at and pull_request_metadata:
+        completed_at = pull_request_metadata.get("finalized_at")
     completed_at = completed_at or issue.updated_at
 
     fallback = "No detailed closed synopsis is available. Review the issue description, runs, and artifacts."
@@ -1566,10 +1611,32 @@ def _closed_synopsis_payload(
         "run_id": run_id,
         "completed_at": completed_at,
         "merged_at": merged_metadata.get("merged_at") if merged_metadata else None,
-        "target_branch": merged_metadata.get("merge_target_branch") if merged_metadata else None,
+        "target_branch": (
+            merged_metadata.get("merge_target_branch")
+            if merged_metadata
+            else (pull_request_metadata.get("target_branch") if pull_request_metadata else None)
+        ),
         "merge_commit": merged_metadata.get("merge_commit") if merged_metadata else None,
         "worktree_commit": merged_metadata.get("worktree_commit") if merged_metadata else None,
+        "pull_request": _pull_request_synopsis_payload(pull_request_metadata),
         "links": _closed_synopsis_links(artifacts_by_path, run_id),
+    }
+
+
+def _pull_request_synopsis_payload(metadata: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not metadata:
+        return None
+    return {
+        "provider": metadata.get("provider"),
+        "remote_name": metadata.get("remote_name"),
+        "source_branch": metadata.get("source_branch"),
+        "target_branch": metadata.get("target_branch"),
+        "head_commit": metadata.get("head_commit") or metadata.get("worktree_head"),
+        "url": metadata.get("url"),
+        "number": metadata.get("number"),
+        "id": metadata.get("id"),
+        "status": metadata.get("pr_status"),
+        "finalized_at": metadata.get("finalized_at"),
     }
 
 
@@ -1593,6 +1660,7 @@ def _closed_synopsis_links(artifacts_by_path: dict[str, dict[str, Any]], run_id:
     if run_id:
         candidates.append(f"logs/merge-{run_id}.md")
     candidates.append("workspace.merged.json")
+    candidates.append("pull_request.json")
     links: list[dict[str, Any]] = []
     seen: set[str] = set()
     for relative_path in candidates:

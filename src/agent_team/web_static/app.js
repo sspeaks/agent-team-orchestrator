@@ -141,7 +141,7 @@
 
   function renderRecentlyMerged(container, items) {
     if (!items || items.length === 0) {
-      replaceWithEmpty(container, "No merged issues yet.");
+      replaceWithEmpty(container, "No finalized issues yet.");
       return;
     }
     var ul = el("ul", "item-list");
@@ -151,7 +151,7 @@
       link.href = issueHref(merge.issue_id);
       link.textContent = "#" + merge.issue_id + " " + (merge.title || "");
       var mergedAt = merge.completed_at || merge.started_at || merge.updated_at || "unknown time";
-      var meta = "merged " + mergedAt + " - run " + String(merge.run_id || "").slice(0, 8);
+      var meta = "finalized " + mergedAt + " - run " + String(merge.run_id || "").slice(0, 8);
       if (merge.summary) {
         meta += " - " + merge.summary;
       }
@@ -348,6 +348,10 @@
     if (synopsis.target_branch) details.push("Target branch: " + synopsis.target_branch);
     if (synopsis.merge_commit) details.push("Merge commit: " + synopsis.merge_commit);
     if (synopsis.worktree_commit) details.push("Worktree commit: " + synopsis.worktree_commit);
+    if (synopsis.pull_request) {
+      if (synopsis.pull_request.provider) details.push("PR provider: " + synopsis.pull_request.provider);
+      if (synopsis.pull_request.head_commit) details.push("PR head: " + synopsis.pull_request.head_commit);
+    }
     var nodes = [
       el("h2", null, "Closed synopsis"),
       el("p", "closed-synopsis-summary", synopsis.summary || synopsis.headline || "No detailed closed synopsis is available."),
@@ -359,6 +363,9 @@
     if (synopsis.merge_summary) {
       nodes.push(el("p", "closed-synopsis-merge", synopsis.merge_summary));
     }
+    if (synopsis.pull_request) {
+      nodes.push(renderPullRequestSynopsis(synopsis.pull_request));
+    }
     var links = el("ul", "item-list closed-synopsis-links");
     (synopsis.links || []).forEach(function (link) {
       renderClosedSynopsisLink(links, link);
@@ -367,6 +374,27 @@
       nodes.push(links);
     }
     container.replaceChildren.apply(container, nodes);
+  }
+
+  function renderPullRequestSynopsis(pullRequest) {
+    var paragraph = el("p", "closed-synopsis-pr");
+    var label = pullRequest.number || pullRequest.id ? "Pull request #" + (pullRequest.number || pullRequest.id) : "Pull request";
+    if (pullRequest.url) {
+      var link = el("a", null, label);
+      link.href = pullRequest.url;
+      link.rel = "noreferrer";
+      paragraph.append(link);
+    } else {
+      paragraph.append(label);
+    }
+    var details = [];
+    if (pullRequest.source_branch) details.push("source " + pullRequest.source_branch);
+    if (pullRequest.target_branch) details.push("target " + pullRequest.target_branch);
+    if (pullRequest.status) details.push(pullRequest.status);
+    if (details.length) {
+      paragraph.append(el("span", "muted", " " + details.join(" - ")));
+    }
+    return paragraph;
   }
 
   function renderField(field) {

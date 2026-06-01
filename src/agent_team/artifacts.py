@@ -26,6 +26,7 @@ PLAN_FEEDBACK_ARTIFACT = "plan_feedback.md"
 PLAN_PRIOR_ARTIFACT = "plan_prior.md"
 MERGE_REQUEST_ARTIFACT = "merge_request.json"
 MERGED_WORKSPACE_ARTIFACT = "workspace.merged.json"
+PULL_REQUEST_ARTIFACT = "pull_request.json"
 HUMAN_INPUT_JSONL_ARTIFACT = "human_input.jsonl"
 HUMAN_INPUT_MARKDOWN_ARTIFACT = "human_input.md"
 UNBLOCK_CONTEXT_ARTIFACT = "unblock_context.md"
@@ -36,6 +37,7 @@ PLAN_REJECTION_ARTIFACTS = (
 MERGE_ARTIFACTS = (
     (MERGE_REQUEST_ARTIFACT, "merge approval request"),
     (MERGED_WORKSPACE_ARTIFACT, "merged workspace metadata"),
+    (PULL_REQUEST_ARTIFACT, "pull request metadata"),
 )
 HUMAN_INPUT_ARTIFACTS = (
     (HUMAN_INPUT_JSONL_ARTIFACT, "human input decision log"),
@@ -193,6 +195,9 @@ class ArtifactStore:
     def merged_workspace_metadata_path(self, issue_id: int) -> Path:
         return self.issue_dir(issue_id) / MERGED_WORKSPACE_ARTIFACT
 
+    def pull_request_metadata_path(self, issue_id: int) -> Path:
+        return self.issue_dir(issue_id) / PULL_REQUEST_ARTIFACT
+
     def merge_request_path(self, issue_id: int) -> Path:
         return self.issue_dir(issue_id) / MERGE_REQUEST_ARTIFACT
 
@@ -243,16 +248,34 @@ class ArtifactStore:
             raise ValueError(f"Merged workspace metadata is not an object for issue {issue_id}: {path}")
         return data
 
+    def write_pull_request_metadata(self, issue_id: int, metadata: dict[str, Any]) -> Path:
+        path = self.pull_request_metadata_path(issue_id)
+        path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return path
+
+    def read_pull_request_metadata(self, issue_id: int) -> dict[str, Any] | None:
+        path = self.pull_request_metadata_path(issue_id)
+        if not path.is_file():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError(f"Pull request metadata is not an object for issue {issue_id}: {path}")
+        return data
+
     def write_merge_request(
         self,
         issue_id: int,
         *,
         target_branch: str | None,
         message: str,
+        mode: str = "auto",
+        remote_name: str | None = None,
     ) -> Path:
         metadata = {
             "approved_at": utc_now_iso(),
             "message": message,
+            "mode": mode,
+            "remote_name": remote_name,
             "target_branch": target_branch,
         }
         path = self.merge_request_path(issue_id)

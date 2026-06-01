@@ -7,9 +7,11 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_team.artifacts import ArtifactStore
 from agent_team.models import Issue
+from agent_team.pull_requests import PullRequestResult
 from agent_team.workspaces import WorkspaceError, WorkspaceManager
 
 
@@ -403,6 +405,120 @@ class WorkspaceManagerTests(unittest.TestCase):
         self.assertNotIn("Implement issue 1: issue 1", self._git(self.repo, "log", "--format=%s", "--max-count=3"))
         merged = json.loads(self.artifacts.merged_workspace_metadata_path(issue.id).read_text(encoding="utf-8"))
         self.assertEqual(merged["worktree_commit"], result.worktree_commit)
+
+    def test_auto_remote_finalizes_by_pull_request_without_merging_source(self) -> None:
+        bare_remote = self.home / "remote.git"
+        self._git(bare_remote.parent, "init", "--bare", str(bare_remote))
+        self._git(self.repo, "remote", "add", "origin", "https://token:secret@github.com/owner/repo.git")
+        self._git(self.repo, "remote", "set-url", "--push", "origin", str(bare_remote))
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        source_head = self._git(self.repo, "rev-parse", "HEAD")
+        pr_result = PullRequestResult(
+            provider="github",
+            remote_name="origin",
+            source_branch="agent-team/issue-1",
+            target_branch="master",
+            title="Issue 1: issue 1",
+            url="https://github.com/owner/repo/pull/7",
+            id="7",
+            number=7,
+            status="OPEN",
+            is_existing=False,
+            raw={"number": 7},
+        )
+
+        with patch("agent_team.workspaces.create_or_get_pull_request", return_value=pr_result) as create_pr:
+            result = self.manager.merge_and_cleanup(issue)
+
+        self.assertEqual(result.status, "pull_request")
+        self.assertEqual(result.pr_url, "https://github.com/owner/repo/pull/7")
+        self.assertFalse(info.worktree_root.exists())
+        self.assertEqual(self._git(self.repo, "rev-parse", "HEAD"), source_head)
+        self.assertFalse((self.repo / "feature.txt").exists())
+        self.assertEqual(
+            self._git(self.repo, "ls-remote", str(bare_remote), "refs/heads/agent-team/issue-1").split()[0],
+            result.worktree_head,
+        )
+        request = create_pr.call_args.args[1]
+        self.assertEqual(request.source_branch, "agent-team/issue-1")
+        self.assertEqual(request.target_branch, "master")
+        metadata = self.artifacts.read_pull_request_metadata(issue.id)
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertTrue(metadata["cleanup_removed"])
+        self.assertEqual(metadata["url"], "https://github.com/owner/repo/pull/7")
+        self.assertEqual(metadata["head_commit"], result.worktree_head)
+        self.assertEqual(metadata["remote_url"], "https://github.com/owner/repo.git")
+        self.assertNotIn("remote_push_url", metadata)
+        self.assertNotIn("secret", json.dumps(metadata))
+        self.assertIsNone(self.artifacts.read_workspace_metadata(issue.id))
+        self.assertFalse(self.artifacts.merged_workspace_metadata_path(issue.id).exists())
+
+    def test_auto_unsupported_remote_blocks_instead_of_local_merge(self) -> None:
+        self._git(self.repo, "remote", "add", "origin", "https://example.com/owner/repo.git")
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+
+        with self.assertRaisesRegex(WorkspaceError, "no.*supported pull request provider"):
+            self.manager.merge_and_cleanup(issue)
+
+        self.assertTrue(info.worktree_root.exists())
+        self.assertFalse((self.repo / "feature.txt").exists())
+
+    def test_explicit_local_mode_uses_local_merge_even_with_remote(self) -> None:
+        self._git(self.repo, "remote", "add", "origin", "https://example.com/owner/repo.git")
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        self.artifacts.write_merge_request(issue.id, target_branch=None, message="approved", mode="local")
+
+        result = self.manager.merge_and_cleanup(issue)
+
+        self.assertEqual(result.status, "merged")
+        self.assertEqual((self.repo / "feature.txt").read_text(encoding="utf-8"), "feature\n")
+
+    def test_pull_request_recovery_finishes_partial_cleanup(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        head = self._git(info.worktree_root, "rev-parse", "HEAD")
+        metadata = {
+            **info.to_metadata(),
+            "cleanup_removed": False,
+            "finalized_at": "2026-01-01T00:00:00+00:00",
+            "mode": "pull_request",
+            "provider": "github",
+            "remote_name": "origin",
+            "source_branch": "agent-team/issue-1",
+            "target_branch": "master",
+            "head_commit": head,
+            "worktree_head": head,
+            "worktree_commit": None,
+            "merge_branch": "agent-team/issue-1-merge",
+            "title": "Issue 1: issue 1",
+            "url": "https://github.com/owner/repo/pull/7",
+            "id": "7",
+            "number": 7,
+            "pr_status": "OPEN",
+            "is_existing": False,
+            "raw": {"number": 7},
+        }
+        self.artifacts.write_pull_request_metadata(issue.id, metadata)
+
+        recovery = self.manager.recover_interrupted_merge(issue)
+
+        self.assertEqual(recovery.next_phase, "done")
+        self.assertEqual(recovery.run_status, "success")
+        self.assertFalse(info.worktree_root.exists())
+        self.assertIsNone(self.artifacts.read_workspace_metadata(issue.id))
+        recovered = self.artifacts.read_pull_request_metadata(issue.id)
+        self.assertIsNotNone(recovered)
+        assert recovered is not None
+        self.assertTrue(recovered["cleanup_removed"])
+        self.assertIn("Pull request URL", recovery.artifact_markdown)
 
     def test_merge_blocks_when_source_branch_is_unknown(self) -> None:
         self._git(self.repo, "checkout", "--detach")

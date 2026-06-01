@@ -1835,7 +1835,38 @@ class StoreAndWorkerTests(unittest.TestCase):
         self.assertIsNotNone(request)
         self.assertEqual(request["target_branch"], "main")
         self.assertEqual(request["message"], "merge approved")
+        self.assertEqual(request["mode"], "auto")
+        self.assertIsNone(request["remote_name"])
         self.assertIn("merge approved targeting main", output.getvalue())
+
+    def test_cli_approve_merge_records_pull_request_mode_and_remote(self) -> None:
+        issue = self.store.create_issue("title", "desc")
+        self._move_to_merge_approval(issue.id)
+        args = build_parser().parse_args(
+            [
+                "issue",
+                "approve-merge",
+                str(issue.id),
+                "--mode",
+                "pull-request",
+                "--remote",
+                "upstream",
+                "--message",
+                "open a PR",
+            ]
+        )
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            exit_code = handle_issue(args, self.store, self.artifacts)
+
+        self.assertEqual(exit_code, 0)
+        request = self.artifacts.read_merge_request(issue.id)
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertEqual(request["mode"], "pull_request")
+        self.assertEqual(request["remote_name"], "upstream")
+        self.assertIn("using pull request mode via remote upstream", output.getvalue())
 
     def test_cli_approve_merge_rejects_wrong_phase(self) -> None:
         issue = self.store.create_issue("title", "desc")

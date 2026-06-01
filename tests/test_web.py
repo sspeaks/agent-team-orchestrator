@@ -360,7 +360,7 @@ class WebTests(unittest.TestCase):
         payload, _headers = self.get_json(f"/api/dashboard?{query}")
         script = self.get("/static/app.js")
 
-        self.assertIn("Recently merged", dashboard)
+        self.assertIn("Recently finalized", dashboard)
         self.assertIn('data-dashboard-list="recently_merged"', dashboard)
         self.assertIn("merged dashboard issue", dashboard)
         self.assertIn("Merged issue into main at abc123", dashboard)
