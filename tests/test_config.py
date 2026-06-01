@@ -111,6 +111,25 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.worker_interval_seconds, 0)
         self.assertIsNone(config.vscode_wsl_distro)
 
+    def test_jsonc_trailing_commas_are_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_config(
+                tmp,
+                """
+                {
+                  "runner": "dry-run",
+                  "copilot": {
+                    "extra_args": ["--flag",],
+                  },
+                }
+                """,
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                config = load_config(path)
+
+        self.assertEqual(config.runner, "dry-run")
+        self.assertEqual(config.copilot_args, ("--flag",))
+
     def test_default_config_file_is_discovered_in_current_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -322,6 +341,34 @@ class ConfigTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             config = load_config(example_path)
         self.assertEqual(config.runner, "copilot-cli")
+
+    def test_example_config_allows_uncommenting_single_top_level_default(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        example_path = repo_root / "agent-team.config.example.jsonc"
+        text = example_path.read_text(encoding="utf-8").replace(
+            '  // "runner": "copilot-cli",',
+            '  "runner": "dry-run",',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_config(tmp, text)
+            with patch.dict(os.environ, {}, clear=True):
+                config = load_config(path)
+
+        self.assertEqual(config.runner, "dry-run")
+
+    def test_example_config_allows_uncommenting_single_nested_default(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        example_path = repo_root / "agent-team.config.example.jsonc"
+        text = example_path.read_text(encoding="utf-8")
+        text = text.replace('  // "web": {', '  "web": {')
+        text = text.replace('    // "port": 8765,', '    "port": 9876,')
+        text = text.replace('  // },\n\n  // "worker": {', '  },\n\n  // "worker": {')
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_config(tmp, text)
+            with patch.dict(os.environ, {}, clear=True):
+                config = load_config(path)
+
+        self.assertEqual(config.web_port, 9876)
 
     def test_default_config_tests_are_not_affected_by_repo_local_config(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]

@@ -165,7 +165,8 @@ def _load_config_file(config_path: str | Path | None) -> dict[str, Any]:
     if path.is_dir():
         raise ValueError(f"Config file is a directory: {path}")
     try:
-        parsed = json.loads(_strip_jsonc_comments(path.read_text(encoding="utf-8")))
+        source = path.read_text(encoding="utf-8")
+        parsed = json.loads(_strip_jsonc_trailing_commas(_strip_jsonc_comments(source)))
     except json.JSONDecodeError as exc:
         raise ValueError(
             f"Invalid JSONC in config file {path}: {exc.msg} at line {exc.lineno} column {exc.colno}"
@@ -232,6 +233,41 @@ def _strip_jsonc_comments(source: str) -> str:
             if not closed:
                 raise ValueError("Unterminated block comment in config file")
             continue
+        output.append(char)
+        index += 1
+    return "".join(output)
+
+
+def _strip_jsonc_trailing_commas(source: str) -> str:
+    output: list[str] = []
+    index = 0
+    in_string = False
+    escaped = False
+    while index < len(source):
+        char = source[index]
+        if in_string:
+            output.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            output.append(char)
+            index += 1
+            continue
+        if char == ",":
+            lookahead = index + 1
+            while lookahead < len(source) and source[lookahead] in " \t\r\n":
+                lookahead += 1
+            if lookahead < len(source) and source[lookahead] in "}]":
+                output.append(" ")
+                index += 1
+                continue
         output.append(char)
         index += 1
     return "".join(output)
