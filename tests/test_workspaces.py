@@ -11,8 +11,8 @@ from unittest.mock import patch
 
 from agent_team.artifacts import ArtifactStore
 from agent_team.models import Issue
-from agent_team.pull_requests import PullRequestResult
-from agent_team.workspaces import WorkspaceError, WorkspaceManager
+from agent_team.pull_requests import PullRequestRemote, PullRequestResult
+from agent_team.workspaces import WorkspaceError, WorkspaceManager, _SelectedRemote
 
 
 @unittest.skipUnless(shutil.which("git"), "git is required for workspace tests")
@@ -407,10 +407,8 @@ class WorkspaceManagerTests(unittest.TestCase):
         self.assertEqual(merged["worktree_commit"], result.worktree_commit)
 
     def test_auto_remote_finalizes_by_pull_request_without_merging_source(self) -> None:
-        bare_remote = self.home / "remote.git"
-        self._git(bare_remote.parent, "init", "--bare", str(bare_remote))
         self._git(self.repo, "remote", "add", "origin", "https://token:secret@github.com/owner/repo.git")
-        self._git(self.repo, "remote", "set-url", "--push", "origin", str(bare_remote))
+        self._git(self.repo, "remote", "set-url", "--push", "origin", "https://github.com/owner/repo.git")
         issue = self._issue(1, self.repo)
         info = self.manager.prepare(issue)
         self._commit_file(info.worktree_root, "feature.txt", "feature\n")
@@ -429,18 +427,17 @@ class WorkspaceManagerTests(unittest.TestCase):
             raw={"number": 7},
         )
 
-        with patch("agent_team.workspaces.create_or_get_pull_request", return_value=pr_result) as create_pr:
-            result = self.manager.merge_and_cleanup(issue)
+        with patch.object(self.manager, "_push_pull_request_branch") as push_branch:
+            with patch("agent_team.workspaces.create_or_get_pull_request", return_value=pr_result) as create_pr:
+                result = self.manager.merge_and_cleanup(issue)
 
         self.assertEqual(result.status, "pull_request")
         self.assertEqual(result.pr_url, "https://github.com/owner/repo/pull/7")
         self.assertFalse(info.worktree_root.exists())
         self.assertEqual(self._git(self.repo, "rev-parse", "HEAD"), source_head)
         self.assertFalse((self.repo / "feature.txt").exists())
-        self.assertEqual(
-            self._git(self.repo, "ls-remote", str(bare_remote), "refs/heads/agent-team/issue-1").split()[0],
-            result.worktree_head,
-        )
+        self.assertEqual(push_branch.call_args.args[3], "agent-team/issue-1")
+        self.assertEqual(push_branch.call_args.args[4], result.worktree_head)
         request = create_pr.call_args.args[1]
         self.assertEqual(request.source_branch, "agent-team/issue-1")
         self.assertEqual(request.target_branch, "master")
@@ -455,6 +452,89 @@ class WorkspaceManagerTests(unittest.TestCase):
         self.assertNotIn("secret", json.dumps(metadata))
         self.assertIsNone(self.artifacts.read_workspace_metadata(issue.id))
         self.assertFalse(self.artifacts.merged_workspace_metadata_path(issue.id).exists())
+
+    def test_pull_request_remote_allows_same_repo_https_and_ssh_push_urls(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        cases = (
+            (
+                "https://github.com/owner/repo.git",
+                "git@github.com:owner/repo.git",
+                "github",
+            ),
+            (
+                "https://dev.azure.com/org/project/_git/repo",
+                "ssh.dev.azure.com:v3/org/project/repo",
+                "azure-devops",
+            ),
+        )
+        self._git(self.repo, "remote", "add", "origin", cases[0][0])
+        for fetch_url, push_url, provider in cases:
+            with self.subTest(provider=provider):
+                self._git(self.repo, "remote", "set-url", "origin", fetch_url)
+                self._git(self.repo, "remote", "set-url", "--push", "origin", push_url)
+
+                mode, selected_remote = self.manager._select_finalization_mode(info, "pull_request", "origin")
+
+                self.assertEqual(mode, "pull_request")
+                self.assertIsNotNone(selected_remote)
+                assert selected_remote is not None
+                self.assertEqual(selected_remote.remote.provider, provider)
+
+    def test_pull_request_remote_blocks_mismatched_push_url(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._git(self.repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
+        self._git(self.repo, "remote", "set-url", "--push", "origin", "https://github.com/other/repo.git")
+
+        with self.assertRaisesRegex(WorkspaceError, "push URL resolves to GitHub other/repo"):
+            self.manager._select_finalization_mode(info, "pull_request", "origin")
+
+    def test_pull_request_remote_blocks_unsupported_push_url(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._git(self.repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
+        self._git(self.repo, "remote", "set-url", "--push", "origin", str(self.home / "remote.git"))
+
+        with self.assertRaisesRegex(WorkspaceError, "push URL does not resolve to a supported"):
+            self.manager._select_finalization_mode(info, "pull_request", "origin")
+
+    def test_push_pull_request_branch_uses_validated_push_url_directly(self) -> None:
+        bare_remote = self.home / "validated-push.git"
+        self._git(bare_remote.parent, "init", "--bare", str(bare_remote))
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        selected_remote = _SelectedRemote(
+            remote=PullRequestRemote(
+                provider="github",
+                remote_name="origin",
+                url="https://github.com/owner/repo.git",
+                repo="repo",
+                owner="owner",
+            ),
+            push_url=str(bare_remote),
+        )
+        head = self._git(info.worktree_root, "rev-parse", "HEAD")
+
+        self.manager._push_pull_request_branch(issue, info, selected_remote, "agent-team/issue-1", head)
+
+        self.assertEqual(
+            self._git(self.repo, "ls-remote", str(bare_remote), "refs/heads/agent-team/issue-1").split()[0],
+            head,
+        )
+
+    def test_remote_branch_probe_redacts_credentials_in_git_errors(self) -> None:
+        with self.assertRaises(WorkspaceError) as caught:
+            self.manager._remote_branch_head(
+                self.repo,
+                "https://token:secret@127.0.0.1:1/owner/repo.git",
+                "agent-team/issue-1",
+            )
+
+        message = str(caught.exception)
+        self.assertIn("https://[redacted]@127.0.0.1", message)
+        self.assertNotIn("token:secret", message)
+        self.assertNotIn("secret@127.0.0.1", message)
 
     def test_auto_unsupported_remote_blocks_instead_of_local_merge(self) -> None:
         self._git(self.repo, "remote", "add", "origin", "https://example.com/owner/repo.git")

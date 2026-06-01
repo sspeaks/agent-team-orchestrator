@@ -807,8 +807,26 @@ class WorkspaceManager:
             push_url = self._git(info.source_root, "remote", "get-url", "--push", remote_name)
             remote = parse_pull_request_remote(remote_name, remote_url)
             if remote is not None:
+                self._validate_pull_request_push_url(remote, push_url)
                 return _SelectedRemote(remote=remote, push_url=push_url)
         return None
+
+    def _validate_pull_request_push_url(self, remote: PullRequestRemote, push_url: str) -> None:
+        push_remote = parse_pull_request_remote(remote.remote_name, push_url)
+        if push_remote is None:
+            raise WorkspaceError(
+                f"Remote '{remote.remote_name}' fetch URL resolves to {_pull_request_remote_label(remote)}, "
+                "but its push URL does not resolve to a supported pull request provider repository. "
+                "The fetch and push URLs must resolve to the same GitHub or Azure DevOps Services repository; "
+                "approve with --mode local to merge locally instead."
+            )
+        if not _same_pull_request_repository(remote, push_remote):
+            raise WorkspaceError(
+                f"Remote '{remote.remote_name}' fetch URL resolves to {_pull_request_remote_label(remote)}, "
+                f"but its push URL resolves to {_pull_request_remote_label(push_remote)}. "
+                "Refusing to push issue work to a different repository; fix the remote push URL or approve "
+                "with --mode local to merge locally instead."
+            )
 
     def _remote_names(self, source_root: Path) -> list[str]:
         return [line for line in self._git(source_root, "remote").splitlines() if line]
@@ -845,7 +863,7 @@ class WorkspaceManager:
             push_args.append(f"--force-with-lease=refs/heads/{source_branch}:{remote_head}")
         push_args.extend(
             [
-                selected_remote.remote.remote_name,
+                selected_remote.push_url,
                 f"{integrated_head}:refs/heads/{source_branch}",
             ]
         )
@@ -1439,10 +1457,11 @@ class WorkspaceManager:
         except FileNotFoundError as exc:
             raise WorkspaceError("Git executable was not found while preparing an isolated workspace") from exc
         if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout or "").strip()
+            detail = _redact_git_text((completed.stderr or completed.stdout or "").strip())
             if args[:2] == ("rev-parse", "--show-toplevel"):
                 raise WorkspaceError(f"Target repo path is not inside a Git worktree: {repo_path}")
-            raise WorkspaceError(f"Git command failed for {repo_path}: {' '.join(args)}\n{detail}".rstrip())
+            rendered_args = " ".join(_redact_git_text(arg) for arg in args)
+            raise WorkspaceError(f"Git command failed for {repo_path}: {rendered_args}\n{detail}".rstrip())
         return completed.stdout.strip()
 
     @staticmethod
@@ -1485,6 +1504,42 @@ def _require_string(value: str | None, label: str) -> str:
     if cleaned is None:
         raise WorkspaceError(f"Missing {label}")
     return cleaned
+
+
+def _same_pull_request_repository(left: PullRequestRemote, right: PullRequestRemote) -> bool:
+    return _pull_request_remote_identity(left) == _pull_request_remote_identity(right)
+
+
+def _pull_request_remote_identity(remote: PullRequestRemote) -> tuple[str, ...]:
+    if remote.provider == "github":
+        return (
+            remote.provider,
+            _identity_part(remote.owner),
+            _identity_part(remote.repo),
+        )
+    if remote.provider == "azure-devops":
+        return (
+            remote.provider,
+            _identity_part(remote.org),
+            _identity_part(remote.project),
+            _identity_part(remote.repo),
+        )
+    return (remote.provider, _identity_part(remote.url))
+
+
+def _identity_part(value: str | None) -> str:
+    return (value or "").strip().casefold()
+
+
+def _pull_request_remote_label(remote: PullRequestRemote) -> str:
+    if remote.provider == "github":
+        owner = remote.owner or "unknown-owner"
+        return f"GitHub {owner}/{remote.repo}"
+    if remote.provider == "azure-devops":
+        org = remote.org or "unknown-org"
+        project = remote.project or "unknown-project"
+        return f"Azure DevOps Services {org}/{project}/{remote.repo}"
+    return f"{remote.provider} {_redact_remote_url(remote.url)}"
 
 
 def _single_line(value: str) -> str:
@@ -1668,6 +1723,13 @@ def _redact_remote_url(value: str) -> str:
         port = None
     netloc = f"{host}:{port}" if port is not None else host
     return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+
+
+_CREDENTIAL_URL_RE = re.compile(r"\b(https?://)([^/\s:@]+(?::[^/\s@]*)?@)", re.IGNORECASE)
+
+
+def _redact_git_text(value: str) -> str:
+    return _CREDENTIAL_URL_RE.sub(r"\1[redacted]@", value)
 
 
 def _truncate_snapshot_subject_detail(value: str) -> str:

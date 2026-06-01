@@ -63,14 +63,21 @@ class CommandRunner(Protocol):
 
 class SubprocessCommandRunner:
     def run(self, args: Sequence[str]) -> CommandResult:
-        completed = subprocess.run(
-            list(args),
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        command = [str(arg) for arg in args]
+        if not command:
+            raise PullRequestError("Pull request provider command was empty.")
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as exc:
+            executable = Path(command[0]).name or command[0]
+            raise PullRequestError(_command_launch_error(executable, exc)) from exc
         return CommandResult(
-            args=tuple(str(arg) for arg in args),
+            args=tuple(command),
             returncode=int(completed.returncode),
             stdout=completed.stdout or "",
             stderr=completed.stderr or "",
@@ -367,7 +374,7 @@ def _ado_result(
     is_existing: bool,
 ) -> PullRequestResult:
     number = _as_int(raw.get("pullRequestId"))
-    url = _validated_result_url(raw.get("url"), "az repos pr result")
+    url = _validated_result_url(_ado_result_url(raw), "az repos pr result")
     return PullRequestResult(
         provider=remote.provider,
         remote_name=remote.remote_name,
@@ -381,6 +388,17 @@ def _ado_result(
         is_existing=is_existing,
         raw=dict(raw),
     )
+
+
+def _ado_result_url(raw: dict[str, Any]) -> Any:
+    if raw.get("webUrl"):
+        return raw.get("webUrl")
+    links = raw.get("_links")
+    if isinstance(links, dict):
+        web = links.get("web")
+        if isinstance(web, dict) and web.get("href"):
+            return web.get("href")
+    return raw.get("url")
 
 
 def _ado_remote(remote_name: str, remote_url: str, *, org: str, project: str, repo: str) -> PullRequestRemote | None:
@@ -455,6 +473,22 @@ def _ensure_success(command: str, result: CommandResult, hint: str) -> None:
         return
     detail = _safe_command_output(result.stderr or result.stdout)
     raise PullRequestError(f"{command} failed with exit code {result.returncode}: {detail}. {hint}")
+
+
+def _command_launch_error(executable: str, exc: OSError) -> str:
+    detail = _safe_command_output(str(exc))
+    return f"Failed to start pull request command '{executable}': {detail}. {_command_install_hint(executable)}"
+
+
+def _command_install_hint(executable: str) -> str:
+    if executable == "gh":
+        return "Install GitHub CLI and run 'gh auth login' before retrying."
+    if executable == "az":
+        return (
+            "Install Azure CLI, install/configure the azure-devops extension, and run 'az login' "
+            "before retrying."
+        )
+    return "Install the required pull request provider CLI and verify it is on PATH before retrying."
 
 
 def _safe_command_output(output: str) -> str:

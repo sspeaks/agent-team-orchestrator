@@ -4,6 +4,7 @@ import json
 import unittest
 from collections.abc import Sequence
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_team.pull_requests import (
     AZURE_DEVOPS_DESCRIPTION_MAX_BYTES,
@@ -11,6 +12,7 @@ from agent_team.pull_requests import (
     PullRequestError,
     PullRequestRemote,
     PullRequestRequest,
+    SubprocessCommandRunner,
     create_or_get_pull_request,
     parse_azure_devops_remote,
     parse_github_remote,
@@ -261,7 +263,8 @@ class PullRequestProviderTests(unittest.TestCase):
                     [
                         {
                             "pullRequestId": 17,
-                            "url": "https://dev.azure.com/org/project/_git/repo/pullrequest/17",
+                            "url": "https://dev.azure.com/org/project/_apis/git/repositories/repo/pullRequests/17",
+                            "webUrl": "https://dev.azure.com/org/project/_git/repo/pullrequest/17",
                             "title": "Existing PR",
                             "status": "active",
                             "sourceRefName": "refs/heads/feature",
@@ -278,6 +281,7 @@ class PullRequestProviderTests(unittest.TestCase):
         self.assertEqual(result.provider, "azure-devops")
         self.assertEqual(result.number, 17)
         self.assertEqual(result.id, "17")
+        self.assertEqual(result.url, "https://dev.azure.com/org/project/_git/repo/pullrequest/17")
         self.assertEqual(result.status, "active")
         self.assertEqual(result.source_branch, "feature")
         self.assertEqual(result.target_branch, "main")
@@ -322,7 +326,12 @@ class PullRequestProviderTests(unittest.TestCase):
                 command_result(
                     {
                         "pullRequestId": 18,
-                        "url": "https://dev.azure.com/org/project/_git/repo/pullrequest/18",
+                        "url": "https://dev.azure.com/org/project/_apis/git/repositories/repo/pullRequests/18",
+                        "_links": {
+                            "web": {
+                                "href": "https://dev.azure.com/org/project/_git/repo/pullrequest/18",
+                            },
+                        },
                         "title": "Add feature",
                         "status": "active",
                         "sourceRefName": "refs/heads/feature",
@@ -394,6 +403,20 @@ class PullRequestProviderTests(unittest.TestCase):
                 ),
                 runner,
             )
+
+    def test_missing_provider_cli_surfaces_actionable_error(self) -> None:
+        cases = (
+            ("gh", "Install GitHub CLI"),
+            ("az", "Install Azure CLI"),
+        )
+        for executable, expected_hint in cases:
+            with self.subTest(executable=executable):
+                with patch(
+                    "agent_team.pull_requests.subprocess.run",
+                    side_effect=FileNotFoundError(f"No such file or directory: '{executable}'"),
+                ):
+                    with self.assertRaisesRegex(PullRequestError, expected_hint):
+                        SubprocessCommandRunner().run([executable, "--version"])
 
     def test_cli_failure_redacts_and_truncates_sensitive_output(self) -> None:
         remote = parse_pull_request_remote("origin", "https://github.com/owner/repo.git")
