@@ -34,6 +34,14 @@ _COPILOT_KEYS = {
     "allow_all_urls",
     "extra_args",
 }
+_COPILOT_PASSTHROUGH_FLAGS = (
+    ("available_tools", "--available-tools", "AGENT_TEAM_COPILOT_AVAILABLE_TOOLS"),
+    ("excluded_tools", "--excluded-tools", "AGENT_TEAM_COPILOT_EXCLUDED_TOOLS"),
+    ("allow_tool", "--allow-tool", "AGENT_TEAM_COPILOT_ALLOW_TOOL"),
+    ("deny_tool", "--deny-tool", "AGENT_TEAM_COPILOT_DENY_TOOL"),
+    ("allow_url", "--allow-url", "AGENT_TEAM_COPILOT_ALLOW_URL"),
+    ("deny_url", "--deny-url", "AGENT_TEAM_COPILOT_DENY_URL"),
+)
 _WEB_KEYS = {
     "host",
     "port",
@@ -260,43 +268,27 @@ def _section(config: Mapping[str, Any], key: str) -> Mapping[str, Any]:
 
 def _build_copilot_args(copilot_config: Mapping[str, Any]) -> list[str]:
     args: list[str] = []
-    _append_copilot_value(args, "available_tools", "--available-tools", copilot_config)
-    _append_copilot_value(args, "excluded_tools", "--excluded-tools", copilot_config)
-    _append_copilot_value(args, "allow_tool", "--allow-tool", copilot_config)
-    _append_copilot_value(args, "deny_tool", "--deny-tool", copilot_config)
-    _append_copilot_value(args, "allow_url", "--allow-url", copilot_config)
-    _append_copilot_value(args, "deny_url", "--deny-url", copilot_config)
+    for key, flag, env_name in _COPILOT_PASSTHROUGH_FLAGS:
+        _append_copilot_value(args, key, flag, env_name, copilot_config)
     if _copilot_bool_setting(copilot_config, "allow_all_tools", "AGENT_TEAM_COPILOT_ALLOW_ALL_TOOLS"):
         args.append("--allow-all-tools")
     if _copilot_bool_setting(copilot_config, "allow_all_urls", "AGENT_TEAM_COPILOT_ALLOW_ALL_URLS"):
         args.append("--allow-all-urls")
-    args.extend(_config_extra_args(copilot_config))
-    available_tools = os.environ.get("AGENT_TEAM_COPILOT_AVAILABLE_TOOLS")
-    excluded_tools = os.environ.get("AGENT_TEAM_COPILOT_EXCLUDED_TOOLS")
-    allow_tool = os.environ.get("AGENT_TEAM_COPILOT_ALLOW_TOOL")
-    deny_tool = os.environ.get("AGENT_TEAM_COPILOT_DENY_TOOL")
-    allow_url = os.environ.get("AGENT_TEAM_COPILOT_ALLOW_URL")
-    deny_url = os.environ.get("AGENT_TEAM_COPILOT_DENY_URL")
-    extra_args = os.environ.get("AGENT_TEAM_COPILOT_ARGS")
-    if available_tools:
-        args.append(f"--available-tools={available_tools}")
-    if excluded_tools:
-        args.append(f"--excluded-tools={excluded_tools}")
-    if allow_tool:
-        args.append(f"--allow-tool={allow_tool}")
-    if deny_tool:
-        args.append(f"--deny-tool={deny_tool}")
-    if allow_url:
-        args.append(f"--allow-url={allow_url}")
-    if deny_url:
-        args.append(f"--deny-url={deny_url}")
-    if extra_args:
-        args.extend(shlex.split(extra_args))
+    args.extend(_copilot_extra_args(copilot_config))
     return args
 
 
-def _append_copilot_value(args: list[str], key: str, flag: str, config: Mapping[str, Any]) -> None:
-    value = _config_string_or_list(config, key, None)
+def _append_copilot_value(
+    args: list[str],
+    key: str,
+    flag: str,
+    env_name: str,
+    config: Mapping[str, Any],
+) -> None:
+    if env_name in os.environ:
+        value = os.environ[env_name]
+    else:
+        value = _config_string_or_list(config, key, None)
     if value:
         args.append(f"{flag}={value}")
 
@@ -321,6 +313,12 @@ def _config_extra_args(config: Mapping[str, Any]) -> tuple[str, ...]:
     if isinstance(value, list) and all(isinstance(item, str) for item in value):
         return tuple(value)
     raise ValueError("copilot.extra_args must be a string or an array of strings")
+
+
+def _copilot_extra_args(config: Mapping[str, Any]) -> tuple[str, ...]:
+    if "AGENT_TEAM_COPILOT_ARGS" in os.environ:
+        return tuple(shlex.split(os.environ["AGENT_TEAM_COPILOT_ARGS"]))
+    return _config_extra_args(config)
 
 
 def _copilot_bool_setting(config: Mapping[str, Any], key: str, env_name: str) -> bool:

@@ -8,10 +8,19 @@ from pathlib import Path
 from typing import Iterator
 from unittest.mock import patch
 
-from agent_team.config import AppConfig, ensure_home, load_config
+from agent_team.config import AppConfig, DEFAULT_CONFIG_FILENAME, ensure_home, load_config
 
 
 class ConfigTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._empty_cwd = tempfile.TemporaryDirectory()
+        self._empty_cwd_context = self._cwd(Path(self._empty_cwd.name))
+        self._empty_cwd_context.__enter__()
+
+    def tearDown(self) -> None:
+        self._empty_cwd_context.__exit__(None, None, None)
+        self._empty_cwd.cleanup()
+
     @contextmanager
     def _cwd(self, path: Path) -> Iterator[None]:
         previous = Path.cwd()
@@ -212,12 +221,88 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.web_workers, 5)
         self.assertEqual(config.worker_concurrency, 6)
         self.assertEqual(config.worker_interval_seconds, 7)
-        self.assertLess(
-            config.copilot_args.index("--allow-tool=shell(file-test)"),
-            config.copilot_args.index("--allow-tool=shell(env-test)"),
-        )
+        self.assertNotIn("--allow-tool=shell(file-test)", config.copilot_args)
+        self.assertIn("--allow-tool=shell(env-test)", config.copilot_args)
         self.assertNotIn("--allow-all-tools", config.copilot_args)
+        self.assertNotIn("file-model", config.copilot_args)
         self.assertEqual(config.copilot_args[-2:], ("--model", "env-model"))
+
+    def test_copilot_pass_through_env_values_replace_config_file_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_config(
+                tmp,
+                """
+                {
+                  "copilot": {
+                    "available_tools": "file-available",
+                    "excluded_tools": "file-excluded",
+                    "allow_tool": "file-allow",
+                    "deny_tool": "file-deny",
+                    "allow_url": "https://file-allow.example/*",
+                    "deny_url": "https://file-deny.example/*",
+                    "extra_args": ["--model", "file-model"]
+                  }
+                }
+                """,
+            )
+            env = {
+                "AGENT_TEAM_COPILOT_AVAILABLE_TOOLS": "env-available",
+                "AGENT_TEAM_COPILOT_EXCLUDED_TOOLS": "env-excluded",
+                "AGENT_TEAM_COPILOT_ALLOW_TOOL": "env-allow",
+                "AGENT_TEAM_COPILOT_DENY_TOOL": "env-deny",
+                "AGENT_TEAM_COPILOT_ALLOW_URL": "https://env-allow.example/*",
+                "AGENT_TEAM_COPILOT_DENY_URL": "https://env-deny.example/*",
+                "AGENT_TEAM_COPILOT_ARGS": "--model env-model --env-flag",
+            }
+            with patch.dict(os.environ, env, clear=True):
+                config = load_config(path)
+
+        self.assertEqual(
+            config.copilot_args,
+            (
+                "--available-tools=env-available",
+                "--excluded-tools=env-excluded",
+                "--allow-tool=env-allow",
+                "--deny-tool=env-deny",
+                "--allow-url=https://env-allow.example/*",
+                "--deny-url=https://env-deny.example/*",
+                "--model",
+                "env-model",
+                "--env-flag",
+            ),
+        )
+
+    def test_empty_copilot_pass_through_env_values_clear_config_file_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_config(
+                tmp,
+                """
+                {
+                  "copilot": {
+                    "available_tools": "file-available",
+                    "excluded_tools": "file-excluded",
+                    "allow_tool": "file-allow",
+                    "deny_tool": "file-deny",
+                    "allow_url": "https://file-allow.example/*",
+                    "deny_url": "https://file-deny.example/*",
+                    "extra_args": ["--model", "file-model"]
+                  }
+                }
+                """,
+            )
+            env = {
+                "AGENT_TEAM_COPILOT_AVAILABLE_TOOLS": "",
+                "AGENT_TEAM_COPILOT_EXCLUDED_TOOLS": "",
+                "AGENT_TEAM_COPILOT_ALLOW_TOOL": "",
+                "AGENT_TEAM_COPILOT_DENY_TOOL": "",
+                "AGENT_TEAM_COPILOT_ALLOW_URL": "",
+                "AGENT_TEAM_COPILOT_DENY_URL": "",
+                "AGENT_TEAM_COPILOT_ARGS": "",
+            }
+            with patch.dict(os.environ, env, clear=True):
+                config = load_config(path)
+
+        self.assertEqual(config.copilot_args, ())
 
     def test_config_can_disable_wsl_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -236,6 +321,22 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("/agent-team.config.jsonc", gitignore)
         with patch.dict(os.environ, {}, clear=True):
             config = load_config(example_path)
+        self.assertEqual(config.runner, "copilot-cli")
+
+    def test_default_config_tests_are_not_affected_by_repo_local_config(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        local_config = repo_root / DEFAULT_CONFIG_FILENAME
+        created = False
+        if not local_config.exists():
+            local_config.write_text('{"runner": "dry-run"}', encoding="utf-8")
+            created = True
+        try:
+            with patch.dict(os.environ, {}, clear=True):
+                config = load_config()
+        finally:
+            if created:
+                local_config.unlink()
+
         self.assertEqual(config.runner, "copilot-cli")
 
     def test_copilot_permission_args_from_env(self) -> None:
