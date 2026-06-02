@@ -1171,6 +1171,7 @@ class AgentTeamWebApp:
         artifacts_payload = payload["artifacts"]
         log_payload = self._current_log_payload(issue.id, context, artifacts_payload)["log"]
         plan_review = self._render_plan_review(issue, artifacts_payload)
+        review_artifact = self._render_review_artifact(issue, artifacts_payload)
         artifacts = self._render_artifacts(artifacts_payload)
         body = render_issue_detail_body(
             issue,
@@ -1178,6 +1179,7 @@ class AgentTeamWebApp:
             workspace_rows,
             log_payload,
             plan_review,
+            review_artifact,
             artifacts,
             self.csrf_token,
         )
@@ -1201,30 +1203,64 @@ class AgentTeamWebApp:
         if issue.phase != "awaiting_plan_approval":
             return ""
 
-        plan_artifact = next(
-            (
-                artifact
-                for artifact in artifacts
-                if artifact["relative_path"] == "plan.md"
-            ),
+        return self._render_phase_artifact_preview(
+            issue,
+            artifacts,
+            relative_path="plan.md",
+            title="Plan review",
+            panel_class="plan-review-panel",
+            content_class="plan-review-content",
+            link_text="Open full plan artifact",
+            missing_html=self._render_missing_plan_review(),
+        )
+
+    def _render_review_artifact(self, issue: Issue, artifacts: list[dict[str, Any]]) -> str:
+        if issue.phase != "awaiting_merge_approval":
+            return ""
+
+        return self._render_phase_artifact_preview(
+            issue,
+            artifacts,
+            relative_path="review.md",
+            title="Review artifact",
+            panel_class="review-artifact-panel",
+            content_class="review-artifact-content",
+            link_text="Open full review artifact",
+            missing_html=self._render_missing_review_artifact(),
+        )
+
+    def _render_phase_artifact_preview(
+        self,
+        issue: Issue,
+        artifacts: list[dict[str, Any]],
+        *,
+        relative_path: str,
+        title: str,
+        panel_class: str,
+        content_class: str,
+        link_text: str,
+        missing_html: str,
+    ) -> str:
+        artifact = next(
+            (artifact for artifact in artifacts if artifact["relative_path"] == relative_path),
             None,
         )
-        if plan_artifact is None:
-            return self._render_missing_plan_review()
+        if artifact is None:
+            return missing_html
 
         try:
-            content = self.artifacts.read_issue_artifact(issue.id, "plan.md")
+            content = self.artifacts.read_issue_artifact(issue.id, relative_path)
         except (FileNotFoundError, ValueError):
-            return self._render_missing_plan_review()
+            return missing_html
 
         return f"""
-              <div class="panel priority plan-review-panel">
-                <h2>Plan review</h2>
+              <div class="panel priority {panel_class}">
+                <h2>{_esc(title)}</h2>
                 <p class="muted">
-                  {_format_bytes(int(plan_artifact["size_bytes"]))} &middot; modified {_esc(plan_artifact["modified_at"])}
-                  &middot; <a href="{_esc(plan_artifact["url"])}">Open full plan artifact</a>
+                  {_format_bytes(int(artifact["size_bytes"]))} &middot; modified {_esc(artifact["modified_at"])}
+                  &middot; <a href="{_esc(artifact["url"])}">{_esc(link_text)}</a>
                 </p>
-                <pre class="plan-review-content">{_esc(content)}</pre>
+                <pre class="phase-artifact-preview-content {content_class}">{_esc(content)}</pre>
               </div>
         """
 
@@ -1234,6 +1270,15 @@ class AgentTeamWebApp:
                 <h2>Plan review</h2>
                 <p>This issue is awaiting plan approval, but the plan artifact is not available yet.</p>
                 <p class="muted">Approval and rejection controls are still available below.</p>
+              </div>
+        """
+
+    def _render_missing_review_artifact(self) -> str:
+        return """
+              <div class="panel attention review-artifact-panel">
+                <h2>Review artifact</h2>
+                <p>This issue is awaiting merge approval, but the review artifact is not available yet.</p>
+                <p class="muted">Approval controls are still available below.</p>
               </div>
         """
 

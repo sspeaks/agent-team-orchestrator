@@ -126,11 +126,50 @@ def render_issue_detail_body(
     workspace_rows: str,
     log_payload: dict[str, Any],
     plan_review: str,
+    review_artifact: str,
     artifacts: str,
     csrf_token: str,
 ) -> str:
     human_input_panel = _render_human_input_panel(payload["human_input"])
     controls = _manager_controls_html(payload["manager_controls"], csrf_token)
+    current_log_panel = f"""
+              <div class="panel current-log-panel">
+                <div class="section-header">
+                  <h2>Current log</h2>
+                  <button type="button" class="secondary" data-log-toggle aria-pressed="false">Pause log</button>
+                </div>
+                <p class="muted" data-log-meta>{_esc(_log_meta_text(log_payload))}</p>
+                <pre class="log-viewer" data-log-output>{_esc(log_payload.get("content") or "")}</pre>
+              </div>
+    """
+    primary_controls_panel = f"""
+              <div class="panel primary-controls-panel">
+                <h2>Primary controls</h2>
+                <div class="action-stack" data-action-stack data-controls-signature="{_esc(payload["manager_controls_signature"])}">{controls}</div>
+              </div>
+    """
+    issue_context_panel = f"""
+              <div class="panel">
+                <h2>Issue context</h2>
+                <dl class="metadata">
+                  <dt>Priority</dt><dd data-issue-priority>P{issue.priority}</dd>
+                  <dt>Repo</dt><dd data-issue-repo>{_esc(issue.repo_path or "")}</dd>
+                  <dt>Tags</dt><dd data-issue-tags>{_esc(issue.tags or "")}</dd>
+                  <dt>Created</dt><dd>{_esc(issue.created_at)}</dd>
+                  <dt>Updated</dt><dd>{_esc(issue.updated_at)}</dd>
+                </dl>
+              </div>
+    """
+    if issue.phase == "awaiting_merge_approval":
+        action_panels = (
+            f"{plan_review}{human_input_panel}{review_artifact}"
+            f"{primary_controls_panel}{issue_context_panel}{current_log_panel}"
+        )
+    else:
+        action_panels = (
+            f"{plan_review}{human_input_panel}{current_log_panel}"
+            f"{primary_controls_panel}{issue_context_panel}"
+        )
     return f"""
             <section class="hero issue-hero">
               <div>
@@ -160,30 +199,7 @@ def render_issue_detail_body(
               <nav class="timeline" aria-label="Workflow progress" data-phase-timeline>{_phase_timeline_html(payload["phase_timeline"])}</nav>
             </section>
             <section class="panel-grid issue-grid issue-action-grid">
-              {plan_review}
-              {human_input_panel}
-              <div class="panel current-log-panel">
-                <div class="section-header">
-                  <h2>Current log</h2>
-                  <button type="button" class="secondary" data-log-toggle aria-pressed="false">Pause log</button>
-                </div>
-                <p class="muted" data-log-meta>{_esc(_log_meta_text(log_payload))}</p>
-                <pre class="log-viewer" data-log-output>{_esc(log_payload.get("content") or "")}</pre>
-              </div>
-              <div class="panel primary-controls-panel">
-                <h2>Primary controls</h2>
-                <div class="action-stack" data-action-stack data-controls-signature="{_esc(payload["manager_controls_signature"])}">{controls}</div>
-              </div>
-              <div class="panel">
-                <h2>Issue context</h2>
-                <dl class="metadata">
-                  <dt>Priority</dt><dd data-issue-priority>P{issue.priority}</dd>
-                  <dt>Repo</dt><dd data-issue-repo>{_esc(issue.repo_path or "")}</dd>
-                  <dt>Tags</dt><dd data-issue-tags>{_esc(issue.tags or "")}</dd>
-                  <dt>Created</dt><dd>{_esc(issue.created_at)}</dd>
-                  <dt>Updated</dt><dd>{_esc(issue.updated_at)}</dd>
-                </dl>
-              </div>
+              {action_panels}
             </section>
             <section class="panel-grid issue-grid evidence-grid">
               <div class="panel">

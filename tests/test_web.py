@@ -281,7 +281,7 @@ class WebTests(unittest.TestCase):
         self.assertIn(f'href="/artifacts/{issue.id}/logs/research-run-0.md"', artifact_section)
         self.assertIn(f'href="/artifacts/{issue.id}/logs/research-run-7.md"', artifact_section)
 
-    def test_issue_detail_places_current_log_before_primary_controls_and_issue_context(self) -> None:
+    def test_issue_detail_places_current_log_before_primary_controls_for_non_merge_approval(self) -> None:
         issue = self.store.create_issue("current log layout issue", "desc", ready=True)
 
         html = self.get(f"/issues/{issue.id}")
@@ -291,6 +291,40 @@ class WebTests(unittest.TestCase):
         self.assertIn("data-log-toggle", html)
         self.assertIn("data-log-meta", html)
         self.assertIn("data-log-output", html)
+
+    def test_issue_detail_places_review_artifact_and_merge_controls_before_current_log(self) -> None:
+        issue = self.store.create_issue("merge review layout issue", "desc")
+        self._move_to_merge_approval(issue.id)
+        self.artifacts.write_workspace_metadata(issue.id, {"source_branch": "main"})
+        review_content = "Review says merge is ready\n<script>alert('review')</script>"
+        self.artifacts.write_phase_artifact(issue.id, "review", "run-1", review_content)
+
+        html = self.get(f"/issues/{issue.id}")
+
+        self.assertIn("Review artifact", html)
+        self.assertIn("Review says merge is ready", html)
+        self.assertIn("&lt;script&gt;alert(&#x27;review&#x27;)&lt;/script&gt;", html)
+        self.assertNotIn("<script>alert('review')</script>", html)
+        self.assertIn(f'href="/artifacts/{issue.id}/review.md"', html)
+        self.assertIn("Open full review artifact", html)
+        self.assertLess(html.index("Review artifact"), html.index("Primary controls"))
+        self.assertLess(html.index("Review artifact"), html.index("Current log"))
+        self.assertLess(html.index("Primary controls"), html.index("Current log"))
+        self.assertLess(html.index("/actions/approve-merge"), html.index("Current log"))
+
+    def test_issue_detail_shows_missing_review_artifact_notice_before_current_log(self) -> None:
+        issue = self.store.create_issue("missing review artifact issue", "desc")
+        self._move_to_merge_approval(issue.id)
+        self.artifacts.write_workspace_metadata(issue.id, {"source_branch": "main"})
+
+        html = self.get(f"/issues/{issue.id}")
+
+        self.assertIn("Review artifact", html)
+        self.assertIn("the review artifact is not available yet", html)
+        self.assertIn(f"/issues/{issue.id}/actions/approve-merge", html)
+        self.assertLess(html.index("the review artifact is not available yet"), html.index("Primary controls"))
+        self.assertLess(html.index("the review artifact is not available yet"), html.index("Current log"))
+        self.assertLess(html.index("Primary controls"), html.index("Current log"))
 
     def test_issue_detail_links_existing_phase_artifacts_when_blocked(self) -> None:
         issue = self.store.create_issue("blocked artifact issue", "desc", ready=True)
