@@ -943,14 +943,28 @@ class WorkspaceManager:
         push_args = ["push"]
         if remote_head is not None:
             prior_metadata = self._read_pull_request_metadata_for_push(issue.id)
-            if not self._metadata_owns_pr_branch(prior_metadata, selected_remote.remote, source_branch):
+            expected_heads = self._metadata_pr_branch_expected_heads(
+                prior_metadata,
+                selected_remote.remote,
+                source_branch,
+            )
+            if not expected_heads:
                 raise WorkspaceError(
                     f"Remote branch '{source_branch}' already exists on '{selected_remote.remote.remote_name}' "
                     f"at {remote_head[:12]}, not the prepared head {integrated_head[:12]}. "
                     "Refusing to overwrite it without existing pull_request.json ownership metadata for the "
-                    "same provider repository."
+                    "same provider repository and a recorded branch head."
                 )
-            push_args.append(f"--force-with-lease=refs/heads/{source_branch}:{remote_head}")
+            expected_head = next((head for head in expected_heads if head == remote_head), None)
+            if expected_head is None:
+                expected_text = ", ".join(head[:12] for head in expected_heads)
+                raise WorkspaceError(
+                    f"Remote branch '{source_branch}' already exists on '{selected_remote.remote.remote_name}' "
+                    f"at {remote_head[:12]}, but pull_request.json last recorded the orchestrator-owned head as "
+                    f"{expected_text}. Refusing to overwrite remote branch changes made after PR finalization; "
+                    "inspect the remote branch before retrying."
+                )
+            push_args.append(f"--force-with-lease=refs/heads/{source_branch}:{expected_head}")
         push_args.extend(
             [
                 selected_remote.push_url,
@@ -995,6 +1009,22 @@ class WorkspaceManager:
             and _clean_optional_string(metadata.get("source_branch")) == source_branch
             and metadata_identity == _pull_request_remote_identity(remote)
         )
+
+    @classmethod
+    def _metadata_pr_branch_expected_heads(
+        cls,
+        metadata: dict[str, Any] | None,
+        remote: PullRequestRemote,
+        source_branch: str,
+    ) -> tuple[str, ...]:
+        if not cls._metadata_owns_pr_branch(metadata, remote, source_branch) or metadata is None:
+            return ()
+        heads: list[str] = []
+        for key in ("head_commit", "worktree_head"):
+            head = _clean_optional_string(metadata.get(key))
+            if head is not None and head not in heads:
+                heads.append(head)
+        return tuple(heads)
 
     def _write_pull_request_body(
         self,

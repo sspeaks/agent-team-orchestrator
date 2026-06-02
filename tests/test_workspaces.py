@@ -689,6 +689,7 @@ class WorkspaceManagerTests(unittest.TestCase):
                 "remote_url": "https://github.com/owner/repo.git",
                 "remote_identity": ["github", "owner", "repo"],
                 "source_branch": source_branch,
+                "head_commit": existing_remote_head,
             },
         )
 
@@ -703,6 +704,78 @@ class WorkspaceManagerTests(unittest.TestCase):
             "https://github.com/owner/repo.git",
             f"{integrated_head}:refs/heads/{source_branch}",
         )
+
+    def test_push_pull_request_branch_blocks_owned_retry_without_recorded_head(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        selected_remote = _SelectedRemote(
+            remote=PullRequestRemote(
+                provider="github",
+                remote_name="origin",
+                url="https://github.com/owner/repo.git",
+                repo="repo",
+                owner="owner",
+            ),
+            push_url="https://github.com/owner/repo.git",
+        )
+        source_branch = "agent-team/issue-1"
+        existing_remote_head = self._git(self.repo, "rev-parse", "HEAD")
+        integrated_head = self._git(info.worktree_root, "rev-parse", "HEAD")
+        self.artifacts.write_pull_request_metadata(
+            issue.id,
+            {
+                "provider": "github",
+                "remote_name": "origin",
+                "remote_url": "https://github.com/owner/repo.git",
+                "remote_identity": ["github", "owner", "repo"],
+                "source_branch": source_branch,
+            },
+        )
+
+        with patch.object(self.manager, "_remote_branch_head", return_value=existing_remote_head):
+            with patch.object(self.manager, "_git_remote", return_value="") as git:
+                with self.assertRaisesRegex(WorkspaceError, "recorded branch head"):
+                    self.manager._push_pull_request_branch(issue, info, selected_remote, source_branch, integrated_head)
+
+        git.assert_not_called()
+
+    def test_push_pull_request_branch_blocks_owned_retry_after_remote_branch_moves(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        selected_remote = _SelectedRemote(
+            remote=PullRequestRemote(
+                provider="github",
+                remote_name="origin",
+                url="https://github.com/owner/repo.git",
+                repo="repo",
+                owner="owner",
+            ),
+            push_url="https://github.com/owner/repo.git",
+        )
+        source_branch = "agent-team/issue-1"
+        old_owned_head = "a" * 40
+        moved_remote_head = "b" * 40
+        integrated_head = self._git(info.worktree_root, "rev-parse", "HEAD")
+        self.artifacts.write_pull_request_metadata(
+            issue.id,
+            {
+                "provider": "github",
+                "remote_name": "origin",
+                "remote_url": "https://github.com/owner/repo.git",
+                "remote_identity": ["github", "owner", "repo"],
+                "source_branch": source_branch,
+                "head_commit": old_owned_head,
+            },
+        )
+
+        with patch.object(self.manager, "_remote_branch_head", return_value=moved_remote_head):
+            with patch.object(self.manager, "_git_remote", return_value="") as git:
+                with self.assertRaisesRegex(WorkspaceError, "remote branch changes made after PR finalization"):
+                    self.manager._push_pull_request_branch(issue, info, selected_remote, source_branch, integrated_head)
+
+        git.assert_not_called()
 
     def test_push_pull_request_branch_blocks_owned_retry_after_remote_repository_changes(self) -> None:
         issue = self._issue(1, self.repo)
