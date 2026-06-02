@@ -13,7 +13,12 @@ from unittest.mock import patch
 from agent_team.artifacts import ArtifactStore
 from agent_team.models import Issue
 from agent_team.pull_requests import PullRequestRemote, PullRequestResult
-from agent_team.workspaces import WorkspaceError, WorkspaceManager, _SelectedRemote
+from agent_team.workspaces import (
+    WorkspaceError,
+    WorkspaceManager,
+    _REMOTE_GIT_COMMAND_TIMEOUT_SECONDS,
+    _SelectedRemote,
+)
 
 
 @unittest.skipUnless(shutil.which("git"), "git is required for workspace tests")
@@ -527,6 +532,7 @@ class WorkspaceManagerTests(unittest.TestCase):
         self.assertEqual(metadata["url"], "https://github.com/owner/repo/pull/7")
         self.assertEqual(metadata["head_commit"], result.worktree_head)
         self.assertEqual(metadata["remote_url"], "https://github.com/owner/repo.git")
+        self.assertEqual(metadata["remote_identity"], ["github", "owner", "repo"])
         self.assertNotIn("remote_push_url", metadata)
         self.assertNotIn("secret", json.dumps(metadata))
         self.assertIsNone(self.artifacts.read_workspace_metadata(issue.id))
@@ -678,13 +684,16 @@ class WorkspaceManagerTests(unittest.TestCase):
         self.artifacts.write_pull_request_metadata(
             issue.id,
             {
+                "provider": "github",
                 "remote_name": "origin",
+                "remote_url": "https://github.com/owner/repo.git",
+                "remote_identity": ["github", "owner", "repo"],
                 "source_branch": source_branch,
             },
         )
 
         with patch.object(self.manager, "_remote_branch_head", return_value=existing_remote_head):
-            with patch.object(self.manager, "_git", return_value="") as git:
+            with patch.object(self.manager, "_git_remote", return_value="") as git:
                 self.manager._push_pull_request_branch(issue, info, selected_remote, source_branch, integrated_head)
 
         git.assert_called_once_with(
@@ -694,6 +703,41 @@ class WorkspaceManagerTests(unittest.TestCase):
             "https://github.com/owner/repo.git",
             f"{integrated_head}:refs/heads/{source_branch}",
         )
+
+    def test_push_pull_request_branch_blocks_owned_retry_after_remote_repository_changes(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        selected_remote = _SelectedRemote(
+            remote=PullRequestRemote(
+                provider="github",
+                remote_name="origin",
+                url="https://github.com/other/repo.git",
+                repo="repo",
+                owner="other",
+            ),
+            push_url="https://github.com/other/repo.git",
+        )
+        source_branch = "agent-team/issue-1"
+        existing_remote_head = self._git(self.repo, "rev-parse", "HEAD")
+        integrated_head = self._git(info.worktree_root, "rev-parse", "HEAD")
+        self.artifacts.write_pull_request_metadata(
+            issue.id,
+            {
+                "provider": "github",
+                "remote_name": "origin",
+                "remote_url": "https://github.com/owner/repo.git",
+                "remote_identity": ["github", "owner", "repo"],
+                "source_branch": source_branch,
+            },
+        )
+
+        with patch.object(self.manager, "_remote_branch_head", return_value=existing_remote_head):
+            with patch.object(self.manager, "_git_remote", return_value="") as git:
+                with self.assertRaisesRegex(WorkspaceError, "same provider repository"):
+                    self.manager._push_pull_request_branch(issue, info, selected_remote, source_branch, integrated_head)
+
+        git.assert_not_called()
 
     def test_remote_branch_probe_rejects_credential_bearing_url_before_git(self) -> None:
         with patch("agent_team.workspaces.subprocess.run") as run:
@@ -709,6 +753,90 @@ class WorkspaceManagerTests(unittest.TestCase):
         self.assertIn("Refusing to pass a credential-bearing HTTPS remote URL", message)
         self.assertNotIn("token:secret", message)
         self.assertNotIn("secret@github.com", message)
+
+    def test_remote_branch_probe_runs_git_non_interactively_with_timeout(self) -> None:
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with patch("agent_team.workspaces.subprocess.run", return_value=completed) as run:
+            head = self.manager._remote_branch_head(
+                self.repo,
+                "https://github.com/owner/repo.git",
+                "agent-team/issue-1",
+            )
+
+        self.assertIsNone(head)
+        run.assert_called_once()
+        args, kwargs = run.call_args
+        self.assertEqual(
+            args[0],
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "ls-remote",
+                "--heads",
+                "https://github.com/owner/repo.git",
+                "agent-team/issue-1",
+            ],
+        )
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(kwargs["timeout"], _REMOTE_GIT_COMMAND_TIMEOUT_SECONDS)
+        self.assertFalse(kwargs["check"])
+        self.assertTrue(kwargs["capture_output"])
+        self.assertTrue(kwargs["text"])
+        env = kwargs["env"]
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(env["GCM_INTERACTIVE"], "never")
+
+    def test_remote_branch_probe_timeout_surfaces_workspace_error(self) -> None:
+        with patch(
+            "agent_team.workspaces.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["git", "ls-remote"], timeout=1),
+        ):
+            with self.assertRaisesRegex(WorkspaceError, "timed out after 120 seconds.*non-interactively"):
+                self.manager._remote_branch_head(
+                    self.repo,
+                    "https://github.com/owner/repo.git",
+                    "agent-team/issue-1",
+                )
+
+    def test_push_pull_request_branch_runs_git_push_non_interactively_with_timeout(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        selected_remote = _SelectedRemote(
+            remote=PullRequestRemote(
+                provider="github",
+                remote_name="origin",
+                url="https://github.com/owner/repo.git",
+                repo="repo",
+                owner="owner",
+            ),
+            push_url="https://github.com/owner/repo.git",
+        )
+        source_branch = "agent-team/issue-1"
+        head = self._git(info.worktree_root, "rev-parse", "HEAD")
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+        with patch.object(self.manager, "_remote_branch_head", return_value=None):
+            with patch("agent_team.workspaces.subprocess.run", return_value=completed) as run:
+                self.manager._push_pull_request_branch(issue, info, selected_remote, source_branch, head)
+
+        run.assert_called_once()
+        args, kwargs = run.call_args
+        self.assertEqual(
+            args[0],
+            [
+                "git",
+                "-C",
+                str(info.source_root),
+                "push",
+                "https://github.com/owner/repo.git",
+                f"{head}:refs/heads/{source_branch}",
+            ],
+        )
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(kwargs["timeout"], _REMOTE_GIT_COMMAND_TIMEOUT_SECONDS)
+        self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(kwargs["env"]["GCM_INTERACTIVE"], "never")
 
     def test_auto_unsupported_remote_blocks_instead_of_local_merge(self) -> None:
         self._git(self.repo, "remote", "add", "origin", "https://example.com/owner/repo.git")

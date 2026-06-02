@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import os
 import re
 import shutil
 import subprocess
@@ -21,6 +22,12 @@ from .pull_requests import (
     create_or_get_pull_request,
     parse_pull_request_remote,
 )
+
+_REMOTE_GIT_COMMAND_TIMEOUT_SECONDS = 120.0
+_REMOTE_GIT_NONINTERACTIVE_ENV = {
+    "GIT_TERMINAL_PROMPT": "0",
+    "GCM_INTERACTIVE": "never",
+}
 
 
 class WorkspaceError(Exception):
@@ -936,11 +943,12 @@ class WorkspaceManager:
         push_args = ["push"]
         if remote_head is not None:
             prior_metadata = self._read_pull_request_metadata_for_push(issue.id)
-            if not self._metadata_owns_pr_branch(prior_metadata, selected_remote.remote.remote_name, source_branch):
+            if not self._metadata_owns_pr_branch(prior_metadata, selected_remote.remote, source_branch):
                 raise WorkspaceError(
                     f"Remote branch '{source_branch}' already exists on '{selected_remote.remote.remote_name}' "
                     f"at {remote_head[:12]}, not the prepared head {integrated_head[:12]}. "
-                    "Refusing to overwrite it without existing pull_request.json ownership metadata."
+                    "Refusing to overwrite it without existing pull_request.json ownership metadata for the "
+                    "same provider repository."
                 )
             push_args.append(f"--force-with-lease=refs/heads/{source_branch}:{remote_head}")
         push_args.extend(
@@ -949,7 +957,7 @@ class WorkspaceManager:
                 f"{integrated_head}:refs/heads/{source_branch}",
             ]
         )
-        self._git(info.source_root, *push_args)
+        self._git_remote(info.source_root, *push_args)
 
     def _remote_branch_head(self, source_root: Path, remote_ref: str, branch: str) -> str | None:
         if _remote_url_embeds_credentials(remote_ref):
@@ -957,7 +965,7 @@ class WorkspaceManager:
                 "Refusing to pass a credential-bearing HTTPS remote URL to git. Use a Git credential helper "
                 "or an authenticated SSH remote instead."
             )
-        output = self._git(source_root, "ls-remote", "--heads", remote_ref, branch)
+        output = self._git_remote(source_root, "ls-remote", "--heads", remote_ref, branch)
         for line in output.splitlines():
             parts = line.split()
             if len(parts) >= 2 and parts[1] == f"refs/heads/{branch}":
@@ -976,14 +984,16 @@ class WorkspaceManager:
     @staticmethod
     def _metadata_owns_pr_branch(
         metadata: dict[str, Any] | None,
-        remote_name: str,
+        remote: PullRequestRemote,
         source_branch: str,
     ) -> bool:
         if metadata is None:
             return False
+        metadata_identity = _metadata_pull_request_remote_identity(metadata)
         return (
-            _clean_optional_string(metadata.get("remote_name")) == remote_name
+            _clean_optional_string(metadata.get("remote_name")) == remote.remote_name
             and _clean_optional_string(metadata.get("source_branch")) == source_branch
+            and metadata_identity == _pull_request_remote_identity(remote)
         )
 
     def _write_pull_request_body(
@@ -1030,6 +1040,7 @@ class WorkspaceManager:
             "provider": pr_result.provider,
             "remote_name": pr_result.remote_name,
             "remote_url": _redact_remote_url(selected_remote.remote.url),
+            "remote_identity": list(_pull_request_remote_identity(selected_remote.remote)),
             "source_branch": pr_result.source_branch,
             "target_branch": pr_result.target_branch,
             "head_commit": integrated_head,
@@ -1541,9 +1552,48 @@ class WorkspaceManager:
 
     @staticmethod
     def _git(repo_path: Path, *args: str) -> str:
+        return WorkspaceManager._run_git(repo_path, *args)
+
+    @staticmethod
+    def _git_remote(repo_path: Path, *args: str) -> str:
+        return WorkspaceManager._run_git(
+            repo_path,
+            *args,
+            noninteractive=True,
+            timeout_seconds=_REMOTE_GIT_COMMAND_TIMEOUT_SECONDS,
+        )
+
+    @staticmethod
+    def _run_git(
+        repo_path: Path,
+        *args: str,
+        noninteractive: bool = False,
+        timeout_seconds: float | None = None,
+    ) -> str:
         command = ["git", "-C", str(repo_path), *args]
+        env = None
+        stdin = None
+        if noninteractive:
+            env = os.environ.copy()
+            env.update(_REMOTE_GIT_NONINTERACTIVE_ENV)
+            stdin = subprocess.DEVNULL
         try:
-            completed = subprocess.run(command, text=True, capture_output=True, check=False)
+            completed = subprocess.run(
+                command,
+                text=True,
+                capture_output=True,
+                check=False,
+                stdin=stdin,
+                env=env,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            rendered_args = " ".join(_redact_git_text(arg) for arg in args)
+            raise WorkspaceError(
+                f"Git remote operation timed out after {timeout_seconds:g} seconds for {repo_path}: "
+                f"{rendered_args}. Verify remote access and credentials are configured non-interactively "
+                "before retrying."
+            ) from exc
         except FileNotFoundError as exc:
             raise WorkspaceError("Git executable was not found while preparing an isolated workspace") from exc
         if completed.returncode != 0:
@@ -1598,6 +1648,32 @@ def _require_string(value: str | None, label: str) -> str:
 
 def _same_pull_request_repository(left: PullRequestRemote, right: PullRequestRemote) -> bool:
     return _pull_request_remote_identity(left) == _pull_request_remote_identity(right)
+
+
+def _metadata_pull_request_remote_identity(metadata: dict[str, Any]) -> tuple[str, ...] | None:
+    identity = metadata.get("remote_identity")
+    if isinstance(identity, (list, tuple)):
+        parts: list[str] = []
+        for part in identity:
+            cleaned = _clean_optional_string(part)
+            if cleaned is None:
+                return None
+            parts.append(_identity_part(cleaned))
+        if parts:
+            return tuple(parts)
+
+    remote_url = _clean_optional_string(metadata.get("remote_url"))
+    if remote_url is None:
+        return None
+    remote_name = _clean_optional_string(metadata.get("remote_name")) or "origin"
+    remote = parse_pull_request_remote(remote_name, remote_url)
+    if remote is None:
+        return None
+    provider = _clean_optional_string(metadata.get("provider"))
+    remote_identity = _pull_request_remote_identity(remote)
+    if provider is not None and _identity_part(provider) != remote_identity[0]:
+        return None
+    return remote_identity
 
 
 def _pull_request_remote_identity(remote: PullRequestRemote) -> tuple[str, ...]:
