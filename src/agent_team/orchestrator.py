@@ -632,8 +632,13 @@ class Orchestrator:
         return (
             workspace_info is not None
             and final_status == "success"
-            and next_phase == "ready_for_validation"
-            and phase in {"implementation", "merge_conflict_resolution"}
+            and (
+                (phase == "implementation" and next_phase == "ready_for_validation")
+                or (
+                    phase == "merge_conflict_resolution"
+                    and next_phase in {"ready_for_validation", "ready_for_implementation"}
+                )
+            )
         )
 
     @staticmethod
