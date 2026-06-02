@@ -2682,12 +2682,150 @@ class StoreAndWorkerTests(unittest.TestCase):
             self.assertIn(subject, merge_message)
         history_events = [
             json.loads(line)
-            for line in (self.config.artifacts_dir / str(issue.id) / "history.jsonl").read_text(encoding="utf-8").splitlines()
+            for line in (self.config.artifacts_dir / str(issue.id) / "history.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
         ]
         implementation_events = [event for event in history_events if event["phase"] == "implementation"]
         self.assertEqual(len(implementation_events), 2)
         self.assertTrue(all(event.get("workspace_commit") for event in implementation_events))
         self.assertEqual(len(self._records(record_dir)), 6)
+
+    @unittest.skipUnless(shutil.which("git"), "git is required for workspace tests")
+    def test_review_rejection_syncs_source_before_reimplementation(self) -> None:
+        repo = self._create_repo("source")
+        record_dir, script = self._fake_copilot_review_loop()
+        config = self._copilot_config(script)
+        issue = self.store.create_issue("sync title", "desc", repo_path=str(repo), ready=True)
+        self._move_to_plan_approval(issue.id)
+        self.store.transition_issue(issue.id, "ready_for_implementation", message="test approved plan")
+        orchestrator = Orchestrator(self.store, self.artifacts, config)
+
+        implementation_result = orchestrator.process_next()
+        validation_result = orchestrator.process_next()
+        self._commit_file(repo, "source-advance.txt", "source\n")
+        source_head = self._git(repo, "rev-parse", "HEAD")
+        review_result = orchestrator.process_next()
+
+        self.assertIsNotNone(implementation_result)
+        self.assertIsNotNone(validation_result)
+        self.assertIsNotNone(review_result)
+        self.assertEqual(review_result.phase, "review")
+        self.assertEqual(review_result.next_phase, "ready_for_implementation")
+        self.assertEqual(self.store.get_issue(issue.id).phase, "ready_for_implementation")
+        metadata = self.artifacts.read_workspace_metadata(issue.id)
+        self.assertIsNotNone(metadata)
+        self.assertEqual(metadata["last_source_sync_status"], "synced")
+        self.assertEqual(metadata["last_source_sync_head"], source_head)
+        workspace_root = Path(str(metadata["worktree_root"]))
+        self.assertTrue(self._git_check(workspace_root, "merge-base", "--is-ancestor", source_head, "HEAD"))
+        self.assertFalse((self.config.artifacts_dir / str(issue.id) / "merge.md").exists())
+        history_events = [
+            json.loads(line)
+            for line in (self.config.artifacts_dir / str(issue.id) / "history.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        review_events = [event for event in history_events if event["phase"] == "review"]
+        self.assertEqual(review_events[-1]["workspace_source_sync"]["status"], "synced")
+
+        second_implementation = orchestrator.process_next()
+
+        self.assertIsNotNone(second_implementation)
+        self.assertEqual(second_implementation.phase, "implementation")
+        self.assertEqual(len(self._records(record_dir)), 4)
+
+    @unittest.skipUnless(shutil.which("git"), "git is required for workspace tests")
+    def test_review_rejection_source_sync_conflict_routes_to_resolution(self) -> None:
+        repo = self._create_repo("source")
+        record_dir, script = self._fake_copilot_review_loop()
+        config = self._copilot_config(script)
+        issue = self.store.create_issue("sync conflict", "desc", repo_path=str(repo))
+        info = WorkspaceManager(config.worktrees_dir, self.artifacts, config.locks_dir).prepare(issue)
+        (info.worktree_root / "README.md").write_text("workspace change\n", encoding="utf-8")
+        self._git(info.worktree_root, "add", "README.md")
+        self._git(info.worktree_root, "commit", "-m", "workspace change")
+        (repo / "README.md").write_text("source change\n", encoding="utf-8")
+        self._git(repo, "add", "README.md")
+        self._git(repo, "commit", "-m", "source change")
+        self._move_to_plan_approval(issue.id)
+        self.store.transition_issue(issue.id, "ready_for_implementation")
+        self.store.transition_issue(issue.id, "implementing")
+        self.store.transition_issue(issue.id, "ready_for_validation")
+        self.store.transition_issue(issue.id, "validating")
+        self.store.transition_issue(issue.id, "ready_for_review")
+        orchestrator = Orchestrator(self.store, self.artifacts, config)
+
+        review_result = orchestrator.process_next()
+
+        self.assertIsNotNone(review_result)
+        self.assertEqual(review_result.phase, "review")
+        self.assertEqual(review_result.next_phase, "ready_for_merge_conflict_resolution")
+        self.assertEqual(self.store.get_issue(issue.id).phase, "ready_for_merge_conflict_resolution")
+        merge_artifact = (self.config.artifacts_dir / str(issue.id) / "merge.md").read_text(encoding="utf-8")
+        self.assertIn("Workspace Source Sync", merge_artifact)
+        self.assertIn("README.md", merge_artifact)
+        self.assertIn("Recommendation: `ready_for_merge_conflict_resolution`", merge_artifact)
+        review_artifact = (self.config.artifacts_dir / str(issue.id) / "review.md").read_text(encoding="utf-8")
+        self.assertIn("Recommendation: `ready_for_implementation`", review_artifact)
+        self.assertIn("<<<<<<<", (info.worktree_root / "README.md").read_text(encoding="utf-8"))
+        self.assertNotIn("<<<<<<<", (repo / "README.md").read_text(encoding="utf-8"))
+        self.assertEqual(self._git(repo, "status", "--porcelain"), "")
+        history_events = [
+            json.loads(line)
+            for line in (self.config.artifacts_dir / str(issue.id) / "history.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        review_events = [event for event in history_events if event["phase"] == "review"]
+        self.assertEqual(review_events[-1]["workspace_source_sync"]["status"], "conflicts")
+        self.assertEqual(self._records(record_dir)[0]["agent"], "agent-team-review")
+
+    @unittest.skipUnless(shutil.which("git"), "git is required for workspace tests")
+    def test_source_sync_conflict_resolution_to_implementation_creates_snapshot_commit(self) -> None:
+        repo = self._create_repo("source")
+        review_record_dir, review_script = self._fake_copilot_review_loop()
+        review_config = self._copilot_config(review_script)
+        resolution_record_dir, resolution_script = self._fake_copilot_conflict_resolution(
+            recommendation="ready_for_implementation"
+        )
+        resolution_config = self._copilot_config(resolution_script)
+        issue = self.store.create_issue("sync conflict", "desc", repo_path=str(repo))
+        info = WorkspaceManager(review_config.worktrees_dir, self.artifacts, review_config.locks_dir).prepare(issue)
+        (info.worktree_root / "README.md").write_text("workspace change\n", encoding="utf-8")
+        self._git(info.worktree_root, "add", "README.md")
+        self._git(info.worktree_root, "commit", "-m", "workspace change")
+        (repo / "README.md").write_text("source change\n", encoding="utf-8")
+        self._git(repo, "add", "README.md")
+        self._git(repo, "commit", "-m", "source change")
+        self._move_to_plan_approval(issue.id)
+        self.store.transition_issue(issue.id, "ready_for_implementation")
+        self.store.transition_issue(issue.id, "implementing")
+        self.store.transition_issue(issue.id, "ready_for_validation")
+        self.store.transition_issue(issue.id, "validating")
+        self.store.transition_issue(issue.id, "ready_for_review")
+        review_orchestrator = Orchestrator(self.store, self.artifacts, review_config)
+        resolution_orchestrator = Orchestrator(self.store, self.artifacts, resolution_config)
+
+        review_result = review_orchestrator.process_next()
+        resolution_result = resolution_orchestrator.process_next()
+
+        self.assertIsNotNone(review_result)
+        self.assertEqual(review_result.next_phase, "ready_for_merge_conflict_resolution")
+        self.assertIsNotNone(resolution_result)
+        self.assertEqual(resolution_result.phase, "merge_conflict_resolution")
+        self.assertEqual(resolution_result.next_phase, "ready_for_implementation")
+        self.assertEqual(self.store.get_issue(issue.id).phase, "ready_for_implementation")
+        self.assertEqual((info.worktree_root / "README.md").read_text(encoding="utf-8"), "resolved by copilot\n")
+        self.assertEqual(self._git(info.worktree_root, "status", "--porcelain"), "")
+        self.assertFalse(self._git_check(info.worktree_root, "rev-parse", "-q", "--verify", "MERGE_HEAD"))
+        parents = self._git(info.worktree_root, "rev-list", "--parents", "-n", "1", "HEAD").split()
+        self.assertEqual(len(parents), 3)
+        history_events = [
+            json.loads(line)
+            for line in (self.config.artifacts_dir / str(issue.id) / "history.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        resolution_events = [event for event in history_events if event["phase"] == "merge_conflict_resolution"]
+        self.assertEqual(len(resolution_events), 1)
+        self.assertTrue(resolution_events[0].get("workspace_commit"))
+        self.assertEqual(self._records(review_record_dir)[0]["agent"], "agent-team-review")
+        self.assertEqual(self._records(resolution_record_dir)[0]["agent"], "agent-team-merge-conflict-resolution")
 
     @unittest.skipUnless(shutil.which("git"), "git is required for workspace tests")
     def test_copilot_end_to_end_validation_runs_real_check(self) -> None:
@@ -3068,6 +3206,54 @@ class StoreAndWorkerTests(unittest.TestCase):
         self.assertEqual(self.store.get_issue(issue.id).phase, "ready_for_validation")
 
     @unittest.skipUnless(shutil.which("git"), "git is required for workspace tests")
+    def test_recovery_routes_interrupted_review_source_sync_conflicts_to_resolution(self) -> None:
+        repo = self._create_repo("source")
+        issue = self.store.create_issue("source sync conflict", "desc", repo_path=str(repo))
+        manager = WorkspaceManager(self.config.worktrees_dir, self.artifacts, self.config.locks_dir)
+        info = manager.prepare(issue)
+        (info.worktree_root / "README.md").write_text("workspace change\n", encoding="utf-8")
+        self._git(info.worktree_root, "add", "README.md")
+        self._git(info.worktree_root, "commit", "-m", "workspace change")
+        (repo / "README.md").write_text("source change\n", encoding="utf-8")
+        self._git(repo, "add", "README.md")
+        self._git(repo, "commit", "-m", "source change")
+        self.assertEqual(manager.sync_source_into_workspace(issue, info).status, "conflicts")
+        self._move_to_plan_approval(issue.id)
+        self.store.transition_issue(issue.id, "ready_for_implementation")
+        self.store.transition_issue(issue.id, "implementing")
+        self.store.transition_issue(issue.id, "ready_for_validation")
+        self.store.transition_issue(issue.id, "validating")
+        self.store.transition_issue(issue.id, "ready_for_review")
+        run_id = "review-source-sync-run"
+        self.assertTrue(
+            self.store.acquire_lock(
+                issue.id,
+                "stale-worker",
+                -60,
+                run_id,
+                expected_phase="ready_for_review",
+            )
+        )
+        self.store.transition_issue(issue.id, "reviewing", run_id, "Starting review")
+        self.store.create_run(run_id, issue.id, "review", "copilot-cli")
+        orchestrator = Orchestrator(self.store, self.artifacts, self.config)
+
+        results = orchestrator.recover_interrupted_runs()
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].action, "review_source_sync_recovered")
+        self.assertEqual(results[0].next_phase, "ready_for_merge_conflict_resolution")
+        self.assertEqual(self.store.get_issue(issue.id).phase, "ready_for_merge_conflict_resolution")
+        run = self.store.list_runs(issue.id)[-1]
+        self.assertEqual(run["status"], "interrupted")
+        self.assertEqual(run["next_phase"], "ready_for_merge_conflict_resolution")
+        merge_artifact = (self.config.artifacts_dir / str(issue.id) / "merge.md").read_text(encoding="utf-8")
+        self.assertIn("Workspace Source Sync", merge_artifact)
+        self.assertIn("README.md", merge_artifact)
+        self.assertIn("<<<<<<<", (info.worktree_root / "README.md").read_text(encoding="utf-8"))
+        self.assertEqual(self._git(repo, "status", "--porcelain"), "")
+
+    @unittest.skipUnless(shutil.which("git"), "git is required for workspace tests")
     def test_copilot_merge_conflict_resolution_creates_snapshot_commit(self) -> None:
         repo = self._create_repo("source")
         record_dir, script = self._fake_copilot_conflict_resolution()
@@ -3376,7 +3562,7 @@ print(artifact)
         script.chmod(0o755)
         return record_dir, script
 
-    def _fake_copilot_conflict_resolution(self) -> tuple[Path, Path]:
+    def _fake_copilot_conflict_resolution(self, recommendation: str = "ready_for_validation") -> tuple[Path, Path]:
         record_dir = self.home / "copilot-conflict-records"
         record_dir.mkdir()
         script = self.home / "fake-copilot-conflict-resolution"
@@ -3394,7 +3580,7 @@ agent = argv[argv.index("--agent") + 1] if "--agent" in argv else ""
 agent = agent.rsplit(":", 1)[-1]
 if agent == "agent-team-merge-conflict-resolution":
     (cwd / "README.md").write_text("resolved by copilot\\n", encoding="utf-8")
-    recommendation = "ready_for_validation"
+    recommendation = {recommendation!r}
     artifact = (
         "1. Conflicted files resolved\\n\\n"
         "- README.md\\n\\n"
@@ -3426,6 +3612,11 @@ print(artifact)
     def _git(repo: Path, *args: str) -> str:
         completed = subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True, check=True)
         return completed.stdout.strip()
+
+    @staticmethod
+    def _git_check(repo: Path, *args: str) -> bool:
+        completed = subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True, check=False)
+        return completed.returncode == 0
 
     def _move_to_plan_approval(self, issue_id: int) -> None:
         if self.store.get_issue(issue_id).phase == "draft":

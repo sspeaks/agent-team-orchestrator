@@ -1349,6 +1349,55 @@ class IssueStore:
                     results.append(result)
             return results
 
+    def _claim_interrupted_phase_recovery(
+        self,
+        issue_id: int,
+        owner: str,
+        ttl_seconds: int,
+        *,
+        phase: str,
+        event_message: str,
+        now: str | None = None,
+        is_lock_reclaimable: LockReclaimPredicate | None = None,
+    ) -> Issue | None:
+        now_iso = now or utc_now_iso()
+        expires_at = (
+            datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+        ).replace(microsecond=0).isoformat()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM issues WHERE id = ?", (issue_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"Issue not found: {issue_id}")
+            if str(row["phase"]) != phase or not self._lock_is_recoverable(row, now_iso, is_lock_reclaimable):
+                return None
+            params: list[object] = [owner, expires_at, now_iso, issue_id, phase]
+            guards = [
+                _expected_value_guard("current_run_id", row["current_run_id"], params),
+                _expected_value_guard("lock_owner", row["lock_owner"], params),
+                _expected_value_guard("lock_expires_at", row["lock_expires_at"], params),
+            ]
+            cur = conn.execute(
+                f"""
+                UPDATE issues
+                SET lock_owner = ?, lock_expires_at = ?, updated_at = ?
+                WHERE id = ? AND phase = ?
+                  {''.join(guards)}
+                """,
+                params,
+            )
+            if cur.rowcount != 1:
+                return None
+            self._add_event(
+                conn,
+                issue_id,
+                row["current_run_id"],
+                "lock.acquired",
+                f"{owner} {event_message} until {expires_at}",
+            )
+            claimed = conn.execute("SELECT * FROM issues WHERE id = ?", (issue_id,)).fetchone()
+            return Issue.from_row(claimed)
+
     def claim_interrupted_merge_recovery(
         self,
         issue_id: int,
@@ -1395,6 +1444,25 @@ class IssueStore:
             )
             claimed = conn.execute("SELECT * FROM issues WHERE id = ?", (issue_id,)).fetchone()
             return Issue.from_row(claimed)
+
+    def claim_interrupted_review_source_sync_recovery(
+        self,
+        issue_id: int,
+        owner: str,
+        ttl_seconds: int,
+        *,
+        now: str | None = None,
+        is_lock_reclaimable: LockReclaimPredicate | None = None,
+    ) -> Issue | None:
+        return self._claim_interrupted_phase_recovery(
+            issue_id,
+            owner,
+            ttl_seconds,
+            phase="reviewing",
+            event_message="claimed review source-sync recovery",
+            now=now,
+            is_lock_reclaimable=is_lock_reclaimable,
+        )
 
     def recover_interrupted_merge(
         self,
@@ -1451,6 +1519,63 @@ class IssueStore:
                 action="merge_recovered",
                 summary=summary,
                 agent_phase="merge",
+            )
+
+    def recover_interrupted_review_source_sync(
+        self,
+        issue_id: int,
+        *,
+        next_phase: str,
+        run_status: str,
+        summary: str,
+        artifact_path: str | None = None,
+        now: str | None = None,
+        is_lock_reclaimable: LockReclaimPredicate | None = None,
+        claimed_owner: str | None = None,
+        claimed_run_id: str | None = None,
+    ) -> RecoveryResult | None:
+        now_iso = now or utc_now_iso()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM issues WHERE id = ?", (issue_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"Issue not found: {issue_id}")
+            claimed_by_owner = (
+                claimed_owner is not None
+                and row["lock_owner"] == claimed_owner
+                and row["current_run_id"] == claimed_run_id
+            )
+            if str(row["phase"]) != "reviewing" or (
+                not claimed_by_owner and not self._lock_is_recoverable(row, now_iso, is_lock_reclaimable)
+            ):
+                return None
+            run_id = row["current_run_id"]
+            if not self._apply_recovery_issue_update(conn, row, next_phase, now_iso, summary):
+                return None
+            run = self._run_for_recovery(conn, issue_id, run_id, "review")
+            if run is not None:
+                if str(run["status"]) == "running":
+                    self._complete_recovered_run(
+                        conn,
+                        run,
+                        run_status,
+                        summary,
+                        next_phase,
+                        now_iso,
+                        artifact_path,
+                        None if run_status == "success" else summary,
+                    )
+                elif run["next_phase"] is None:
+                    conn.execute("UPDATE runs SET next_phase = ? WHERE id = ? AND next_phase IS NULL", (next_phase, run["id"]))
+            self._add_event(conn, issue_id, run_id, "issue.recovered", summary)
+            return RecoveryResult(
+                issue_id=issue_id,
+                run_id=run_id,
+                previous_phase="reviewing",
+                next_phase=next_phase,
+                action="review_source_sync_recovered",
+                summary=summary,
+                agent_phase="review",
             )
 
     def add_event(self, issue_id: int, event_type: str, message: str, run_id: str | None = None) -> None:

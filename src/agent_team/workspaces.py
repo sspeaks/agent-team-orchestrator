@@ -101,6 +101,58 @@ class WorkspaceMergeResult:
 
 
 @dataclass(frozen=True)
+class WorkspaceSourceSyncResult:
+    status: str
+    summary: str
+    target_branch: str | None
+    old_source_head: str | None
+    new_source_head: str | None
+    worktree_head: str | None
+    sync_commit: str | None = None
+    conflict_files: tuple[str, ...] = ()
+    synced_at: str = ""
+
+    def artifact_markdown(self) -> str:
+        lines = [
+            "# Workspace Source Sync",
+            "",
+            f"- Status: `{self.status}`",
+            f"- Summary: {self.summary}",
+        ]
+        if self.target_branch:
+            lines.append(f"- Source branch: `{self.target_branch}`")
+        if self.old_source_head:
+            lines.append(f"- Previous source HEAD: `{self.old_source_head}`")
+        if self.new_source_head:
+            lines.append(f"- Current source HEAD: `{self.new_source_head}`")
+        if self.worktree_head:
+            lines.append(f"- Worktree HEAD before sync: `{self.worktree_head}`")
+        if self.sync_commit:
+            lines.append(f"- Source sync commit: `{self.sync_commit}`")
+        if self.synced_at:
+            lines.append(f"- Synced at: {self.synced_at}")
+        if self.conflict_files:
+            lines.extend(["", "## Conflicted files", ""])
+            lines.extend(f"- `{path}`" for path in self.conflict_files)
+            lines.extend(
+                [
+                    "",
+                    "These conflicts happened while merging the recorded source branch into the isolated "
+                    "workspace after review requested implementation rework. Resolve conflict markers in the "
+                    "isolated workspace before continuing the rework loop.",
+                    "",
+                    "If prior review findings still require code changes after resolving these conflict markers, "
+                    "recommend `ready_for_implementation`; otherwise recommend `ready_for_validation`.",
+                ]
+            )
+        recommendation = (
+            "ready_for_merge_conflict_resolution" if self.status == "conflicts" else "ready_for_implementation"
+        )
+        lines.extend(["", f"Recommendation: `{recommendation}`"])
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
 class WorkspaceMergeRecovery:
     next_phase: str
     run_status: str
@@ -239,6 +291,92 @@ class WorkspaceManager:
         if info is None:
             raise WorkspaceError(f"Workspace metadata is missing for issue {issue.id}")
         return info
+
+    def sync_source_into_workspace(self, issue: Issue, info: WorkspaceInfo) -> WorkspaceSourceSyncResult:
+        self._validate_merge_workspace(issue, info)
+        metadata = self._workspace_metadata_for_update(issue, info)
+        old_source_head = _clean_optional_string(metadata.get("last_source_sync_head")) or info.source_head
+        synced_at = utc_now_iso()
+        branch = info.source_branch
+        if not branch:
+            result = WorkspaceSourceSyncResult(
+                status="skipped",
+                summary=f"Skipped source sync for issue {issue.id}; workspace was created from detached source HEAD.",
+                target_branch=None,
+                old_source_head=old_source_head,
+                new_source_head=None,
+                worktree_head=self._git(info.worktree_root, "rev-parse", "HEAD"),
+                synced_at=synced_at,
+            )
+            self._write_source_sync_metadata(issue.id, metadata, result)
+            return result
+
+        with self._repo_lock(info):
+            return self._sync_source_into_workspace_locked(issue, info, metadata, branch, old_source_head, synced_at)
+
+    def recover_interrupted_source_sync(self, issue: Issue) -> WorkspaceMergeRecovery | None:
+        try:
+            metadata = self.artifacts.read_workspace_metadata(issue.id)
+        except (OSError, ValueError):
+            return None
+        if metadata is None:
+            return None
+        try:
+            info = WorkspaceInfo.from_metadata(metadata)
+        except (KeyError, TypeError, ValueError):
+            return None
+        try:
+            self._validate_merge_workspace(issue, info)
+        except WorkspaceError:
+            return None
+
+        with self._repo_lock(info):
+            conflict_files = self._conflicted_files(info.worktree_root)
+            if not conflict_files:
+                return None
+            old_source_head = _clean_optional_string(metadata.get("last_source_sync_previous_head")) or info.source_head
+            new_source_head = _clean_optional_string(metadata.get("last_source_sync_head"))
+            if new_source_head is None and info.source_branch and self._git_check(
+                info.source_root, "rev-parse", "--verify", info.source_branch
+            ):
+                new_source_head = self._git(info.source_root, "rev-parse", info.source_branch)
+            result = WorkspaceSourceSyncResult(
+                status="conflicts",
+                summary=(
+                    f"Recovered interrupted source-sync conflicts for issue {issue.id}; "
+                    "AI resolution is required before implementation rework can continue."
+                ),
+                target_branch=info.source_branch,
+                old_source_head=old_source_head,
+                new_source_head=new_source_head,
+                worktree_head=self._git(info.worktree_root, "rev-parse", "HEAD"),
+                conflict_files=conflict_files,
+                synced_at=utc_now_iso(),
+            )
+            self._write_source_sync_metadata(issue.id, metadata, result)
+            return WorkspaceMergeRecovery(
+                "ready_for_merge_conflict_resolution",
+                "interrupted",
+                result.summary,
+                result.artifact_markdown(),
+            )
+
+    def has_interrupted_source_sync_conflicts(self, issue: Issue) -> bool:
+        try:
+            metadata = self.artifacts.read_workspace_metadata(issue.id)
+        except (OSError, ValueError):
+            return False
+        if metadata is None:
+            return False
+        try:
+            info = WorkspaceInfo.from_metadata(metadata)
+        except (KeyError, TypeError, ValueError):
+            return False
+        try:
+            self._validate_merge_workspace(issue, info)
+        except WorkspaceError:
+            return False
+        return bool(self._conflicted_files(info.worktree_root))
 
     def commit_phase_snapshot(
         self,
@@ -493,11 +631,7 @@ class WorkspaceManager:
         except WorkspaceError as exc:
             return _merge_recovery_blocked(str(exc))
 
-        conflict_files = tuple(
-            line
-            for line in self._git(info.worktree_root, "diff", "--name-only", "--diff-filter=U").splitlines()
-            if line
-        )
+        conflict_files = self._conflicted_files(info.worktree_root)
         if conflict_files:
             result = WorkspaceMergeResult(
                 status="conflicts",
@@ -626,11 +760,7 @@ class WorkspaceManager:
                     f"Merge {branch} into issue {issue.id} workspace",
                 )
             except WorkspaceError as exc:
-                conflict_files = tuple(
-                    line
-                    for line in self._git(info.worktree_root, "diff", "--name-only", "--diff-filter=U").splitlines()
-                    if line
-                )
+                conflict_files = self._conflicted_files(info.worktree_root)
                 if not conflict_files:
                     try:
                         self._git(info.worktree_root, "merge", "--abort")
@@ -716,6 +846,83 @@ class WorkspaceManager:
             worktree_commit=preflight.worktree_commit,
             cleanup_removed=True,
         )
+
+    def _sync_source_into_workspace_locked(
+        self,
+        issue: Issue,
+        info: WorkspaceInfo,
+        metadata: dict[str, Any],
+        branch: str,
+        old_source_head: str | None,
+        synced_at: str,
+    ) -> WorkspaceSourceSyncResult:
+        self._ensure_clean_repo(info.source_root, "source repo")
+        self._ensure_clean_repo(info.worktree_root, "issue worktree")
+        if not self._git_check(info.source_root, "rev-parse", "--verify", branch):
+            raise WorkspaceError(f"Recorded source branch does not exist in source repo: {branch}")
+
+        new_source_head = self._git(info.source_root, "rev-parse", branch)
+        worktree_head = self._git(info.worktree_root, "rev-parse", "HEAD")
+        if self._git_check(info.worktree_root, "merge-base", "--is-ancestor", branch, "HEAD"):
+            result = WorkspaceSourceSyncResult(
+                status="up_to_date",
+                summary=f"Source branch {branch} is already included in issue {issue.id} workspace.",
+                target_branch=branch,
+                old_source_head=old_source_head,
+                new_source_head=new_source_head,
+                worktree_head=worktree_head,
+                synced_at=synced_at,
+            )
+            self._write_source_sync_metadata(issue.id, metadata, result)
+            return result
+
+        try:
+            self._git(
+                info.worktree_root,
+                "merge",
+                "--no-ff",
+                branch,
+                "-m",
+                f"Merge {branch} into issue {issue.id} workspace before implementation rework",
+            )
+        except WorkspaceError as exc:
+            conflict_files = self._conflicted_files(info.worktree_root)
+            if not conflict_files:
+                try:
+                    self._git(info.worktree_root, "merge", "--abort")
+                except WorkspaceError as abort_exc:
+                    raise WorkspaceError(f"{exc}\n\nAlso failed to abort workspace source sync: {abort_exc}") from abort_exc
+                raise
+            result = WorkspaceSourceSyncResult(
+                status="conflicts",
+                summary=(
+                    f"Source sync conflicts require resolution before implementation rework for issue "
+                    f"{issue.id}."
+                ),
+                target_branch=branch,
+                old_source_head=old_source_head,
+                new_source_head=new_source_head,
+                worktree_head=worktree_head,
+                conflict_files=conflict_files,
+                synced_at=synced_at,
+            )
+            self._write_source_sync_metadata(issue.id, metadata, result)
+            return result
+
+        sync_commit = self._git(info.worktree_root, "rev-parse", "HEAD")
+        self._ensure_clean_repo(info.worktree_root, "issue worktree")
+        result = WorkspaceSourceSyncResult(
+            status="synced",
+            summary=f"Merged source branch {branch} into issue {issue.id} workspace at {sync_commit[:12]}.",
+            target_branch=branch,
+            old_source_head=old_source_head,
+            new_source_head=new_source_head,
+            worktree_head=worktree_head,
+            sync_commit=sync_commit,
+            synced_at=synced_at,
+        )
+        self._write_source_sync_metadata(issue.id, metadata, result)
+        return result
 
     def _finalize_pull_request(
         self,
@@ -1166,6 +1373,50 @@ class WorkspaceManager:
                 removed.append(str(safe_path))
 
         return WorkspaceResetResult(removed_paths=tuple(removed), warnings=tuple(warnings))
+
+    def _workspace_metadata_for_update(self, issue: Issue, info: WorkspaceInfo) -> dict[str, Any]:
+        try:
+            metadata = self.artifacts.read_workspace_metadata(issue.id)
+        except (OSError, ValueError) as exc:
+            raise WorkspaceError(
+                f"Workspace metadata is unreadable for issue {issue.id}: "
+                f"{self.artifacts.workspace_metadata_path(issue.id)}"
+            ) from exc
+        if metadata is None:
+            raise WorkspaceError(f"Workspace metadata is missing for issue {issue.id}")
+        try:
+            metadata_info = WorkspaceInfo.from_metadata(metadata)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise WorkspaceError(
+                f"Workspace metadata is invalid for issue {issue.id}: "
+                f"{self.artifacts.workspace_metadata_path(issue.id)}"
+            ) from exc
+        if metadata_info != info:
+            raise WorkspaceError(
+                f"Workspace metadata changed while preparing source sync for issue {issue.id}; rerun the phase."
+            )
+        return dict(metadata)
+
+    def _write_source_sync_metadata(
+        self,
+        issue_id: int,
+        metadata: dict[str, Any],
+        result: WorkspaceSourceSyncResult,
+    ) -> None:
+        updated = {
+            **metadata,
+            "last_source_sync_at": result.synced_at,
+            "last_source_sync_branch": result.target_branch,
+            "last_source_sync_commit": result.sync_commit,
+            "last_source_sync_conflict_files": list(result.conflict_files),
+            "last_source_sync_head": result.new_source_head,
+            "last_source_sync_previous_head": result.old_source_head,
+            "last_source_sync_status": result.status,
+        }
+        self.artifacts.write_workspace_metadata(issue_id, updated)
+
+    def _conflicted_files(self, repo_path: Path) -> tuple[str, ...]:
+        return tuple(line for line in self._git(repo_path, "diff", "--name-only", "--diff-filter=U").splitlines() if line)
 
     def _commit_dirty_worktree(self, issue: Issue, info: WorkspaceInfo) -> str | None:
         subject, body = self._final_snapshot_commit_message(issue)

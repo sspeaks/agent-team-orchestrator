@@ -15,7 +15,7 @@ from .runners.base import AgentRunner
 from .runners.copilot_cli import PHASE_RECOMMENDATIONS, CopilotCliRunner
 from .runners.dry_run import DryRunRunner
 from .state_machine import default_next_phase, runnable_phase_for, running_phase_for
-from .workspaces import WorkspaceError, WorkspaceInfo, WorkspaceManager
+from .workspaces import WorkspaceError, WorkspaceInfo, WorkspaceManager, WorkspaceSourceSyncResult
 
 
 @dataclass(frozen=True)
@@ -60,11 +60,12 @@ class Orchestrator:
 
     def recover_interrupted_runs(self) -> list[RecoveryResult]:
         merge_results = self._recover_interrupted_merges()
+        source_sync_results = self._recover_interrupted_review_source_syncs()
         results = self.store.recover_interrupted_runs(
             is_lock_reclaimable=is_definitely_dead_same_host_owner,
             terminal_next_phase_resolver=self._terminal_next_phase_from_artifact,
         )
-        all_results = [*merge_results, *results]
+        all_results = [*merge_results, *source_sync_results, *results]
         self._record_recoveries(all_results)
         return all_results
 
@@ -72,6 +73,14 @@ class Orchestrator:
         issue = self.store.get_issue(issue_id)
         if issue.phase == "merging":
             result = self._recover_interrupted_merge_issue(issue)
+        elif issue.phase == "reviewing":
+            result = self._recover_interrupted_review_source_sync_issue(issue)
+            if result is None:
+                result = self.store.recover_interrupted_issue(
+                    issue_id,
+                    is_lock_reclaimable=is_definitely_dead_same_host_owner,
+                    terminal_next_phase_resolver=self._terminal_next_phase_from_artifact,
+                )
         else:
             result = self.store.recover_interrupted_issue(
                 issue_id,
@@ -179,6 +188,58 @@ class Orchestrator:
                     next_phase = "blocked"
             if phase == "plan" and result.status == "success" and next_phase == "awaiting_plan_approval":
                 self.artifacts.clear_plan_rejection_context(issue.id)
+            workspace_source_sync: dict[str, object] | None = None
+            if self._should_sync_source_before_rework(phase, workspace_info, final_status, next_phase):
+                try:
+                    sync_result = WorkspaceManager(
+                        self.config.worktrees_dir,
+                        self.artifacts,
+                        self.config.locks_dir or self.config.home / "locks",
+                    ).sync_source_into_workspace(issue, workspace_info)
+                except WorkspaceError as exc:
+                    final_status = "blocked"
+                    final_summary = f"Workspace source sync failed: {exc}"
+                    final_error = final_summary
+                    final_blocked_summary = summarize_blocked_reason(final_summary)
+                    next_phase = "blocked"
+                    human_input_request = None
+                    workspace_source_sync = {
+                        "status": "blocked",
+                        "summary": final_summary,
+                    }
+                    artifact_path = self.artifacts.write_phase_artifact(
+                        issue.id,
+                        phase,
+                        run_id,
+                        self._source_sync_blocked_artifact(phase, final_summary, result.artifact_markdown),
+                    )
+                else:
+                    workspace_source_sync = self._source_sync_history(sync_result)
+                    if sync_result.status == "conflicts":
+                        try:
+                            self.artifacts.archive_phase_artifact_before_run(issue.id, "merge", run_id)
+                            sync_artifact_path = self.artifacts.write_phase_artifact(
+                                issue.id,
+                                "merge",
+                                run_id,
+                                sync_result.artifact_markdown(),
+                            )
+                        except OSError as exc:
+                            final_status = "blocked"
+                            final_summary = f"Workspace source sync conflict artifact persistence failed: {exc}"
+                            final_error = final_summary
+                            final_blocked_summary = summarize_blocked_reason(final_summary)
+                            next_phase = "blocked"
+                            workspace_source_sync["artifact_error"] = str(exc)
+                            artifact_path = self.artifacts.write_phase_artifact(
+                                issue.id,
+                                phase,
+                                run_id,
+                                self._source_sync_blocked_artifact(phase, final_summary, result.artifact_markdown),
+                            )
+                        else:
+                            workspace_source_sync["artifact_path"] = str(sync_artifact_path)
+                            next_phase = "ready_for_merge_conflict_resolution"
             workspace_commit = None
             if self._should_commit_phase_snapshot(phase, workspace_info, final_status, next_phase):
                 try:
@@ -232,6 +293,8 @@ class Orchestrator:
                 )
             if workspace_commit is not None:
                 history_event["workspace_commit"] = workspace_commit
+            if workspace_source_sync is not None:
+                history_event["workspace_source_sync"] = workspace_source_sync
             if next_phase == "blocked":
                 final_blocked_summary = final_blocked_summary or summarize_blocked_reason(
                     result.artifact_markdown or final_error or result.error or final_summary
@@ -340,6 +403,73 @@ class Orchestrator:
             claimed_run_id=issue.current_run_id,
         )
 
+    def _recover_interrupted_review_source_syncs(self) -> list[RecoveryResult]:
+        results: list[RecoveryResult] = []
+        for issue in self.store.list_issues("open"):
+            if issue.phase != "reviewing":
+                continue
+            result = self._recover_interrupted_review_source_sync_issue(issue)
+            if result is not None:
+                results.append(result)
+        return results
+
+    def _recover_interrupted_review_source_sync_issue(self, issue: Issue) -> RecoveryResult | None:
+        manager = WorkspaceManager(
+            self.config.worktrees_dir,
+            self.artifacts,
+            self.config.locks_dir or self.config.home / "locks",
+        )
+        if not manager.has_interrupted_source_sync_conflicts(issue):
+            return None
+        issue = self.store.claim_interrupted_review_source_sync_recovery(
+            issue.id,
+            self.owner,
+            self.config.lock_ttl_seconds,
+            is_lock_reclaimable=is_definitely_dead_same_host_owner,
+        )
+        if issue is None:
+            return None
+        lease = _ReviewSourceSyncRecoveryLease(
+            self.store,
+            issue.id,
+            self.owner,
+            issue.current_run_id,
+            self.config.lock_ttl_seconds,
+        )
+        with lease:
+            recovery = manager.recover_interrupted_source_sync(issue)
+        issue = self.store.refresh_issue_lock(
+            issue.id,
+            self.owner,
+            self.config.lock_ttl_seconds,
+            expected_phase="reviewing",
+            expected_run_id=issue.current_run_id,
+        )
+        if issue is None:
+            return None
+        if recovery is None:
+            self.store.release_lock(issue.id, self.owner, issue.current_run_id)
+            return None
+        artifact_path: Path | None = None
+        if issue.current_run_id:
+            self.artifacts.archive_phase_artifact_before_run(issue.id, "merge", issue.current_run_id)
+            artifact_path = self.artifacts.write_phase_artifact(
+                issue.id,
+                "merge",
+                issue.current_run_id,
+                recovery.artifact_markdown,
+            )
+        return self.store.recover_interrupted_review_source_sync(
+            issue.id,
+            next_phase=recovery.next_phase,
+            run_status=recovery.run_status,
+            summary=recovery.summary,
+            artifact_path=str(artifact_path) if artifact_path is not None else None,
+            is_lock_reclaimable=is_definitely_dead_same_host_owner,
+            claimed_owner=self.owner,
+            claimed_run_id=issue.current_run_id,
+        )
+
     def _record_recoveries(self, results: list[RecoveryResult]) -> None:
         for result in results:
             event = {
@@ -434,6 +564,42 @@ class Orchestrator:
         )
 
     @staticmethod
+    def _should_sync_source_before_rework(
+        phase: str,
+        workspace_info: WorkspaceInfo | None,
+        final_status: str,
+        next_phase: str | None,
+    ) -> bool:
+        return (
+            phase == "review"
+            and workspace_info is not None
+            and final_status == "success"
+            and next_phase == "ready_for_implementation"
+        )
+
+    @staticmethod
+    def _source_sync_history(result: WorkspaceSourceSyncResult) -> dict[str, object]:
+        return {
+            "status": result.status,
+            "summary": result.summary,
+            "target_branch": result.target_branch,
+            "old_source_head": result.old_source_head,
+            "new_source_head": result.new_source_head,
+            "worktree_head": result.worktree_head,
+            "sync_commit": result.sync_commit,
+            "conflict_files": list(result.conflict_files),
+        }
+
+    @staticmethod
+    def _source_sync_blocked_artifact(phase: str, message: str, original_artifact_markdown: str) -> str:
+        title = phase.replace("_", " ").title()
+        sections = [f"# {title} Blocked During Source Sync", "", message]
+        if original_artifact_markdown.strip():
+            sections.extend(["", "## Original review artifact", "", original_artifact_markdown.strip()])
+        sections.extend(["", f"Blocked summary: {summarize_blocked_reason(message)}", "Recommendation: `blocked`"])
+        return "\n".join(sections)
+
+    @staticmethod
     def _blocked_workspace_result(message: str) -> AgentResult:
         return AgentResult(
             status="blocked",
@@ -468,8 +634,13 @@ class Orchestrator:
         return (
             workspace_info is not None
             and final_status == "success"
-            and next_phase == "ready_for_validation"
-            and phase in {"implementation", "merge_conflict_resolution"}
+            and (
+                (phase == "implementation" and next_phase == "ready_for_validation")
+                or (
+                    phase == "merge_conflict_resolution"
+                    and next_phase in {"ready_for_validation", "ready_for_implementation"}
+                )
+            )
         )
 
     @staticmethod
@@ -561,4 +732,24 @@ class _MergeRecoveryLease(_IssueLockHeartbeat):
             ttl_seconds,
             expected_phase="merging",
             thread_name=f"agent-team-merge-recovery-lease-{issue_id}",
+        )
+
+
+class _ReviewSourceSyncRecoveryLease(_IssueLockHeartbeat):
+    def __init__(
+        self,
+        store: IssueStore,
+        issue_id: int,
+        owner: str,
+        run_id: str | None,
+        ttl_seconds: int,
+    ) -> None:
+        super().__init__(
+            store,
+            issue_id,
+            owner,
+            run_id,
+            ttl_seconds,
+            expected_phase="reviewing",
+            thread_name=f"agent-team-review-source-sync-recovery-lease-{issue_id}",
         )

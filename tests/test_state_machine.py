@@ -74,6 +74,7 @@ class StateMachineTests(unittest.TestCase):
     def test_review_enters_merge_approval_gate(self) -> None:
         validate_transition("reviewing", "awaiting_merge_approval")
         validate_transition("reviewing", "ready_for_implementation")
+        validate_transition("reviewing", "ready_for_merge_conflict_resolution")
         with self.assertRaises(ValueError):
             validate_transition("reviewing", "done")
         self.assertEqual(default_next_phase("review"), "awaiting_merge_approval")
@@ -90,6 +91,7 @@ class StateMachineTests(unittest.TestCase):
         validate_transition("merging", "ready_for_merge_conflict_resolution")
         validate_transition("ready_for_merge_conflict_resolution", "resolving_merge_conflicts")
         validate_transition("resolving_merge_conflicts", "ready_for_validation")
+        validate_transition("resolving_merge_conflicts", "ready_for_implementation")
         self.assertEqual(runnable_phase_for("ready_for_merge_conflict_resolution"), "merge_conflict_resolution")
         self.assertEqual(default_next_phase("merge_conflict_resolution"), "ready_for_validation")
 
