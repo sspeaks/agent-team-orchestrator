@@ -2,15 +2,32 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import os
 import re
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from .artifacts import ArtifactStore
 from .models import Issue, utc_now_iso
+from .pull_requests import (
+    PullRequestError,
+    PullRequestRemote,
+    PullRequestRequest,
+    PullRequestResult,
+    SAFE_PULL_REQUEST_DESCRIPTION,
+    create_or_get_pull_request,
+    parse_pull_request_remote,
+)
+
+_REMOTE_GIT_COMMAND_TIMEOUT_SECONDS = 120.0
+_REMOTE_GIT_NONINTERACTIVE_ENV = {
+    "GIT_TERMINAL_PROMPT": "0",
+    "GCM_INTERACTIVE": "never",
+}
 
 
 class WorkspaceError(Exception):
@@ -27,6 +44,14 @@ class WorkspaceMergeResult:
     worktree_commit: str | None = None
     conflict_files: tuple[str, ...] = ()
     cleanup_removed: bool = False
+    pr_provider: str | None = None
+    pr_remote_name: str | None = None
+    pr_source_branch: str | None = None
+    pr_url: str | None = None
+    pr_id: str | None = None
+    pr_number: int | None = None
+    pr_status: str | None = None
+    pr_is_existing: bool = False
 
     def artifact_markdown(self) -> str:
         lines = [
@@ -43,6 +68,22 @@ class WorkspaceMergeResult:
             lines.append(f"- Worktree commit created: `{self.worktree_commit}`")
         if self.merge_commit:
             lines.append(f"- Merge commit: `{self.merge_commit}`")
+        if self.status == "pull_request":
+            if self.pr_provider:
+                lines.append(f"- Pull request provider: `{self.pr_provider}`")
+            if self.pr_remote_name:
+                lines.append(f"- Pull request remote: `{self.pr_remote_name}`")
+            if self.pr_source_branch:
+                lines.append(f"- Pull request source branch: `{self.pr_source_branch}`")
+            if self.pr_url:
+                lines.append(f"- Pull request URL: {self.pr_url}")
+            if self.pr_number is not None:
+                lines.append(f"- Pull request number: `{self.pr_number}`")
+            elif self.pr_id:
+                lines.append(f"- Pull request id: `{self.pr_id}`")
+            if self.pr_status:
+                lines.append(f"- Pull request status: `{self.pr_status}`")
+            lines.append(f"- Existing pull request reused: `{str(self.pr_is_existing).lower()}`")
         lines.append(f"- Worktree removed: `{str(self.cleanup_removed).lower()}`")
         if self.conflict_files:
             lines.extend(["", "## Conflicted files", ""])
@@ -120,6 +161,23 @@ class WorkspaceMergeRecovery:
 
 
 @dataclass(frozen=True)
+class _MergePreflightResult:
+    status: str
+    target_branch: str
+    merge_branch: str
+    worktree_head: str
+    integrated_head: str | None
+    worktree_commit: str | None
+    conflict_files: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _SelectedRemote:
+    remote: PullRequestRemote
+    push_url: str
+
+
+@dataclass(frozen=True)
 class WorkspaceResetResult:
     removed_paths: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
@@ -179,10 +237,22 @@ class _WorkspacePaths:
 
 
 class WorkspaceManager:
-    def __init__(self, worktrees_dir: Path, artifacts: ArtifactStore, locks_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        worktrees_dir: Path,
+        artifacts: ArtifactStore,
+        locks_dir: Path | None = None,
+        *,
+        merge_mode: str = "auto",
+        pr_remote: str | None = None,
+        pr_branch_prefix: str = "agent-team/issue-",
+    ) -> None:
         self.worktrees_dir = worktrees_dir
         self.artifacts = artifacts
         self.locks_dir = locks_dir
+        self.merge_mode = _normalize_merge_mode(merge_mode)
+        self.pr_remote = _clean_optional_string(pr_remote)
+        self.pr_branch_prefix = pr_branch_prefix
 
     def prepare(self, issue: Issue) -> WorkspaceInfo:
         paths = self._workspace_paths(issue)
@@ -354,6 +424,8 @@ class WorkspaceManager:
         merge_request = self.artifacts.read_merge_request(issue.id) or {}
         requested_branch = target_branch or _clean_optional_string(merge_request.get("target_branch"))
         approval_message = _clean_optional_string(merge_request.get("message"))
+        requested_mode = _normalize_merge_mode(_clean_optional_string(merge_request.get("mode")) or self.merge_mode)
+        requested_remote = _clean_optional_string(merge_request.get("remote_name")) or self.pr_remote
         branch = requested_branch or info.source_branch
         if not branch:
             raise WorkspaceError(
@@ -361,7 +433,14 @@ class WorkspaceManager:
             )
 
         with self._repo_lock(info):
-            return self._merge_and_cleanup_locked(issue, info, branch, approval_message)
+            return self._merge_and_cleanup_locked(
+                issue,
+                info,
+                branch,
+                approval_message,
+                requested_mode,
+                requested_remote,
+            )
 
     def recover_interrupted_merge(self, issue: Issue, target_branch: str | None = None) -> WorkspaceMergeRecovery:
         try:
@@ -373,6 +452,16 @@ class WorkspaceManager:
             )
         if merged_metadata is not None:
             return self._recover_merged_metadata(issue, merged_metadata)
+
+        try:
+            pull_request_metadata = self.artifacts.read_pull_request_metadata(issue.id)
+        except (OSError, ValueError) as exc:
+            return _merge_recovery_blocked(
+                f"Pull request metadata is unreadable for issue {issue.id}: "
+                f"{self.artifacts.pull_request_metadata_path(issue.id)}\n{exc}"
+            )
+        if pull_request_metadata is not None:
+            return self._recover_pull_request_metadata(issue, pull_request_metadata)
 
         try:
             metadata = self.artifacts.read_workspace_metadata(issue.id)
@@ -428,6 +517,15 @@ class WorkspaceManager:
                         f"{self.artifacts.merged_workspace_metadata_path(issue.id)}"
                     )
                 return self._recover_merged_metadata_locked(issue, latest_info, latest_merged_metadata)
+            try:
+                latest_pull_request_metadata = self.artifacts.read_pull_request_metadata(issue.id)
+            except (OSError, ValueError) as exc:
+                return _merge_recovery_blocked(
+                    f"Pull request metadata is unreadable for issue {issue.id}: "
+                    f"{self.artifacts.pull_request_metadata_path(issue.id)}\n{exc}"
+                )
+            if latest_pull_request_metadata is not None:
+                return self._recover_pull_request_metadata_locked(issue, info, latest_pull_request_metadata)
             return self._recover_interrupted_merge_locked(issue, info, branch)
 
     def _recover_merged_metadata(
@@ -444,6 +542,21 @@ class WorkspaceManager:
             )
         with self._repo_lock(info):
             return self._recover_merged_metadata_locked(issue, info, merged_metadata)
+
+    def _recover_pull_request_metadata(
+        self,
+        issue: Issue,
+        pull_request_metadata: dict[str, Any],
+    ) -> WorkspaceMergeRecovery:
+        try:
+            info = WorkspaceInfo.from_metadata(pull_request_metadata)
+        except (KeyError, TypeError, ValueError) as exc:
+            return _merge_recovery_blocked(
+                f"Pull request metadata is invalid for issue {issue.id}: "
+                f"{self.artifacts.pull_request_metadata_path(issue.id)}"
+            )
+        with self._repo_lock(info):
+            return self._recover_pull_request_metadata_locked(issue, info, pull_request_metadata)
 
     def _recover_merged_metadata_locked(
         self,
@@ -462,12 +575,7 @@ class WorkspaceManager:
             merged_metadata = {**merged_metadata, "cleanup_removed": True}
             self.artifacts.write_merged_workspace_metadata(issue.id, merged_metadata)
         self.artifacts.delete_workspace_metadata(issue.id)
-        merge_branch = f"agent-team/issue-{issue.id}-merge"
-        if info.source_root.is_dir() and self._git_check(info.source_root, "rev-parse", "--verify", merge_branch):
-            try:
-                self._git(info.source_root, "branch", "-d", merge_branch)
-            except WorkspaceError:
-                pass
+        self._delete_internal_merge_branches(issue.id, info.source_root, force=True)
         merge_commit = _clean_optional_string(merged_metadata.get("merge_commit"))
         target_branch = _clean_optional_string(merged_metadata.get("merge_target_branch"))
         suffix = f" at {merge_commit[:12]}" if merge_commit else ""
@@ -483,6 +591,31 @@ class WorkspaceManager:
         )
         return WorkspaceMergeRecovery("done", "success", result.summary, result.artifact_markdown())
 
+    def _recover_pull_request_metadata_locked(
+        self,
+        issue: Issue,
+        info: WorkspaceInfo,
+        pull_request_metadata: dict[str, Any],
+    ) -> WorkspaceMergeRecovery:
+        cleanup_removed = bool(pull_request_metadata.get("cleanup_removed"))
+        if not cleanup_removed:
+            if info.worktree_root.exists():
+                try:
+                    self._ensure_clean_repo(info.worktree_root, "issue worktree")
+                    self._git(info.source_root, "worktree", "remove", str(info.worktree_root))
+                except WorkspaceError as exc:
+                    return _merge_recovery_blocked(f"Pull request cleanup recovery could not remove worktree: {exc}")
+            pull_request_metadata = {**pull_request_metadata, "cleanup_removed": True}
+            self.artifacts.write_pull_request_metadata(issue.id, pull_request_metadata)
+        self.artifacts.delete_workspace_metadata(issue.id)
+        self._delete_internal_merge_branches(issue.id, info.source_root, force=True)
+        result = self._pull_request_result_from_metadata(
+            issue,
+            pull_request_metadata,
+            summary_prefix="Recovered completed pull request finalization",
+        )
+        return WorkspaceMergeRecovery("done", "success", result.summary, result.artifact_markdown())
+
     def _recover_interrupted_merge_locked(
         self,
         issue: Issue,
@@ -493,8 +626,10 @@ class WorkspaceManager:
             self._ensure_clean_repo(info.source_root, "source repo")
         except WorkspaceError as exc:
             return _merge_recovery_blocked(str(exc))
-        if not self._git_check(info.source_root, "rev-parse", "--verify", branch):
-            return _merge_recovery_blocked(f"Target branch does not exist in source repo: {branch}")
+        try:
+            branch = self._validate_local_target_branch(info.source_root, branch)
+        except WorkspaceError as exc:
+            return _merge_recovery_blocked(str(exc))
 
         conflict_files = self._conflicted_files(info.worktree_root)
         if conflict_files:
@@ -563,10 +698,46 @@ class WorkspaceManager:
         info: WorkspaceInfo,
         branch: str,
         approval_message: str | None,
+        requested_mode: str,
+        requested_remote: str | None,
     ) -> WorkspaceMergeResult:
+        preflight = self._prepare_merge_in_worktree(issue, info, branch)
+        if preflight.status == "conflicts":
+            return WorkspaceMergeResult(
+                status="conflicts",
+                summary=(
+                    "Merge conflicts require AI resolution before finalizing "
+                    f"issue {issue.id} into {preflight.target_branch}."
+                ),
+                target_branch=preflight.target_branch,
+                worktree_head=preflight.worktree_head,
+                merge_commit=None,
+                worktree_commit=preflight.worktree_commit,
+                conflict_files=preflight.conflict_files,
+                cleanup_removed=False,
+            )
+
+        assert preflight.integrated_head is not None
+        final_mode, selected_remote = self._select_finalization_mode(info, requested_mode, requested_remote)
+        if final_mode == "pull_request":
+            if selected_remote is None:
+                raise WorkspaceError("Pull request finalization requires a supported remote.")
+            return self._finalize_pull_request(
+                issue,
+                info,
+                preflight,
+                selected_remote,
+            )
+        return self._finalize_local_merge(issue, info, preflight, approval_message)
+
+    def _prepare_merge_in_worktree(
+        self,
+        issue: Issue,
+        info: WorkspaceInfo,
+        branch: str,
+    ) -> _MergePreflightResult:
         self._ensure_clean_repo(info.source_root, "source repo")
-        if not self._git_check(info.source_root, "rev-parse", "--verify", branch):
-            raise WorkspaceError(f"Target branch does not exist in source repo: {branch}")
+        branch = self._validate_local_target_branch(info.source_root, branch)
         worktree_commit = self._commit_dirty_worktree(issue, info)
         self._ensure_clean_repo(info.worktree_root, "issue worktree")
         worktree_head = self._git(info.worktree_root, "rev-parse", "HEAD")
@@ -575,8 +746,8 @@ class WorkspaceManager:
                 f"Worktree has no commits beyond source HEAD {info.source_head[:12]}; nothing can be merged."
             )
 
-        merge_branch = f"agent-team/issue-{issue.id}-merge"
-        self._git(info.worktree_root, "checkout", "-B", merge_branch, worktree_head)
+        merge_branch = self._merge_branch_name(issue.id, worktree_head)
+        self._checkout_internal_merge_branch(info, merge_branch, worktree_head)
 
         if not self._git_check(info.worktree_root, "merge-base", "--is-ancestor", branch, "HEAD"):
             try:
@@ -596,19 +767,38 @@ class WorkspaceManager:
                     except WorkspaceError as abort_exc:
                         raise WorkspaceError(f"{exc}\n\nAlso failed to abort workspace merge: {abort_exc}") from abort_exc
                     raise
-                return WorkspaceMergeResult(
+                return _MergePreflightResult(
                     status="conflicts",
-                    summary=f"Merge conflicts require AI resolution before merging issue {issue.id} into {branch}.",
                     target_branch=branch,
+                    merge_branch=merge_branch,
                     worktree_head=worktree_head,
-                    merge_commit=None,
+                    integrated_head=None,
                     worktree_commit=worktree_commit,
                     conflict_files=conflict_files,
-                    cleanup_removed=False,
                 )
 
         integrated_head = self._git(info.worktree_root, "rev-parse", "HEAD")
         self._ensure_clean_repo(info.worktree_root, "issue worktree")
+        self._ensure_clean_repo(info.source_root, "source repo")
+        return _MergePreflightResult(
+            status="ready",
+            target_branch=branch,
+            merge_branch=merge_branch,
+            worktree_head=worktree_head,
+            integrated_head=integrated_head,
+            worktree_commit=worktree_commit,
+        )
+
+    def _finalize_local_merge(
+        self,
+        issue: Issue,
+        info: WorkspaceInfo,
+        preflight: _MergePreflightResult,
+        approval_message: str | None,
+    ) -> WorkspaceMergeResult:
+        integrated_head = _require_string(preflight.integrated_head, "integrated worktree head")
+        branch = preflight.target_branch
+        merge_branch = preflight.merge_branch
         self._ensure_clean_repo(info.source_root, "source repo")
         self._git(info.source_root, "checkout", branch)
 
@@ -638,22 +828,22 @@ class WorkspaceManager:
             "merge_target_branch": branch,
             "merged_at": utc_now_iso(),
             "worktree_head": integrated_head,
-            "worktree_commit": worktree_commit,
+            "worktree_commit": preflight.worktree_commit,
+            "merge_branch": merge_branch,
         }
         self.artifacts.write_merged_workspace_metadata(issue.id, merged_metadata)
         self._git(info.source_root, "worktree", "remove", str(info.worktree_root))
         merged_metadata["cleanup_removed"] = True
         self.artifacts.write_merged_workspace_metadata(issue.id, merged_metadata)
         self.artifacts.delete_workspace_metadata(issue.id)
-        if self._git_check(info.source_root, "rev-parse", "--verify", merge_branch):
-            self._git(info.source_root, "branch", "-d", merge_branch)
+        self._delete_internal_merge_branches(issue.id, info.source_root, force=True)
         return WorkspaceMergeResult(
             status="merged",
             summary=f"Merged issue {issue.id} worktree into {branch} at {merge_commit[:12]}.",
             target_branch=branch,
             worktree_head=integrated_head,
             merge_commit=merge_commit,
-            worktree_commit=worktree_commit,
+            worktree_commit=preflight.worktree_commit,
             cleanup_removed=True,
         )
 
@@ -733,6 +923,395 @@ class WorkspaceManager:
         )
         self._write_source_sync_metadata(issue.id, metadata, result)
         return result
+
+    def _finalize_pull_request(
+        self,
+        issue: Issue,
+        info: WorkspaceInfo,
+        preflight: _MergePreflightResult,
+        selected_remote: _SelectedRemote,
+    ) -> WorkspaceMergeResult:
+        integrated_head = _require_string(preflight.integrated_head, "integrated worktree head")
+        source_branch = self._pull_request_branch(issue)
+        self._push_pull_request_branch(issue, info, selected_remote, source_branch, integrated_head)
+        body_path = self._write_pull_request_body(
+            issue,
+            preflight,
+            selected_remote,
+            source_branch,
+            integrated_head,
+        )
+        request = PullRequestRequest(
+            source_branch=source_branch,
+            target_branch=preflight.target_branch,
+            title=f"Issue {issue.id}: {_single_line(issue.title)}",
+            body_path=body_path,
+        )
+        try:
+            pr_result = create_or_get_pull_request(selected_remote.remote, request)
+        except PullRequestError as exc:
+            raise WorkspaceError(str(exc)) from exc
+        metadata = self._pull_request_metadata(
+            issue,
+            info,
+            preflight,
+            selected_remote,
+            pr_result,
+            integrated_head,
+        )
+        self.artifacts.write_pull_request_metadata(issue.id, metadata)
+        self._git(info.source_root, "worktree", "remove", str(info.worktree_root))
+        metadata["cleanup_removed"] = True
+        self.artifacts.write_pull_request_metadata(issue.id, metadata)
+        self.artifacts.delete_workspace_metadata(issue.id)
+        self._delete_internal_merge_branches(issue.id, info.source_root, force=True)
+        return self._pull_request_result_from_metadata(issue, metadata)
+
+    def _validate_local_target_branch(self, source_root: Path, branch: str) -> str:
+        target = _clean_optional_string(branch)
+        if target is None:
+            raise WorkspaceError("Target branch is empty.")
+        if target == "HEAD" or target.startswith("refs/") or "@{" in target:
+            raise WorkspaceError(
+                f"Target branch must be an existing local branch name, not a revision or full ref: {target}"
+            )
+        if not self._git_check(source_root, "check-ref-format", "--branch", target):
+            raise WorkspaceError(f"Target branch is not a valid local branch name: {target}")
+        if not self._git_check(source_root, "show-ref", "--verify", "--quiet", f"refs/heads/{target}"):
+            raise WorkspaceError(f"Target branch is not an existing local branch in source repo: {target}")
+        return target
+
+    @staticmethod
+    def _merge_branch_name(issue_id: int, worktree_head: str) -> str:
+        return f"agent-team/issue-{issue_id}-merge-{worktree_head[:12]}"
+
+    def _checkout_internal_merge_branch(
+        self,
+        info: WorkspaceInfo,
+        merge_branch: str,
+        worktree_head: str,
+    ) -> None:
+        ref = f"refs/heads/{merge_branch}"
+        if self._git_check(info.source_root, "show-ref", "--verify", "--quiet", ref):
+            existing_head = self._git(info.source_root, "rev-parse", ref)
+            if existing_head != worktree_head:
+                raise WorkspaceError(
+                    f"Internal merge branch '{merge_branch}' already exists at {existing_head[:12]}, "
+                    f"not prepared worktree head {worktree_head[:12]}. Refusing to reset it."
+                )
+            self._git(info.worktree_root, "checkout", merge_branch)
+            return
+        self._git(info.worktree_root, "checkout", "-b", merge_branch, worktree_head)
+
+    @staticmethod
+    def _is_internal_merge_branch(issue_id: int, merge_branch: str) -> bool:
+        prefix = f"agent-team/issue-{issue_id}-merge-"
+        suffix = merge_branch[len(prefix) :] if merge_branch.startswith(prefix) else ""
+        return bool(re.fullmatch(r"[0-9a-f]{12}", suffix))
+
+    def _select_finalization_mode(
+        self,
+        info: WorkspaceInfo,
+        requested_mode: str,
+        requested_remote: str | None,
+    ) -> tuple[str, _SelectedRemote | None]:
+        mode = _normalize_merge_mode(requested_mode)
+        if mode == "local":
+            return "local", None
+        remote_names = self._remote_names(info.source_root)
+        if not remote_names:
+            if mode == "pull_request":
+                raise WorkspaceError("Pull request finalization was requested, but the source repo has no remotes.")
+            return "local", None
+        selected_remote = self._select_pull_request_remote(info, requested_remote, remote_names)
+        if selected_remote is not None:
+            return "pull_request", selected_remote
+        if requested_remote:
+            raise WorkspaceError(
+                f"Remote '{requested_remote}' does not use a supported pull request provider. "
+                "Supported remote providers are GitHub and Azure DevOps Services; approve with --mode local "
+                "to merge locally instead."
+            )
+        raise WorkspaceError(
+            "The source repo has remotes, but none use a supported pull request provider. "
+            "Supported remote providers are GitHub and Azure DevOps Services; approve with --mode local "
+            "to merge locally instead."
+        )
+
+    def _select_pull_request_remote(
+        self,
+        info: WorkspaceInfo,
+        requested_remote: str | None,
+        remote_names: list[str],
+    ) -> _SelectedRemote | None:
+        names = [requested_remote] if requested_remote else remote_names
+        validation_errors: list[str] = []
+        for remote_name in names:
+            if remote_name is None:
+                continue
+            if remote_name not in remote_names:
+                raise WorkspaceError(f"Requested pull request remote does not exist: {remote_name}")
+            remote_url = self._git(info.source_root, "remote", "get-url", remote_name)
+            push_url = self._git(info.source_root, "remote", "get-url", "--push", remote_name)
+            remote = parse_pull_request_remote(remote_name, remote_url)
+            if remote is not None:
+                try:
+                    self._validate_pull_request_push_url(remote, push_url)
+                except WorkspaceError as exc:
+                    if requested_remote:
+                        raise
+                    validation_errors.append(str(exc))
+                    continue
+                return _SelectedRemote(remote=remote, push_url=push_url)
+        if validation_errors:
+            raise WorkspaceError(
+                "The source repo has remotes that use supported pull request providers, but none have usable "
+                f"push URLs. {' '.join(validation_errors)}"
+            )
+        return None
+
+    def _validate_pull_request_push_url(self, remote: PullRequestRemote, push_url: str) -> None:
+        if _remote_url_embeds_credentials(push_url):
+            raise WorkspaceError(
+                f"Remote '{remote.remote_name}' push URL embeds credentials. Refusing to pass "
+                "credential-bearing remote URLs to git; use a Git credential helper, an authenticated SSH remote, "
+                "or approve with --mode local to merge locally instead."
+            )
+        if _remote_url_has_query_or_fragment(push_url):
+            raise WorkspaceError(
+                f"Remote '{remote.remote_name}' push URL includes query or fragment components. Refusing to pass "
+                "potentially credential-bearing remote URLs to git; use a Git credential helper, an authenticated "
+                "SSH remote, or approve with --mode local to merge locally instead."
+            )
+        push_remote = parse_pull_request_remote(remote.remote_name, push_url)
+        if push_remote is None:
+            raise WorkspaceError(
+                f"Remote '{remote.remote_name}' fetch URL resolves to {_pull_request_remote_label(remote)}, "
+                "but its push URL does not resolve to a supported pull request provider repository. "
+                "The fetch and push URLs must resolve to the same GitHub or Azure DevOps Services repository; "
+                "approve with --mode local to merge locally instead."
+            )
+        if not _same_pull_request_repository(remote, push_remote):
+            raise WorkspaceError(
+                f"Remote '{remote.remote_name}' fetch URL resolves to {_pull_request_remote_label(remote)}, "
+                f"but its push URL resolves to {_pull_request_remote_label(push_remote)}. "
+                "Refusing to push issue work to a different repository; fix the remote push URL or approve "
+                "with --mode local to merge locally instead."
+            )
+
+    def _remote_names(self, source_root: Path) -> list[str]:
+        return [line for line in self._git(source_root, "remote").splitlines() if line]
+
+    def _pull_request_branch(self, issue: Issue) -> str:
+        branch = f"{self.pr_branch_prefix}{issue.id}"
+        if not self._git_check(Path.cwd(), "check-ref-format", "--branch", branch):
+            raise WorkspaceError(
+                f"Configured pull request branch name is not a valid Git branch: {branch}. "
+                "Check AGENT_TEAM_PR_BRANCH_PREFIX."
+            )
+        return branch
+
+    def _push_pull_request_branch(
+        self,
+        issue: Issue,
+        info: WorkspaceInfo,
+        selected_remote: _SelectedRemote,
+        source_branch: str,
+        integrated_head: str,
+    ) -> None:
+        remote_head = self._remote_branch_head(info.source_root, selected_remote.push_url, source_branch)
+        if remote_head == integrated_head:
+            return
+        push_args = ["push"]
+        if remote_head is None:
+            push_args.append(f"--force-with-lease=refs/heads/{source_branch}:")
+        else:
+            prior_metadata = self._read_pull_request_metadata_for_push(issue.id)
+            expected_heads = self._metadata_pr_branch_expected_heads(
+                prior_metadata,
+                selected_remote.remote,
+                source_branch,
+            )
+            if not expected_heads:
+                raise WorkspaceError(
+                    f"Remote branch '{source_branch}' already exists on '{selected_remote.remote.remote_name}' "
+                    f"at {remote_head[:12]}, not the prepared head {integrated_head[:12]}. "
+                    "Refusing to overwrite it without existing pull_request.json ownership metadata for the "
+                    "same provider repository and a recorded branch head."
+                )
+            expected_head = next((head for head in expected_heads if head == remote_head), None)
+            if expected_head is None:
+                expected_text = ", ".join(head[:12] for head in expected_heads)
+                raise WorkspaceError(
+                    f"Remote branch '{source_branch}' already exists on '{selected_remote.remote.remote_name}' "
+                    f"at {remote_head[:12]}, but pull_request.json last recorded the orchestrator-owned head as "
+                    f"{expected_text}. Refusing to overwrite remote branch changes made after PR finalization; "
+                    "inspect the remote branch before retrying."
+                )
+            push_args.append(f"--force-with-lease=refs/heads/{source_branch}:{expected_head}")
+        push_args.extend(
+            [
+                selected_remote.push_url,
+                f"{integrated_head}:refs/heads/{source_branch}",
+            ]
+        )
+        self._git_remote(info.source_root, *push_args)
+
+    def _remote_branch_head(self, source_root: Path, remote_ref: str, branch: str) -> str | None:
+        if _remote_url_embeds_credentials(remote_ref):
+            raise WorkspaceError(
+                "Refusing to pass a credential-bearing remote URL to git. Use a Git credential helper "
+                "or an authenticated SSH remote instead."
+            )
+        if _remote_url_has_query_or_fragment(remote_ref):
+            raise WorkspaceError(
+                "Refusing to pass a remote URL with query or fragment components to git. Use a Git "
+                "credential helper or an authenticated SSH remote instead."
+            )
+        output = self._git_remote(source_root, "ls-remote", "--heads", remote_ref, branch)
+        for line in output.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == f"refs/heads/{branch}":
+                return parts[0]
+        return None
+
+    def _read_pull_request_metadata_for_push(self, issue_id: int) -> dict[str, Any] | None:
+        try:
+            return self.artifacts.read_pull_request_metadata(issue_id)
+        except (OSError, ValueError) as exc:
+            raise WorkspaceError(
+                f"Pull request metadata is unreadable for issue {issue_id}: "
+                f"{self.artifacts.pull_request_metadata_path(issue_id)}\n{exc}"
+            ) from exc
+
+    @staticmethod
+    def _metadata_owns_pr_branch(
+        metadata: dict[str, Any] | None,
+        remote: PullRequestRemote,
+        source_branch: str,
+    ) -> bool:
+        if metadata is None:
+            return False
+        metadata_identity = _metadata_pull_request_remote_identity(metadata)
+        return (
+            _clean_optional_string(metadata.get("remote_name")) == remote.remote_name
+            and _clean_optional_string(metadata.get("source_branch")) == source_branch
+            and metadata_identity == _pull_request_remote_identity(remote)
+        )
+
+    @classmethod
+    def _metadata_pr_branch_expected_heads(
+        cls,
+        metadata: dict[str, Any] | None,
+        remote: PullRequestRemote,
+        source_branch: str,
+    ) -> tuple[str, ...]:
+        if not cls._metadata_owns_pr_branch(metadata, remote, source_branch) or metadata is None:
+            return ()
+        heads: list[str] = []
+        for key in ("head_commit", "worktree_head"):
+            head = _clean_optional_string(metadata.get(key))
+            if head is not None and head not in heads:
+                heads.append(head)
+        return tuple(heads)
+
+    def _write_pull_request_body(
+        self,
+        issue: Issue,
+        preflight: _MergePreflightResult,
+        selected_remote: _SelectedRemote,
+        source_branch: str,
+        integrated_head: str,
+    ) -> Path:
+        path = self.artifacts.issue_dir(issue.id) / "pull_request_body.md"
+        lines = [
+            f"# Issue {issue.id}: {_single_line(issue.title)}",
+            "",
+            SAFE_PULL_REQUEST_DESCRIPTION,
+            "",
+            "## Agent-team finalization",
+            "",
+            f"- Source branch: `{source_branch}`",
+            f"- Target branch: `{preflight.target_branch}`",
+            f"- Head commit: `{integrated_head}`",
+            f"- Provider: `{selected_remote.remote.provider}`",
+            f"- Remote: `{selected_remote.remote.remote_name}`",
+        ]
+        if preflight.worktree_commit:
+            lines.append(f"- Final workspace snapshot commit: `{preflight.worktree_commit}`")
+        path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        return path
+
+    def _pull_request_metadata(
+        self,
+        issue: Issue,
+        info: WorkspaceInfo,
+        preflight: _MergePreflightResult,
+        selected_remote: _SelectedRemote,
+        pr_result: PullRequestResult,
+        integrated_head: str,
+    ) -> dict[str, Any]:
+        return {
+            **info.to_metadata(),
+            "cleanup_removed": False,
+            "finalized_at": utc_now_iso(),
+            "mode": "pull_request",
+            "provider": pr_result.provider,
+            "remote_name": pr_result.remote_name,
+            "remote_url": _redact_remote_url(selected_remote.remote.url),
+            "remote_identity": list(_pull_request_remote_identity(selected_remote.remote)),
+            "source_branch": pr_result.source_branch,
+            "target_branch": pr_result.target_branch,
+            "head_commit": integrated_head,
+            "worktree_head": integrated_head,
+            "worktree_commit": preflight.worktree_commit,
+            "merge_branch": preflight.merge_branch,
+            "title": pr_result.title,
+            "url": pr_result.url,
+            "id": pr_result.id,
+            "number": pr_result.number,
+            "pr_status": pr_result.status,
+            "is_existing": pr_result.is_existing,
+            "raw": pr_result.raw,
+        }
+
+    def _pull_request_result_from_metadata(
+        self,
+        issue: Issue,
+        metadata: dict[str, Any],
+        *,
+        summary_prefix: str | None = None,
+    ) -> WorkspaceMergeResult:
+        url = _clean_optional_string(metadata.get("url"))
+        source_branch = _clean_optional_string(metadata.get("source_branch"))
+        target_branch = _clean_optional_string(metadata.get("target_branch"))
+        head_commit = _clean_optional_string(metadata.get("head_commit")) or _clean_optional_string(
+            metadata.get("worktree_head")
+        )
+        existing = bool(metadata.get("is_existing"))
+        action = "Reused existing pull request" if existing else "Opened pull request"
+        if summary_prefix:
+            action = summary_prefix
+        target_text = f" into {target_branch}" if target_branch else ""
+        url_text = f": {url}" if url else "."
+        summary = f"{action} for issue {issue.id}{target_text}{url_text}"
+        return WorkspaceMergeResult(
+            status="pull_request",
+            summary=summary,
+            target_branch=target_branch,
+            worktree_head=head_commit,
+            merge_commit=None,
+            worktree_commit=_clean_optional_string(metadata.get("worktree_commit")),
+            cleanup_removed=bool(metadata.get("cleanup_removed")),
+            pr_provider=_clean_optional_string(metadata.get("provider")),
+            pr_remote_name=_clean_optional_string(metadata.get("remote_name")),
+            pr_source_branch=source_branch,
+            pr_url=url,
+            pr_id=_clean_optional_string(metadata.get("id")),
+            pr_number=_clean_optional_int(metadata.get("number")),
+            pr_status=_clean_optional_string(metadata.get("pr_status")),
+            pr_is_existing=existing,
+        )
 
     def reset_issue_workspace(self, issue: Issue) -> WorkspaceResetResult:
         candidates: list[Path] = []
@@ -1216,9 +1795,20 @@ class WorkspaceManager:
         return False
 
     def _delete_reset_merge_branch(self, issue_id: int, source_root: Path) -> None:
-        merge_branch = f"agent-team/issue-{issue_id}-merge"
-        if self._git_check(source_root, "rev-parse", "--verify", merge_branch):
-            self._git(source_root, "branch", "-D", merge_branch)
+        self._delete_internal_merge_branches(issue_id, source_root, force=True)
+
+    def _delete_internal_merge_branches(self, issue_id: int, source_root: Path, *, force: bool) -> None:
+        if not source_root.is_dir():
+            return
+        output = self._git(
+            source_root,
+            "for-each-ref",
+            "--format=%(refname:short)",
+            f"refs/heads/agent-team/issue-{issue_id}-merge-*",
+        )
+        for merge_branch in output.splitlines():
+            if self._is_internal_merge_branch(issue_id, merge_branch):
+                self._git(source_root, "branch", "-D" if force else "-d", merge_branch)
 
     @staticmethod
     def _repo_lock_key(source_git_common_dir: Path) -> str:
@@ -1230,16 +1820,56 @@ class WorkspaceManager:
 
     @staticmethod
     def _git(repo_path: Path, *args: str) -> str:
+        return WorkspaceManager._run_git(repo_path, *args)
+
+    @staticmethod
+    def _git_remote(repo_path: Path, *args: str) -> str:
+        return WorkspaceManager._run_git(
+            repo_path,
+            *args,
+            noninteractive=True,
+            timeout_seconds=_REMOTE_GIT_COMMAND_TIMEOUT_SECONDS,
+        )
+
+    @staticmethod
+    def _run_git(
+        repo_path: Path,
+        *args: str,
+        noninteractive: bool = False,
+        timeout_seconds: float | None = None,
+    ) -> str:
         command = ["git", "-C", str(repo_path), *args]
+        env = None
+        stdin = None
+        if noninteractive:
+            env = os.environ.copy()
+            env.update(_REMOTE_GIT_NONINTERACTIVE_ENV)
+            stdin = subprocess.DEVNULL
         try:
-            completed = subprocess.run(command, text=True, capture_output=True, check=False)
+            completed = subprocess.run(
+                command,
+                text=True,
+                capture_output=True,
+                check=False,
+                stdin=stdin,
+                env=env,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            rendered_args = " ".join(_redact_git_text(arg) for arg in args)
+            raise WorkspaceError(
+                f"Git remote operation timed out after {timeout_seconds:g} seconds for {repo_path}: "
+                f"{rendered_args}. Verify remote access and credentials are configured non-interactively "
+                "before retrying."
+            ) from exc
         except FileNotFoundError as exc:
             raise WorkspaceError("Git executable was not found while preparing an isolated workspace") from exc
         if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout or "").strip()
+            detail = _redact_git_text((completed.stderr or completed.stdout or "").strip())
             if args[:2] == ("rev-parse", "--show-toplevel"):
                 raise WorkspaceError(f"Target repo path is not inside a Git worktree: {repo_path}")
-            raise WorkspaceError(f"Git command failed for {repo_path}: {' '.join(args)}\n{detail}".rstrip())
+            rendered_args = " ".join(_redact_git_text(arg) for arg in args)
+            raise WorkspaceError(f"Git command failed for {repo_path}: {rendered_args}\n{detail}".rstrip())
         return completed.stdout.strip()
 
     @staticmethod
@@ -1257,6 +1887,93 @@ def _clean_optional_string(value: object) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _clean_optional_int(value: object) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except ValueError:
+        return None
+
+
+def _normalize_merge_mode(value: str) -> str:
+    normalized = value.strip().lower().replace("-", "_")
+    if normalized not in {"auto", "local", "pull_request"}:
+        raise WorkspaceError(f"Merge mode must be one of: auto, local, pull_request (got {value!r})")
+    return normalized
+
+
+def _require_string(value: str | None, label: str) -> str:
+    cleaned = _clean_optional_string(value)
+    if cleaned is None:
+        raise WorkspaceError(f"Missing {label}")
+    return cleaned
+
+
+def _same_pull_request_repository(left: PullRequestRemote, right: PullRequestRemote) -> bool:
+    return _pull_request_remote_identity(left) == _pull_request_remote_identity(right)
+
+
+def _metadata_pull_request_remote_identity(metadata: dict[str, Any]) -> tuple[str, ...] | None:
+    identity = metadata.get("remote_identity")
+    if isinstance(identity, (list, tuple)):
+        parts: list[str] = []
+        for part in identity:
+            cleaned = _clean_optional_string(part)
+            if cleaned is None:
+                return None
+            parts.append(_identity_part(cleaned))
+        if parts:
+            return tuple(parts)
+
+    remote_url = _clean_optional_string(metadata.get("remote_url"))
+    if remote_url is None:
+        return None
+    remote_name = _clean_optional_string(metadata.get("remote_name")) or "origin"
+    remote = parse_pull_request_remote(remote_name, remote_url)
+    if remote is None:
+        return None
+    provider = _clean_optional_string(metadata.get("provider"))
+    remote_identity = _pull_request_remote_identity(remote)
+    if provider is not None and _identity_part(provider) != remote_identity[0]:
+        return None
+    return remote_identity
+
+
+def _pull_request_remote_identity(remote: PullRequestRemote) -> tuple[str, ...]:
+    if remote.provider == "github":
+        return (
+            remote.provider,
+            _identity_part(remote.owner),
+            _identity_part(remote.repo),
+        )
+    if remote.provider == "azure-devops":
+        return (
+            remote.provider,
+            _identity_part(remote.org),
+            _identity_part(remote.project),
+            _identity_part(remote.repo),
+        )
+    return (remote.provider, _identity_part(remote.url))
+
+
+def _identity_part(value: str | None) -> str:
+    return (value or "").strip().casefold()
+
+
+def _pull_request_remote_label(remote: PullRequestRemote) -> str:
+    if remote.provider == "github":
+        owner = remote.owner or "unknown-owner"
+        return f"GitHub {owner}/{remote.repo}"
+    if remote.provider == "azure-devops":
+        org = remote.org or "unknown-org"
+        project = remote.project or "unknown-project"
+        return f"Azure DevOps Services {org}/{project}/{remote.repo}"
+    return f"{remote.provider} {_redact_remote_url(remote.url)}"
 
 
 def _single_line(value: str) -> str:
@@ -1421,6 +2138,61 @@ def _is_recommendation_line(line: str) -> bool:
     stripped = re.sub(r"^\d+[\.)]\s+", "", line.strip())
     stripped = stripped.strip("*_` ")
     return bool(re.match(r"recommendation\b", stripped, flags=re.IGNORECASE))
+
+
+def _redact_remote_url(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return value
+    if not parsed.scheme or not parsed.netloc:
+        return value
+    hostname = parsed.hostname
+    if hostname is None:
+        return value
+    host = f"[{hostname}]" if ":" in hostname and not hostname.startswith("[") else hostname
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    netloc = f"{host}:{port}" if port is not None else host
+    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+
+
+def _remote_url_embeds_credentials(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    if not parsed.scheme or not parsed.netloc:
+        return False
+    if parsed.password is not None:
+        return True
+    return parsed.scheme.lower() in {"http", "https"} and parsed.username is not None
+
+
+def _remote_url_has_query_or_fragment(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    return bool(parsed.query or parsed.fragment)
+
+
+_CREDENTIAL_URL_RE = re.compile(
+    r"\b([A-Za-z][A-Za-z0-9+.-]*://)([^/\s:@]+(?::[^/\s@]*)?@)",
+    re.IGNORECASE,
+)
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b("
+    r"access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd|pat|secret|sig|token"
+    r")(\s*[:=]\s*)([^\s&#;,]+)"
+)
+
+
+def _redact_git_text(value: str) -> str:
+    redacted = _CREDENTIAL_URL_RE.sub(r"\1[redacted]@", value)
+    return _SECRET_ASSIGNMENT_RE.sub(r"\1\2[redacted]", redacted)
 
 
 def _truncate_snapshot_subject_detail(value: str) -> str:

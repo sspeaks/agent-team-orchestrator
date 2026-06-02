@@ -76,6 +76,9 @@ class AppConfig:
     worker_concurrency: int = 1
     worker_interval_seconds: int = 60
     vscode_wsl_distro: str | None = None
+    merge_mode: str = "auto"
+    pr_remote: str | None = None
+    pr_branch_prefix: str = "agent-team/issue-"
 
 
 def load_config(config_path: str | Path | None = None) -> AppConfig:
@@ -126,6 +129,9 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
         _config_non_negative_int(worker_config, "worker_interval_seconds", 60),
     )
     vscode_wsl_distro = _vscode_wsl_distro(web_config)
+    merge_mode = _merge_mode()
+    pr_remote = _env_optional_string("AGENT_TEAM_PR_REMOTE")
+    pr_branch_prefix = _env_optional_string("AGENT_TEAM_PR_BRANCH_PREFIX") or "agent-team/issue-"
     return AppConfig(
         home=home,
         db_path=home / "state.db",
@@ -146,6 +152,9 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
         worker_concurrency=worker_concurrency,
         worker_interval_seconds=worker_interval_seconds,
         vscode_wsl_distro=vscode_wsl_distro,
+        merge_mode=merge_mode,
+        pr_remote=pr_remote,
+        pr_branch_prefix=pr_branch_prefix,
     )
 
 
@@ -381,6 +390,19 @@ def _copilot_permission_mode(raw_value: str) -> str:
     if value not in {"phase", "yolo"}:
         raise ValueError("copilot.permission_mode/AGENT_TEAM_COPILOT_PERMISSION_MODE must be one of: phase, yolo")
     return value
+
+
+def _merge_mode() -> str:
+    value = os.environ.get("AGENT_TEAM_MERGE_MODE", "auto").strip().lower().replace("-", "_")
+    if value not in {"auto", "local", "pull_request"}:
+        raise ValueError("AGENT_TEAM_MERGE_MODE must be one of: auto, local, pull_request")
+    return value
+
+
+def _env_optional_string(name: str) -> str | None:
+    if name not in os.environ:
+        return None
+    return os.environ[name].strip() or None
 
 
 def _env_bool(name: str) -> bool:

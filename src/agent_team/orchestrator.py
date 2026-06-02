@@ -243,7 +243,7 @@ class Orchestrator:
             workspace_commit = None
             if self._should_commit_phase_snapshot(phase, workspace_info, final_status, next_phase):
                 try:
-                    workspace_commit = WorkspaceManager(self.config.worktrees_dir, self.artifacts).commit_phase_snapshot(
+                    workspace_commit = self._workspace_manager().commit_phase_snapshot(
                         issue,
                         workspace_info,
                         phase=phase,
@@ -365,11 +365,7 @@ class Orchestrator:
         )
         if issue is None:
             return None
-        manager = WorkspaceManager(
-            self.config.worktrees_dir,
-            self.artifacts,
-            self.config.locks_dir or self.config.home / "locks",
-        )
+        manager = self._workspace_manager()
         lease = _MergeRecoveryLease(
             self.store,
             issue.id,
@@ -547,7 +543,7 @@ class Orchestrator:
             return None
         if phase in {"research", "plan"}:
             return None
-        manager = WorkspaceManager(self.config.worktrees_dir, self.artifacts)
+        manager = self._workspace_manager()
         if phase == "implementation":
             return manager.prepare(issue)
         if phase in {"validation", "review", "merge_conflict_resolution"}:
@@ -556,11 +552,7 @@ class Orchestrator:
 
     def _run_merge(self, issue: Issue) -> AgentResult:
         try:
-            merge_result = WorkspaceManager(
-                self.config.worktrees_dir,
-                self.artifacts,
-                self.config.locks_dir or self.config.home / "locks",
-            ).merge_and_cleanup(issue)
+            merge_result = self._workspace_manager().merge_and_cleanup(issue)
         except WorkspaceError as exc:
             return self._blocked_workspace_result(str(exc))
         next_phase = "ready_for_merge_conflict_resolution" if merge_result.status == "conflicts" else "done"
@@ -620,6 +612,16 @@ class Orchestrator:
             suggested_next_phase="blocked",
             error=message,
             blocked_summary=summarize_blocked_reason(message),
+        )
+
+    def _workspace_manager(self) -> WorkspaceManager:
+        return WorkspaceManager(
+            self.config.worktrees_dir,
+            self.artifacts,
+            self.config.locks_dir or self.config.home / "locks",
+            merge_mode=self.config.merge_mode,
+            pr_remote=self.config.pr_remote,
+            pr_branch_prefix=self.config.pr_branch_prefix,
         )
 
     @staticmethod
