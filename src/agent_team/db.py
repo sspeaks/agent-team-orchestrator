@@ -190,6 +190,14 @@ class RecoveryResult:
     agent_phase: str | None = None
 
 
+@dataclass(frozen=True)
+class StopIssueResult:
+    issue_id: int
+    prior_phase: str
+    issue: Issue
+    stopped_human_input_request: HumanInputRequest | None = None
+
+
 class IssueStore:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
@@ -924,6 +932,100 @@ class IssueStore:
                 message or f"Transitioned {issue.phase} -> {next_phase}",
             )
         return self.get_issue(issue_id)
+
+    def stop_issue(
+        self,
+        issue_id: int,
+        message: str,
+        *,
+        stopped_by: str = "cli",
+    ) -> StopIssueResult:
+        cleaned_message = message.strip()
+        if not cleaned_message:
+            raise ValueError("Stop message is required")
+        cleaned_stopped_by = stopped_by.strip() or "unknown"
+        now = utc_now_iso()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM issues WHERE id = ?", (issue_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"Issue not found: {issue_id}")
+            issue = Issue.from_row(row)
+            if issue.status == "closed" or issue.phase == "done":
+                raise ValueError(f"Issue {issue.id} is already closed and cannot be stopped")
+            if issue.phase == "draft":
+                raise ValueError(f"Issue {issue.id} is a draft and is already inactive")
+            if issue.phase == "blocked":
+                return StopIssueResult(issue.id, issue.phase, issue, None)
+            if issue.current_run_id is not None:
+                raise ValueError(f"Cannot stop issue {issue.id} while it has an active run {issue.current_run_id}")
+            if issue.lock_expires_at is not None:
+                raise ValueError(
+                    f"Cannot stop issue {issue.id} while it has an active lock "
+                    f"held by {issue.lock_owner or 'unknown'} until {issue.lock_expires_at}"
+                )
+            validate_transition(issue.phase, "blocked")
+
+            stopped_request: HumanInputRequest | None = None
+            if issue.phase == "awaiting_human_input":
+                request_row = conn.execute(
+                    """
+                    SELECT * FROM human_input_requests
+                    WHERE issue_id = ? AND status = 'pending'
+                    ORDER BY created_at ASC, id ASC
+                    LIMIT 1
+                    """,
+                    (issue_id,),
+                ).fetchone()
+                if request_row is not None:
+                    request = HumanInputRequest.from_row(request_row)
+                    cur = conn.execute(
+                        """
+                        UPDATE human_input_requests
+                        SET status = 'stopped', answered_at = ?, answer = ?, answered_by = ?
+                        WHERE id = ? AND status = 'pending'
+                        """,
+                        (now, cleaned_message, cleaned_stopped_by, request.id),
+                    )
+                    if cur.rowcount != 1:
+                        raise RuntimeError(f"Human input request {request.id} was already resolved")
+                    stopped_row = conn.execute("SELECT * FROM human_input_requests WHERE id = ?", (request.id,)).fetchone()
+                    stopped_request = HumanInputRequest.from_row(stopped_row)
+                    self._add_event(
+                        conn,
+                        issue_id,
+                        stopped_request.run_id,
+                        "human_input.stopped",
+                        f"Stopped human input request {stopped_request.id}",
+                    )
+
+            cur = conn.execute(
+                """
+                UPDATE issues
+                SET phase = 'blocked',
+                    status = 'open',
+                    lock_owner = NULL,
+                    lock_expires_at = NULL,
+                    current_run_id = NULL,
+                    blocked_summary = ?,
+                    updated_at = ?
+                WHERE id = ? AND phase = ?
+                  AND current_run_id IS NULL
+                  AND lock_expires_at IS NULL
+                """,
+                (summarize_blocked_reason(cleaned_message), now, issue_id, issue.phase),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError(f"Issue {issue.id} could not be stopped because its state changed")
+            self._add_event(conn, issue_id, None, "issue.transitioned", f"Stopped issue; transitioned {issue.phase} -> blocked")
+            self._add_event(conn, issue_id, None, "issue.stopped", cleaned_message)
+            updated_row = conn.execute("SELECT * FROM issues WHERE id = ?", (issue_id,)).fetchone()
+        return StopIssueResult(
+            issue_id=issue_id,
+            prior_phase=issue.phase,
+            issue=Issue.from_row(updated_row),
+            stopped_human_input_request=stopped_request,
+        )
 
     def reject_plan(self, issue_id: int, feedback: str, run_id: str | None = None) -> Issue:
         cleaned = feedback.strip()
