@@ -317,7 +317,7 @@ def handle_issue(
             raise ValueError(f"Issue {issue.id} is in phase {issue.phase!r}, not 'awaiting_merge_approval'")
         branch = args.branch.strip() if args.branch else None
         mode = _merge_mode_arg(args.mode) if args.mode else (config.merge_mode if config else "auto")
-        remote = args.remote.strip() if args.remote else None
+        remote = args.remote.strip() if args.remote else (config.pr_remote if config else None)
         message = args.message.strip() or "Human approved worktree merge and cleanup"
         artifacts.write_merge_request(issue.id, target_branch=branch, message=message, mode=mode, remote_name=remote)
         issue = store.transition_issue(args.id, "ready_for_merge", None, message)

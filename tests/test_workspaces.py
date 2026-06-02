@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from agent_team.artifacts import ArtifactStore
 from agent_team.models import Issue
-from agent_team.pull_requests import PullRequestRemote, PullRequestResult
+from agent_team.pull_requests import PullRequestError, PullRequestRemote, PullRequestResult
 from agent_team.workspaces import (
     WorkspaceError,
     WorkspaceManager,
@@ -539,6 +539,83 @@ class WorkspaceManagerTests(unittest.TestCase):
         self.assertIsNone(self.artifacts.read_workspace_metadata(issue.id))
         self.assertFalse(self.artifacts.merged_workspace_metadata_path(issue.id).exists())
         self.assertEqual(self._git(self.repo, "branch", "--list", "agent-team/issue-1-merge-*"), "")
+
+    def test_pull_request_retry_after_push_before_metadata_reuses_matching_remote_branch(self) -> None:
+        bare_remote = self.home / "origin.git"
+        self._git(bare_remote.parent, "init", "--bare", str(bare_remote))
+        self._git(self.repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        target_branch = self._git(self.repo, "rev-parse", "--abbrev-ref", "HEAD")
+        self.artifacts.write_merge_request(
+            issue.id,
+            target_branch=None,
+            message="approved",
+            mode="pull_request",
+            remote_name="origin",
+        )
+        selected_remote = _SelectedRemote(
+            remote=PullRequestRemote(
+                provider="github",
+                remote_name="origin",
+                url="https://github.com/owner/repo.git",
+                repo="repo",
+                owner="owner",
+            ),
+            push_url=str(bare_remote),
+        )
+
+        with patch.object(self.manager, "_select_pull_request_remote", return_value=selected_remote):
+            with patch(
+                "agent_team.workspaces.create_or_get_pull_request",
+                side_effect=PullRequestError("simulated provider failure after push"),
+            ) as create_pr:
+                with self.assertRaisesRegex(WorkspaceError, "simulated provider failure after push"):
+                    self.manager.merge_and_cleanup(issue)
+
+        create_pr.assert_called_once()
+        pushed_head = self._git(self.repo, "ls-remote", str(bare_remote), "refs/heads/agent-team/issue-1").split()[0]
+        self.assertIsNone(self.artifacts.read_pull_request_metadata(issue.id))
+        self.assertIsNotNone(self.artifacts.read_workspace_metadata(issue.id))
+        self.assertTrue(info.worktree_root.exists())
+
+        pr_result = PullRequestResult(
+            provider="github",
+            remote_name="origin",
+            source_branch="agent-team/issue-1",
+            target_branch=target_branch,
+            title="Issue 1: issue 1",
+            url="https://github.com/owner/repo/pull/7",
+            id="7",
+            number=7,
+            status="OPEN",
+            is_existing=True,
+            raw={"number": 7},
+        )
+        with patch.object(self.manager, "_select_pull_request_remote", return_value=selected_remote):
+            with patch("agent_team.workspaces.create_or_get_pull_request", return_value=pr_result) as create_pr:
+                with patch.object(self.manager, "_git_remote", wraps=self.manager._git_remote) as git_remote:
+                    result = self.manager.merge_and_cleanup(issue)
+
+        self.assertEqual(result.status, "pull_request")
+        self.assertEqual(result.worktree_head, pushed_head)
+        self.assertTrue(result.pr_is_existing)
+        self.assertFalse(info.worktree_root.exists())
+        self.assertIsNone(self.artifacts.read_workspace_metadata(issue.id))
+        metadata = self.artifacts.read_pull_request_metadata(issue.id)
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertTrue(metadata["cleanup_removed"])
+        self.assertTrue(metadata["is_existing"])
+        self.assertEqual(metadata["head_commit"], pushed_head)
+        self.assertEqual(
+            self._git(self.repo, "ls-remote", str(bare_remote), "refs/heads/agent-team/issue-1").split()[0],
+            pushed_head,
+        )
+        push_calls = [call for call in git_remote.call_args_list if len(call.args) > 1 and call.args[1] == "push"]
+        self.assertEqual(push_calls, [])
+        create_pr.assert_called_once()
 
     def test_pull_request_remote_allows_same_repo_https_and_ssh_push_urls(self) -> None:
         issue = self._issue(1, self.repo)

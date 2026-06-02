@@ -2,7 +2,7 @@
 
 A local-first state-machine orchestrator for coordinating AI engineering agents through issue intake, research, planning, implementation, validation, and review.
 
-The project stores state locally in SQLite and writes per-issue artifacts to disk. It does not require Azure DevOps permissions; Azure DevOps support is future optional adapter work for importing or syncing work items.
+The project stores state locally in SQLite and writes per-issue artifacts to disk. It does not require Azure DevOps permissions for local orchestration or future work-item import/sync adapters; Azure DevOps permissions are only needed when using Azure DevOps Services pull-request finalization.
 
 ## Prerequisites
 
