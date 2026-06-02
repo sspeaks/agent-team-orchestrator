@@ -118,7 +118,10 @@ _ADO_SCP_RE = re.compile(
     r"^(?:git@)?ssh\.dev\.azure\.com:v3/"
     r"(?P<org>[^/]+)/(?P<project>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$"
 )
-_CREDENTIAL_URL_RE = re.compile(r"\b(https?://)([^/\s:@]+(?::[^/\s@]*)?@)", re.IGNORECASE)
+_CREDENTIAL_URL_RE = re.compile(
+    r"\b([A-Za-z][A-Za-z0-9+.-]*://)([^/\s:@]+(?::[^/\s@]*)?@)",
+    re.IGNORECASE,
+)
 _AUTH_HEADER_RE = re.compile(r"(?i)\b(authorization\s*[:=]\s*(?:bearer|basic|token)\s+)([^\s,;]+)")
 _SECRET_ASSIGNMENT_RE = re.compile(
     r"(?i)\b("
@@ -129,12 +132,16 @@ _GH_TOKEN_RE = re.compile(r"\b(gh[pousr]_[A-Za-z0-9_]{20,})\b")
 
 
 def parse_pull_request_remote(remote_name: str, remote_url: str) -> PullRequestRemote | None:
+    if _url_embeds_disallowed_credentials(remote_url):
+        return None
     return parse_github_remote(remote_name, remote_url) or parse_azure_devops_remote(remote_name, remote_url)
 
 
 def parse_github_remote(remote_name: str, remote_url: str) -> PullRequestRemote | None:
     url = remote_url.strip()
     if _has_query_or_fragment(url):
+        return None
+    if _url_embeds_disallowed_credentials(url):
         return None
     match = _GITHUB_SCP_RE.match(url)
     if match:
@@ -171,6 +178,8 @@ def parse_github_remote(remote_name: str, remote_url: str) -> PullRequestRemote 
 def parse_azure_devops_remote(remote_name: str, remote_url: str) -> PullRequestRemote | None:
     url = remote_url.strip()
     if _has_query_or_fragment(url):
+        return None
+    if _url_embeds_disallowed_credentials(url):
         return None
     match = _ADO_SCP_RE.match(url)
     if match:
@@ -291,7 +300,7 @@ def _github_create_or_get(
     url = _first_non_empty_line(created.stdout)
     if not url:
         raise PullRequestError("gh pr create succeeded but did not return a pull request URL.")
-    _validate_pull_request_url(url, "gh pr create")
+    _validate_github_pull_request_url(remote, url, "gh pr create")
 
     viewed = runner.run(
         [
@@ -389,7 +398,7 @@ def _github_result(
     is_existing: bool,
 ) -> PullRequestResult:
     number = _as_int(raw.get("number"))
-    url = _validated_result_url(raw.get("url"), "gh pr result")
+    url = _validated_github_result_url(remote, raw.get("url"), "gh pr result")
     return PullRequestResult(
         provider=remote.provider,
         remote_name=remote.remote_name,
@@ -509,7 +518,7 @@ def _ado_result(
     is_existing: bool,
 ) -> PullRequestResult:
     number = _as_int(raw.get("pullRequestId"))
-    url = _validated_result_url(_ado_result_url(raw), "az repos pr result")
+    url = _validated_ado_result_url(remote, _ado_result_url(raw), "az repos pr result")
     return PullRequestResult(
         provider=remote.provider,
         remote_name=remote.remote_name,
@@ -658,11 +667,47 @@ def _first_non_empty_line(stdout: str) -> str:
     return ""
 
 
-def _validated_result_url(value: Any, command: str) -> str:
+def _validated_github_result_url(remote: PullRequestRemote, value: Any, command: str) -> str:
     url = str(value or "").strip()
     if not url:
         return ""
-    return _validate_pull_request_url(url, command)
+    return _validate_github_pull_request_url(remote, url, command)
+
+
+def _validated_ado_result_url(remote: PullRequestRemote, value: Any, command: str) -> str:
+    url = str(value or "").strip()
+    if not url:
+        return ""
+    return _validate_ado_pull_request_url(remote, url, command)
+
+
+def _validate_github_pull_request_url(remote: PullRequestRemote, url: str, command: str) -> str:
+    normalized = _validate_pull_request_url(url, command)
+    parsed = urlparse(normalized)
+    parts = _path_parts(parsed.path)
+    if (
+        (parsed.hostname or "").casefold() != "github.com"
+        or len(parts) < 4
+        or parts[0].casefold() != _casefold_required(remote.owner, "owner", remote)
+        or parts[1].casefold() != remote.repo.casefold()
+        or parts[2] != "pull"
+    ):
+        raise PullRequestError(
+            f"{command} returned a pull request URL outside the selected GitHub repository "
+            f"{_github_repo(remote)}."
+        )
+    return normalized
+
+
+def _validate_ado_pull_request_url(remote: PullRequestRemote, url: str, command: str) -> str:
+    normalized = _validate_pull_request_url(url, command)
+    parsed = urlparse(normalized)
+    if not _ado_pull_request_url_matches_remote(parsed, remote):
+        raise PullRequestError(
+            f"{command} returned a pull request URL outside the selected Azure DevOps Services repository "
+            f"{_require(remote.org, 'org', remote)}/{_require(remote.project, 'project', remote)}/{remote.repo}."
+        )
+    return normalized
 
 
 def _validate_pull_request_url(url: str, command: str) -> str:
@@ -679,12 +724,58 @@ def _validate_pull_request_url(url: str, command: str) -> str:
     return urlunparse(parsed._replace(scheme=parsed.scheme.lower()))
 
 
+def _ado_pull_request_url_matches_remote(parsed: Any, remote: PullRequestRemote) -> bool:
+    host = (parsed.hostname or "").casefold()
+    org = _casefold_required(remote.org, "org", remote)
+    project = _casefold_required(remote.project, "project", remote)
+    repo = remote.repo.casefold()
+    parts = [part.casefold() for part in _path_parts(parsed.path)]
+    if host == "dev.azure.com":
+        if len(parts) >= 6 and parts[:4] == [org, project, "_git", repo] and parts[4] == "pullrequest":
+            return True
+        if (
+            len(parts) >= 8
+            and parts[:5] == [org, project, "_apis", "git", "repositories"]
+            and parts[5] == repo
+            and parts[6] == "pullrequests"
+        ):
+            return True
+        return False
+    visualstudio_suffix = ".visualstudio.com"
+    if host.endswith(visualstudio_suffix) and host != "visualstudio.com":
+        host_org = host[: -len(visualstudio_suffix)]
+        if host_org != org:
+            return False
+        if len(parts) >= 5 and parts[:3] == [project, "_git", repo] and parts[3] == "pullrequest":
+            return True
+        if (
+            len(parts) >= 7
+            and parts[:4] == [project, "_apis", "git", "repositories"]
+            and parts[4] == repo
+            and parts[5] == "pullrequests"
+        ):
+            return True
+    return False
+
+
 def _has_query_or_fragment(url: str) -> bool:
     try:
         parsed = urlparse(url)
     except ValueError:
         return any(marker in url for marker in ("?", "#"))
     return bool(parsed.query or parsed.fragment)
+
+
+def _url_embeds_disallowed_credentials(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if not parsed.scheme or not parsed.netloc:
+        return False
+    if parsed.password is not None:
+        return True
+    return parsed.scheme.lower() in {"http", "https"} and parsed.username is not None
 
 
 def _as_int(value: Any) -> int | None:
@@ -705,3 +796,7 @@ def _clean_json_string(value: Any) -> str | None:
         return None
     stripped = value.strip()
     return stripped or None
+
+
+def _casefold_required(value: str | None, name: str, remote: PullRequestRemote) -> str:
+    return _require(value, name, remote).casefold()

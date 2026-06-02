@@ -477,7 +477,7 @@ class WorkspaceManagerTests(unittest.TestCase):
         self.assertEqual(merged["worktree_commit"], result.worktree_commit)
 
     def test_auto_remote_finalizes_by_pull_request_without_merging_source(self) -> None:
-        self._git(self.repo, "remote", "add", "origin", "https://token:secret@github.com/owner/repo.git")
+        self._git(self.repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
         self._git(self.repo, "remote", "set-url", "--push", "origin", "https://github.com/owner/repo.git")
         issue = replace(
             self._issue(1, self.repo),
@@ -492,6 +492,7 @@ class WorkspaceManagerTests(unittest.TestCase):
             mode="auto",
         )
         source_head = self._git(self.repo, "rev-parse", "HEAD")
+        self._git(self.repo, "branch", f"agent-team/issue-{issue.id}-merge-{source_head[:12]}", source_head)
         pr_result = PullRequestResult(
             provider="github",
             remote_name="origin",
@@ -537,6 +538,7 @@ class WorkspaceManagerTests(unittest.TestCase):
         self.assertNotIn("secret", json.dumps(metadata))
         self.assertIsNone(self.artifacts.read_workspace_metadata(issue.id))
         self.assertFalse(self.artifacts.merged_workspace_metadata_path(issue.id).exists())
+        self.assertEqual(self._git(self.repo, "branch", "--list", "agent-team/issue-1-merge-*"), "")
 
     def test_pull_request_remote_allows_same_repo_https_and_ssh_push_urls(self) -> None:
         issue = self._issue(1, self.repo)
@@ -596,6 +598,33 @@ class WorkspaceManagerTests(unittest.TestCase):
         message = str(caught.exception)
         self.assertNotIn("token:secret", message)
         self.assertNotIn("secret@github.com", message)
+
+    def test_pull_request_remote_blocks_credential_bearing_ssh_push_urls(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        cases = (
+            (
+                "https://github.com/owner/repo.git",
+                "ssh://git:super-secret@github.com/owner/repo.git",
+                "github",
+            ),
+            (
+                "https://dev.azure.com/org/project/_git/repo",
+                "ssh://git:super-secret@ssh.dev.azure.com/v3/org/project/repo",
+                "azure-devops",
+            ),
+        )
+        self._git(self.repo, "remote", "add", "origin", cases[0][0])
+        for fetch_url, push_url, provider in cases:
+            with self.subTest(provider=provider):
+                self._git(self.repo, "remote", "set-url", "origin", fetch_url)
+                self._git(self.repo, "remote", "set-url", "--push", "origin", push_url)
+
+                with self.assertRaisesRegex(WorkspaceError, "push URL embeds credentials") as caught:
+                    self.manager._select_finalization_mode(info, "pull_request", "origin")
+
+                message = str(caught.exception)
+                self.assertNotIn("super-secret", message)
 
     def test_pull_request_remote_blocks_query_or_fragment_push_url(self) -> None:
         cases = (
@@ -831,9 +860,51 @@ class WorkspaceManagerTests(unittest.TestCase):
 
         git.assert_not_called()
 
+    def test_push_pull_request_branch_rejects_credential_bearing_ssh_urls_before_git(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        head = self._git(info.worktree_root, "rev-parse", "HEAD")
+        cases = (
+            _SelectedRemote(
+                remote=PullRequestRemote(
+                    provider="github",
+                    remote_name="origin",
+                    url="https://github.com/owner/repo.git",
+                    repo="repo",
+                    owner="owner",
+                ),
+                push_url="ssh://git:super-secret@github.com/owner/repo.git",
+            ),
+            _SelectedRemote(
+                remote=PullRequestRemote(
+                    provider="azure-devops",
+                    remote_name="origin",
+                    url="https://dev.azure.com/org/project/_git/repo",
+                    repo="repo",
+                    org="org",
+                    project="project",
+                ),
+                push_url="ssh://git:super-secret@ssh.dev.azure.com/v3/org/project/repo",
+            ),
+        )
+        for selected_remote in cases:
+            with self.subTest(provider=selected_remote.remote.provider):
+                with patch("agent_team.workspaces.subprocess.run") as run:
+                    with self.assertRaisesRegex(WorkspaceError, "credential-bearing remote URL") as caught:
+                        self.manager._push_pull_request_branch(
+                            issue,
+                            info,
+                            selected_remote,
+                            "agent-team/issue-1",
+                            head,
+                        )
+
+                run.assert_not_called()
+                self.assertNotIn("super-secret", str(caught.exception))
+
     def test_remote_branch_probe_rejects_credential_bearing_url_before_git(self) -> None:
         with patch("agent_team.workspaces.subprocess.run") as run:
-            with self.assertRaisesRegex(WorkspaceError, "credential-bearing HTTPS remote URL") as caught:
+            with self.assertRaisesRegex(WorkspaceError, "credential-bearing remote URL") as caught:
                 self.manager._remote_branch_head(
                     self.repo,
                     "https://token:secret@github.com/owner/repo.git",
@@ -842,9 +913,23 @@ class WorkspaceManagerTests(unittest.TestCase):
 
         run.assert_not_called()
         message = str(caught.exception)
-        self.assertIn("Refusing to pass a credential-bearing HTTPS remote URL", message)
+        self.assertIn("Refusing to pass a credential-bearing remote URL", message)
         self.assertNotIn("token:secret", message)
         self.assertNotIn("secret@github.com", message)
+
+    def test_remote_branch_probe_rejects_credential_bearing_ssh_urls_before_git(self) -> None:
+        cases = (
+            "ssh://git:super-secret@github.com/owner/repo.git",
+            "ssh://git:super-secret@ssh.dev.azure.com/v3/org/project/repo",
+        )
+        for remote_ref in cases:
+            with self.subTest(remote_ref=remote_ref):
+                with patch("agent_team.workspaces.subprocess.run") as run:
+                    with self.assertRaisesRegex(WorkspaceError, "credential-bearing remote URL") as caught:
+                        self.manager._remote_branch_head(self.repo, remote_ref, "agent-team/issue-1")
+
+                run.assert_not_called()
+                self.assertNotIn("super-secret", str(caught.exception))
 
     def test_remote_branch_probe_runs_git_non_interactively_with_timeout(self) -> None:
         completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
@@ -925,6 +1010,26 @@ class WorkspaceManagerTests(unittest.TestCase):
         self.assertIn("[redacted]", message)
         self.assertNotIn("query-secret", message)
         self.assertNotIn("fragment-secret", message)
+
+    def test_git_remote_error_redacts_ssh_userinfo_secrets(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="",
+            stderr="fatal: failed for ssh://git:super-secret@github.com/owner/repo.git",
+        )
+        with patch("agent_team.workspaces.subprocess.run", return_value=completed):
+            with self.assertRaises(WorkspaceError) as caught:
+                self.manager._git_remote(
+                    self.repo,
+                    "ls-remote",
+                    "ssh://git:super-secret@github.com/owner/repo.git",
+                    "agent-team/issue-1",
+                )
+
+        message = str(caught.exception)
+        self.assertIn("ssh://[redacted]@github.com", message)
+        self.assertNotIn("super-secret", message)
 
     def test_push_pull_request_branch_runs_git_push_non_interactively_with_timeout(self) -> None:
         issue = self._issue(1, self.repo)

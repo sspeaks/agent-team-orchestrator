@@ -99,6 +99,17 @@ class PullRequestRemoteParsingTests(unittest.TestCase):
             with self.subTest(url=url):
                 self.assertIsNone(parse_pull_request_remote("origin", url))
 
+    def test_parse_remote_rejects_credential_bearing_urls(self) -> None:
+        urls = (
+            "https://token:secret@github.com/owner/repo.git",
+            "https://token@github.com/owner/repo.git",
+            "ssh://git:secret@github.com/owner/repo.git",
+            "ssh://git:secret@ssh.dev.azure.com/v3/org/project/repo",
+        )
+        for url in urls:
+            with self.subTest(url=url):
+                self.assertIsNone(parse_pull_request_remote("origin", url))
+
 
 class PullRequestProviderTests(unittest.TestCase):
     def test_github_reuses_existing_open_pull_request(self) -> None:
@@ -418,6 +429,37 @@ class PullRequestProviderTests(unittest.TestCase):
         with self.assertRaisesRegex(PullRequestError, "unsafe pull request URL scheme"):
             create_or_get_pull_request(remote, request, runner)
 
+    def test_github_rejects_pull_request_url_outside_selected_repository(self) -> None:
+        remote = parse_pull_request_remote("origin", "https://github.com/owner/repo.git")
+        assert remote is not None
+        request = PullRequestRequest(
+            source_branch="feature",
+            target_branch="main",
+            title="Add feature",
+            body_path=Path("body.md"),
+        )
+        runner = FakeRunner(
+            [
+                command_result(
+                    [
+                        {
+                            "number": 42,
+                            "url": "https://attacker.example/owner/repo/pull/42",
+                            "title": "Existing PR",
+                            "headRefName": "feature",
+                            "baseRefName": "main",
+                            "headRepository": {"name": "repo", "nameWithOwner": "owner/repo"},
+                            "headRepositoryOwner": {"login": "owner"},
+                            "state": "OPEN",
+                        }
+                    ]
+                )
+            ]
+        )
+
+        with self.assertRaisesRegex(PullRequestError, "outside the selected GitHub repository"):
+            create_or_get_pull_request(remote, request, runner)
+
     def test_github_rejects_credential_bearing_pull_request_url_from_provider(self) -> None:
         remote = parse_pull_request_remote("origin", "https://github.com/owner/repo.git")
         assert remote is not None
@@ -532,6 +574,21 @@ class PullRequestProviderTests(unittest.TestCase):
         runner = FakeRunner([command_result([]), command_result("https://github.com/owner/repo/pull/43?token=secret\n")])
 
         with self.assertRaisesRegex(PullRequestError, "query or fragment"):
+            create_or_get_pull_request(remote, request, runner)
+        self.assertEqual(len(runner.calls), 2)
+
+    def test_github_rejects_create_url_outside_selected_repository_before_viewing(self) -> None:
+        remote = parse_pull_request_remote("origin", "https://github.com/owner/repo.git")
+        assert remote is not None
+        request = PullRequestRequest(
+            source_branch="feature",
+            target_branch="main",
+            title="Add feature",
+            body_path=Path("body.md"),
+        )
+        runner = FakeRunner([command_result([]), command_result("https://github.com/other/repo/pull/43\n")])
+
+        with self.assertRaisesRegex(PullRequestError, "outside the selected GitHub repository"):
             create_or_get_pull_request(remote, request, runner)
         self.assertEqual(len(runner.calls), 2)
 
@@ -666,6 +723,30 @@ class PullRequestProviderTests(unittest.TestCase):
                 "json",
             ),
         )
+
+    def test_azure_devops_rejects_pull_request_url_outside_selected_repository(self) -> None:
+        remote = parse_pull_request_remote("origin", "https://dev.azure.com/org/project/_git/repo")
+        assert remote is not None
+        request = PullRequestRequest(source_branch="feature", target_branch="main", title="Add feature")
+        runner = FakeRunner(
+            [
+                command_result(
+                    [
+                        {
+                            "pullRequestId": 17,
+                            "webUrl": "https://dev.azure.com/org/project/_git/other/pullrequest/17",
+                            "title": "Existing PR",
+                            "status": "active",
+                            "sourceRefName": "refs/heads/feature",
+                            "targetRefName": "refs/heads/main",
+                        }
+                    ]
+                )
+            ]
+        )
+
+        with self.assertRaisesRegex(PullRequestError, "outside the selected Azure DevOps Services repository"):
+            create_or_get_pull_request(remote, request, runner)
 
     def test_azure_devops_does_not_read_or_pass_oversized_body(self) -> None:
         remote = parse_pull_request_remote("origin", "https://dev.azure.com/org/project/_git/repo")

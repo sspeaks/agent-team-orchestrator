@@ -437,14 +437,7 @@ class WorkspaceManager:
             merged_metadata = {**merged_metadata, "cleanup_removed": True}
             self.artifacts.write_merged_workspace_metadata(issue.id, merged_metadata)
         self.artifacts.delete_workspace_metadata(issue.id)
-        merge_branch = _clean_optional_string(merged_metadata.get("merge_branch"))
-        self._delete_internal_merge_branch(
-            issue.id,
-            info.source_root,
-            merge_branch,
-            _clean_optional_string(merged_metadata.get("worktree_head")),
-            force=False,
-        )
+        self._delete_internal_merge_branches(issue.id, info.source_root, force=True)
         merge_commit = _clean_optional_string(merged_metadata.get("merge_commit"))
         target_branch = _clean_optional_string(merged_metadata.get("merge_target_branch"))
         suffix = f" at {merge_commit[:12]}" if merge_commit else ""
@@ -477,14 +470,7 @@ class WorkspaceManager:
             pull_request_metadata = {**pull_request_metadata, "cleanup_removed": True}
             self.artifacts.write_pull_request_metadata(issue.id, pull_request_metadata)
         self.artifacts.delete_workspace_metadata(issue.id)
-        self._delete_internal_merge_branch(
-            issue.id,
-            info.source_root,
-            _clean_optional_string(pull_request_metadata.get("merge_branch")),
-            _clean_optional_string(pull_request_metadata.get("head_commit"))
-            or _clean_optional_string(pull_request_metadata.get("worktree_head")),
-            force=True,
-        )
+        self._delete_internal_merge_branches(issue.id, info.source_root, force=True)
         result = self._pull_request_result_from_metadata(
             issue,
             pull_request_metadata,
@@ -720,7 +706,7 @@ class WorkspaceManager:
         merged_metadata["cleanup_removed"] = True
         self.artifacts.write_merged_workspace_metadata(issue.id, merged_metadata)
         self.artifacts.delete_workspace_metadata(issue.id)
-        self._delete_internal_merge_branch(issue.id, info.source_root, merge_branch, integrated_head, force=False)
+        self._delete_internal_merge_branches(issue.id, info.source_root, force=True)
         return WorkspaceMergeResult(
             status="merged",
             summary=f"Merged issue {issue.id} worktree into {branch} at {merge_commit[:12]}.",
@@ -771,13 +757,7 @@ class WorkspaceManager:
         metadata["cleanup_removed"] = True
         self.artifacts.write_pull_request_metadata(issue.id, metadata)
         self.artifacts.delete_workspace_metadata(issue.id)
-        self._delete_internal_merge_branch(
-            issue.id,
-            info.source_root,
-            preflight.merge_branch,
-            integrated_head,
-            force=True,
-        )
+        self._delete_internal_merge_branches(issue.id, info.source_root, force=True)
         return self._pull_request_result_from_metadata(issue, metadata)
 
     def _validate_local_target_branch(self, source_root: Path, branch: str) -> str:
@@ -815,29 +795,6 @@ class WorkspaceManager:
             self._git(info.worktree_root, "checkout", merge_branch)
             return
         self._git(info.worktree_root, "checkout", "-b", merge_branch, worktree_head)
-
-    def _delete_internal_merge_branch(
-        self,
-        issue_id: int,
-        source_root: Path,
-        merge_branch: str | None,
-        expected_head: str | None,
-        *,
-        force: bool,
-    ) -> None:
-        if (
-            merge_branch is None
-            or expected_head is None
-            or not source_root.is_dir()
-            or not self._is_internal_merge_branch(issue_id, merge_branch)
-        ):
-            return
-        ref = f"refs/heads/{merge_branch}"
-        if not self._git_check(source_root, "show-ref", "--verify", "--quiet", ref):
-            return
-        if self._git(source_root, "rev-parse", ref) != expected_head:
-            return
-        self._git(source_root, "branch", "-D" if force else "-d", merge_branch)
 
     @staticmethod
     def _is_internal_merge_branch(issue_id: int, merge_branch: str) -> bool:
@@ -898,13 +855,13 @@ class WorkspaceManager:
         if _remote_url_embeds_credentials(push_url):
             raise WorkspaceError(
                 f"Remote '{remote.remote_name}' push URL embeds credentials. Refusing to pass "
-                "credential-bearing HTTPS URLs to git; use a Git credential helper, an authenticated SSH remote, "
+                "credential-bearing remote URLs to git; use a Git credential helper, an authenticated SSH remote, "
                 "or approve with --mode local to merge locally instead."
             )
         if _remote_url_has_query_or_fragment(push_url):
             raise WorkspaceError(
                 f"Remote '{remote.remote_name}' push URL includes query or fragment components. Refusing to pass "
-                "potentially credential-bearing HTTPS URLs to git; use a Git credential helper, an authenticated "
+                "potentially credential-bearing remote URLs to git; use a Git credential helper, an authenticated "
                 "SSH remote, or approve with --mode local to merge locally instead."
             )
         push_remote = parse_pull_request_remote(remote.remote_name, push_url)
@@ -984,12 +941,12 @@ class WorkspaceManager:
     def _remote_branch_head(self, source_root: Path, remote_ref: str, branch: str) -> str | None:
         if _remote_url_embeds_credentials(remote_ref):
             raise WorkspaceError(
-                "Refusing to pass a credential-bearing HTTPS remote URL to git. Use a Git credential helper "
+                "Refusing to pass a credential-bearing remote URL to git. Use a Git credential helper "
                 "or an authenticated SSH remote instead."
             )
         if _remote_url_has_query_or_fragment(remote_ref):
             raise WorkspaceError(
-                "Refusing to pass an HTTPS remote URL with query or fragment components to git. Use a Git "
+                "Refusing to pass a remote URL with query or fragment components to git. Use a Git "
                 "credential helper or an authenticated SSH remote instead."
             )
         output = self._git_remote(source_root, "ls-remote", "--heads", remote_ref, branch)
@@ -1575,6 +1532,11 @@ class WorkspaceManager:
         return False
 
     def _delete_reset_merge_branch(self, issue_id: int, source_root: Path) -> None:
+        self._delete_internal_merge_branches(issue_id, source_root, force=True)
+
+    def _delete_internal_merge_branches(self, issue_id: int, source_root: Path, *, force: bool) -> None:
+        if not source_root.is_dir():
+            return
         output = self._git(
             source_root,
             "for-each-ref",
@@ -1583,7 +1545,7 @@ class WorkspaceManager:
         )
         for merge_branch in output.splitlines():
             if self._is_internal_merge_branch(issue_id, merge_branch):
-                self._git(source_root, "branch", "-D", merge_branch)
+                self._git(source_root, "branch", "-D" if force else "-d", merge_branch)
 
     @staticmethod
     def _repo_lock_key(source_git_common_dir: Path) -> str:
@@ -1939,9 +1901,11 @@ def _remote_url_embeds_credentials(value: str) -> bool:
         parsed = urlsplit(value)
     except ValueError:
         return False
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+    if not parsed.scheme or not parsed.netloc:
         return False
-    return parsed.username is not None or parsed.password is not None
+    if parsed.password is not None:
+        return True
+    return parsed.scheme.lower() in {"http", "https"} and parsed.username is not None
 
 
 def _remote_url_has_query_or_fragment(value: str) -> bool:
@@ -1949,12 +1913,13 @@ def _remote_url_has_query_or_fragment(value: str) -> bool:
         parsed = urlsplit(value)
     except ValueError:
         return False
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
-        return False
     return bool(parsed.query or parsed.fragment)
 
 
-_CREDENTIAL_URL_RE = re.compile(r"\b(https?://)([^/\s:@]+(?::[^/\s@]*)?@)", re.IGNORECASE)
+_CREDENTIAL_URL_RE = re.compile(
+    r"\b([A-Za-z][A-Za-z0-9+.-]*://)([^/\s:@]+(?::[^/\s@]*)?@)",
+    re.IGNORECASE,
+)
 _SECRET_ASSIGNMENT_RE = re.compile(
     r"(?i)\b("
     r"access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd|pat|secret|sig|token"
