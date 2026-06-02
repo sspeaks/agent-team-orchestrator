@@ -838,6 +838,7 @@ class WorkspaceManager:
         remote_names: list[str],
     ) -> _SelectedRemote | None:
         names = [requested_remote] if requested_remote else remote_names
+        validation_errors: list[str] = []
         for remote_name in names:
             if remote_name is None:
                 continue
@@ -847,8 +848,19 @@ class WorkspaceManager:
             push_url = self._git(info.source_root, "remote", "get-url", "--push", remote_name)
             remote = parse_pull_request_remote(remote_name, remote_url)
             if remote is not None:
-                self._validate_pull_request_push_url(remote, push_url)
+                try:
+                    self._validate_pull_request_push_url(remote, push_url)
+                except WorkspaceError as exc:
+                    if requested_remote:
+                        raise
+                    validation_errors.append(str(exc))
+                    continue
                 return _SelectedRemote(remote=remote, push_url=push_url)
+        if validation_errors:
+            raise WorkspaceError(
+                "The source repo has remotes that use supported pull request providers, but none have usable "
+                f"push URLs. {' '.join(validation_errors)}"
+            )
         return None
 
     def _validate_pull_request_push_url(self, remote: PullRequestRemote, push_url: str) -> None:

@@ -85,8 +85,15 @@ class WebRenderingTests(unittest.TestCase):
         self.assertIn("function isSafeHttpUrl", script)
         self.assertIn("if (isSafeHttpUrl(pullRequest.url))", script)
         self.assertIn("!/^https?:\\/\\//i.test(text)", script)
-        self.assertIn("!parsed.username && !parsed.password", script)
+        self.assertIn("!parsed.username", script)
+        self.assertIn("!parsed.password", script)
         self.assertNotIn("if (pullRequest.url) {\n      var link", script)
+
+    def test_browser_closed_synopsis_rejects_pr_url_query_and_fragment(self) -> None:
+        script = (Path(web_module.__file__).with_name("web_static") / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("!parsed.search", script)
+        self.assertIn("!parsed.hash", script)
 
 
 class WebTests(unittest.TestCase):
@@ -1692,6 +1699,22 @@ setTimeout(() => {{
         self.assertIsNotNone(request)
         assert request is not None
         self.assertEqual(request["mode"], "local")
+
+    def test_approve_merge_action_records_explicit_pull_request_mode_and_remote(self) -> None:
+        issue = self.store.create_issue("merge issue", "desc")
+        self._move_to_merge_approval(issue.id)
+
+        self.post(
+            f"/issues/{issue.id}/actions/approve-merge",
+            {"branch": "main", "message": "open a PR", "mode": "pull-request", "remote": "upstream"},
+        )
+
+        self.assertEqual(self.store.get_issue(issue.id).phase, "ready_for_merge")
+        request = self.artifacts.read_merge_request(issue.id)
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertEqual(request["mode"], "pull_request")
+        self.assertEqual(request["remote_name"], "upstream")
 
     def test_approve_merge_rejects_wrong_phase(self) -> None:
         issue = self.store.create_issue("not ready", "desc")

@@ -645,6 +645,31 @@ class WorkspaceManagerTests(unittest.TestCase):
                 self.assertNotIn("secret", message)
                 self._git(self.repo, "remote", "remove", "origin")
 
+    def test_auto_pull_request_remote_skips_invalid_push_url_before_valid_remote(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        cases = (
+            str(self.home / "unsupported.git"),
+            "https://github.com/other/repo.git",
+            "https://token:secret@github.com/owner/repo.git",
+        )
+        for origin_push_url in cases:
+            with self.subTest(origin_push_url=origin_push_url):
+                self._git(self.repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
+                self._git(self.repo, "remote", "set-url", "--push", "origin", origin_push_url)
+                self._git(self.repo, "remote", "add", "upstream", "https://github.com/upstream/repo.git")
+                self._git(self.repo, "remote", "set-url", "--push", "upstream", "git@github.com:upstream/repo.git")
+
+                mode, selected_remote = self.manager._select_finalization_mode(info, "auto", None)
+
+                self.assertEqual(mode, "pull_request")
+                self.assertIsNotNone(selected_remote)
+                assert selected_remote is not None
+                self.assertEqual(selected_remote.remote.remote_name, "upstream")
+                self.assertEqual(selected_remote.remote.owner, "upstream")
+                self._git(self.repo, "remote", "remove", "origin")
+                self._git(self.repo, "remote", "remove", "upstream")
+
     def test_push_pull_request_branch_uses_validated_push_url_directly(self) -> None:
         bare_remote = self.home / "validated-push.git"
         self._git(bare_remote.parent, "init", "--bare", str(bare_remote))

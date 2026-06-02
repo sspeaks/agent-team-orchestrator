@@ -43,7 +43,13 @@
     }
     try {
       var parsed = new URL(text);
-      return (parsed.protocol === "http:" || parsed.protocol === "https:") && !parsed.username && !parsed.password;
+      return (
+        (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+        !parsed.username &&
+        !parsed.password &&
+        !parsed.search &&
+        !parsed.hash
+      );
     } catch (error) {
       return false;
     }
