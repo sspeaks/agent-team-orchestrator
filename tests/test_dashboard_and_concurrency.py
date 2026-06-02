@@ -7,7 +7,7 @@ from agent_team.cli import process_batch
 from agent_team.config import AppConfig
 from agent_team.dashboard import render_dashboard
 from agent_team.db import IssueStore
-from agent_team.lifecycle import delete_issue, reset_issue_to_draft
+from agent_team.lifecycle import delete_issue, reset_issue_to_draft, stop_issue
 from agent_team.models import HumanInputRequestDraft
 
 
@@ -232,6 +232,20 @@ class DashboardAndConcurrencyTests(unittest.TestCase):
         self.assertNotIn(reset.id, {row["id"] for row in summary["ready_issues"]})
         self.assertEqual({result.issue_id for result in results}, {other.id})
         self.assertEqual(self.store.get_issue(reset.id).phase, "draft")
+
+    def test_stopped_issue_lands_in_blocked_bucket_and_is_skipped_by_batch(self) -> None:
+        stopped = self.store.create_issue("stopped", "desc", ready=True)
+        other = self.store.create_issue("ready", "desc", ready=True)
+        stop_issue(self.config, self.store, self.artifacts, stopped.id, "Pause this work.")
+
+        summary = self.store.dashboard_summary()
+        results = process_batch(self.store, self.artifacts, self.config, concurrency=2)
+
+        self.assertIn(stopped.id, {row["id"] for row in summary["blocked_issues"]})
+        self.assertNotIn(stopped.id, {row["id"] for row in summary["ready_issues"]})
+        self.assertNotIn(stopped.id, {row["id"] for row in summary["human_input_needed"]})
+        self.assertEqual({result.issue_id for result in results}, {other.id})
+        self.assertEqual(self.store.get_issue(stopped.id).phase, "blocked")
 
     def test_deleted_issue_is_absent_from_dashboard_and_batch(self) -> None:
         deleted = self.store.create_issue("deleted", "desc", ready=True)

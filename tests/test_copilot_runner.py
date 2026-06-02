@@ -134,6 +134,28 @@ class CopilotCliRunnerTests(unittest.TestCase):
         )
         self.assertEqual(recommended, "blocked")
 
+    def test_blocked_summary_line_is_parsed_from_blocked_artifact(self) -> None:
+        summary = CopilotCliRunner._blocked_summary_from_artifact(
+            "1. Summary\n\n"
+            "The raw logs are very long.\n\n"
+            "Blocked summary: Source checkout credentials are missing. Add them and rerun research.\n"
+            "Recommendation: `blocked`"
+        )
+
+        self.assertEqual(
+            summary,
+            "Source checkout credentials are missing. Add them and rerun research.",
+        )
+
+    def test_blocked_summary_line_without_blocked_recommendation_is_ignored_by_run(self) -> None:
+        self.assertEqual(
+            CopilotCliRunner._recommended_next_phase(
+                "research",
+                "Blocked summary: Not actually blocked.\nRecommendation: `ready_for_plan`",
+            ),
+            "ready_for_plan",
+        )
+
     def test_bold_colon_recommendation_is_accepted(self) -> None:
         recommended = CopilotCliRunner._recommended_next_phase(
             "research",
@@ -540,6 +562,53 @@ Recommendation: `awaiting_human_input`
                 command = runner._build_command(phase, "prompt", Path("/tmp/repo"))
                 self.assertNotIn("write", self._permission_values(command, "--allow-tool"))
 
+    def test_review_phase_policy_allows_git_status_and_diff_inspection(self) -> None:
+        runner = CopilotCliRunner()
+        command = runner._build_command("review", "prompt", Path("/tmp/repo"))
+        allowed = set(self._permission_values(command, "--allow-tool"))
+
+        self.assertTrue(
+            {
+                "shell(git status)",
+                "shell(git status:*)",
+                "shell(git diff)",
+                "shell(git diff:*)",
+            }.issubset(allowed)
+        )
+        self.assertNotIn("shell(git:*)", allowed)
+        self.assertNotIn("write", allowed)
+
+    def test_all_phase_policies_allow_git_status_and_diff_inspection(self) -> None:
+        runner = CopilotCliRunner()
+        expected = {
+            "shell(git status)",
+            "shell(git status:*)",
+            "shell(git diff)",
+            "shell(git diff:*)",
+        }
+
+        for phase in PHASE_AGENTS:
+            with self.subTest(phase=phase):
+                command = runner._build_command(phase, "prompt", Path("/tmp/repo"))
+                allowed = set(self._permission_values(command, "--allow-tool"))
+                self.assertTrue(expected.issubset(allowed))
+
+    def test_all_phases_allow_abstract_read_tool(self) -> None:
+        runner = CopilotCliRunner()
+        for phase in PHASE_AGENTS:
+            with self.subTest(phase=phase):
+                command = runner._build_command(phase, "prompt", Path("/tmp/repo"))
+                self.assertIn("read", self._permission_values(command, "--allow-tool"))
+
+    def test_read_only_phases_allow_basic_file_inspection_tools(self) -> None:
+        runner = CopilotCliRunner()
+        for phase in ("research", "plan", "review"):
+            with self.subTest(phase=phase):
+                command = runner._build_command(phase, "prompt", Path("/tmp/repo"))
+                allowed = self._permission_values(command, "--allow-tool")
+                self.assertIn("shell(cat:*)", allowed)
+                self.assertIn("shell(grep:*)", allowed)
+
     def test_only_research_phase_policy_allows_url_access(self) -> None:
         runner = CopilotCliRunner()
         for phase in PHASE_AGENTS:
@@ -817,6 +886,35 @@ print("1. Summary\\n\\nChanged the files.\\n\\n6. Recommendation: `ready_for_imp
         self.assertIn("## Orchestrator diagnostic", result.artifact_markdown)
         self.assertIn("Recommendation: `blocked`", result.artifact_markdown)
         self.assertEqual(CopilotCliRunner._recommended_next_phase("implementation", result.artifact_markdown), "blocked")
+
+    def test_run_returns_blocked_summary_for_blocked_recommendation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "fake-copilot"
+            script.write_text(
+                """#!/usr/bin/env python3
+print('''1. Summary
+
+Research cannot continue.
+
+Blocked summary: The source checkout is unavailable. Restore the checkout and rerun research.
+Recommendation: `blocked`
+''')
+""",
+                encoding="utf-8",
+            )
+            script.chmod(0o755)
+
+            result = CopilotCliRunner(command=str(script)).run(
+                "research",
+                self.issue,
+                {"prompt_template": "Body {title}"},
+            )
+
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(
+            result.blocked_summary,
+            "The source checkout is unavailable. Restore the checkout and rerun research.",
+        )
 
     def test_plan_run_blocks_missing_recommendation_with_diagnostic_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

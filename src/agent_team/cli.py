@@ -9,7 +9,7 @@ from .artifacts import ArtifactStore
 from .config import AppConfig, ensure_home, load_config
 from .dashboard import render_dashboard
 from .db import IssueStore
-from .lifecycle import DeleteIssueResult, ResetIssueResult, delete_issue, reset_issue_to_draft
+from .lifecycle import DeleteIssueResult, ResetIssueResult, StopIssueResult, delete_issue, reset_issue_to_draft, stop_issue
 from .orchestrator import Orchestrator
 from .web import serve_web, serve_web_and_worker
 from .worker import process_batch, run_worker_loop
@@ -120,6 +120,10 @@ def build_parser() -> argparse.ArgumentParser:
     reset = issue_sub.add_parser("reset-to-draft")
     reset.add_argument("id", type=int)
     reset.add_argument("--message")
+
+    stop = issue_sub.add_parser("stop")
+    stop.add_argument("id", type=int)
+    stop.add_argument("--message")
 
     delete = issue_sub.add_parser("delete")
     delete.add_argument("id", type=int)
@@ -333,6 +337,12 @@ def handle_issue(
         result = reset_issue_to_draft(config, store, artifacts, args.id, args.message)
         print_reset_result(result)
         return 0
+    if args.issue_command == "stop":
+        if config is None:
+            raise ValueError("Stop requires AppConfig so interrupted run state can be recovered safely")
+        result = stop_issue(config, store, artifacts, args.id, args.message, stopped_by="cli")
+        print_stop_result(result)
+        return 0
     if args.issue_command == "delete":
         expected = f"DELETE {args.id}"
         if args.confirm != expected:
@@ -484,6 +494,9 @@ def print_issue(issue: object, store: IssueStore, artifacts: ArtifactStore) -> N
     print(f"Title: {getattr(issue, 'title')}")
     print(f"Status: {getattr(issue, 'status')}")
     print(f"Phase: {getattr(issue, 'phase')}")
+    blocked_summary = getattr(issue, "blocked_summary", None)
+    if blocked_summary:
+        print(f"Blocked summary: {blocked_summary}")
     print(f"Repo: {getattr(issue, 'repo_path') or ''}")
     if workspace:
         print(f"Workspace: {workspace.get('workspace_repo_path') or ''}")
@@ -544,6 +557,12 @@ def print_reset_result(result: ResetIssueResult) -> None:
         print("Warnings:")
         for warning in result.warnings:
             print(f"- {warning}")
+
+
+def print_stop_result(result: StopIssueResult) -> None:
+    print(f"Issue {result.issue_id} stopped at {result.issue.phase} (was {result.prior_phase})")
+    if result.stopped_human_input_request is not None:
+        print(f"Stopped human input request: {result.stopped_human_input_request.id}")
 
 
 def print_delete_result(result: DeleteIssueResult) -> None:

@@ -23,7 +23,7 @@ import agent_team.worker as worker_module
 from agent_team.cli import build_parser, handle_issue, handle_worker, print_issue
 from agent_team.config import AppConfig
 from agent_team.db import IssueStore
-from agent_team.lifecycle import delete_issue, reset_issue_to_draft
+from agent_team.lifecycle import delete_issue, reset_issue_to_draft, stop_issue
 from agent_team.locks import make_lock_owner
 from agent_team.models import AgentResult, HumanInputRequestDraft, Issue
 from agent_team.orchestrator import Orchestrator, ProcessResult
@@ -155,7 +155,162 @@ class StoreAndWorkerTests(unittest.TestCase):
             row = conn.execute("SELECT last_scheduled_at FROM issues WHERE id = ?", (issue.id,)).fetchone()
         self.assertIsNotNone(row["last_scheduled_at"])
 
-    def test_schema_migration_adds_last_scheduled_at(self) -> None:
+    def test_transition_to_blocked_stores_and_clears_summary(self) -> None:
+        issue = self.store.create_issue("title", "desc", ready=True)
+        verbose_reason = """
+        # Blocked reason
+
+        Database credentials are missing. Grant the agent access to the test database.
+
+        Traceback (most recent call last):
+          File "runner.py", line 7, in <module>
+
+        Recommendation: `blocked`
+        """
+
+        blocked = self.store.transition_issue(issue.id, "blocked", message=verbose_reason)
+
+        self.assertEqual(
+            blocked.blocked_summary,
+            "Database credentials are missing. Grant the agent access to the test database.",
+        )
+        summary = self.store.dashboard_summary()
+        self.assertEqual(summary["blocked_issues"][0]["blocked_summary"], blocked.blocked_summary)
+
+        resumed = self.store.transition_issue(issue.id, "needs_research", message="Retry with credentials.")
+
+        self.assertEqual(resumed.phase, "needs_research")
+        self.assertIsNone(resumed.blocked_summary)
+
+    def test_transition_to_blocked_prefers_explicit_summary(self) -> None:
+        issue = self.store.create_issue("title", "desc", ready=True)
+
+        blocked = self.store.transition_issue(
+            issue.id,
+            "blocked",
+            message="A long technical error with stack traces and tool output.",
+            blocked_summary="The test database credentials are missing. Add them to the workspace and rerun research.",
+        )
+
+        self.assertEqual(
+            blocked.blocked_summary,
+            "The test database credentials are missing. Add them to the workspace and rerun research.",
+        )
+
+    def test_stop_issue_blocks_ready_and_approval_phases_without_deleting_history(self) -> None:
+        ready = self.store.create_issue("ready stop", "desc", ready=True)
+        approval = self.store.create_issue("approval stop", "desc", ready=True)
+        self._move_to_plan_approval(approval.id)
+        self.store.create_run("run-old", approval.id, "research", "dry-run")
+        self.artifacts.write_phase_artifact(approval.id, "research", "run-old", "old research")
+
+        ready_result = stop_issue(self.config, self.store, self.artifacts, ready.id, "Pause ready work.")
+        approval_result = stop_issue(self.config, self.store, self.artifacts, approval.id, "Pause before implementation.")
+
+        self.assertEqual(ready_result.prior_phase, "needs_research")
+        self.assertEqual(ready_result.issue.phase, "blocked")
+        self.assertEqual(ready_result.issue.blocked_summary, "Pause ready work.")
+        self.assertEqual(approval_result.prior_phase, "awaiting_plan_approval")
+        self.assertEqual(approval_result.issue.phase, "blocked")
+        self.assertEqual(self.store.list_runs(approval.id)[0]["id"], "run-old")
+        self.assertTrue(self.artifacts.phase_artifact_path(approval.id, "research").exists())
+        snapshot = json.loads((self.config.artifacts_dir / str(approval.id) / "issue.json").read_text(encoding="utf-8"))
+        self.assertEqual(snapshot["phase"], "blocked")
+        self.assertIn(ready.id, {row["id"] for row in self.store.dashboard_summary()["blocked_issues"]})
+        self.assertNotIn(ready.id, {issue.id for issue in self.store.list_next_ready_issues(10)})
+        event_types = [event["event_type"] for event in self.store.list_events(approval.id)]
+        self.assertEqual(event_types[-2:], ["issue.transitioned", "issue.stopped"])
+
+    def test_stop_issue_from_human_input_closes_pending_request_and_updates_artifacts(self) -> None:
+        issue = self.store.create_issue("human stop", "desc", ready=True)
+        Orchestrator(self.store, self.artifacts, self.config, runner=HumanInputRunner()).process_issue(issue.id)
+
+        result = stop_issue(self.config, self.store, self.artifacts, issue.id, "Pause until product decides.", stopped_by="test")
+
+        self.assertEqual(result.prior_phase, "awaiting_human_input")
+        self.assertEqual(result.issue.phase, "blocked")
+        self.assertEqual(result.issue.blocked_summary, "Pause until product decides.")
+        self.assertIsNotNone(result.stopped_human_input_request)
+        self.assertEqual(result.stopped_human_input_request.status, "stopped")
+        self.assertEqual(result.stopped_human_input_request.answer, "Pause until product decides.")
+        self.assertEqual(result.stopped_human_input_request.answered_by, "test")
+        self.assertIsNone(self.store.get_pending_human_input_request(issue.id))
+        requests = self.store.list_human_input_requests(issue.id)
+        self.assertEqual(requests[0].status, "stopped")
+        self.assertIn("Stop reason", self.artifacts.human_input_markdown_path(issue.id).read_text(encoding="utf-8"))
+        self.assertIn("Pause until product decides.", self.artifacts.human_input_markdown_path(issue.id).read_text(encoding="utf-8"))
+        jsonl = self.artifacts.human_input_jsonl_path(issue.id).read_text(encoding="utf-8")
+        self.assertIn('"type": "requested"', jsonl)
+        self.assertIn('"type": "stopped"', jsonl)
+        event_types = [event["event_type"] for event in self.store.list_events(issue.id)]
+        self.assertIn("human_input.stopped", event_types)
+        self.assertIn("issue.stopped", event_types)
+
+    def test_stop_issue_recovers_stale_run_before_blocking(self) -> None:
+        issue = self.store.create_issue("stale stop", "desc", ready=True)
+        self.assertTrue(self.store.acquire_lock(issue.id, "legacy-worker", 60, "dead-run"))
+        self.store.transition_issue(issue.id, "researching", "dead-run")
+        self.store.create_run("dead-run", issue.id, "research", "dry-run")
+        self._expire_lock(issue.id)
+
+        result = stop_issue(self.config, self.store, self.artifacts, issue.id, "Stop after stale runner.")
+
+        self.assertEqual(result.prior_phase, "needs_research")
+        self.assertEqual(result.issue.phase, "blocked")
+        self.assertIsNone(result.issue.current_run_id)
+        self.assertIsNone(result.issue.lock_expires_at)
+        self.assertEqual(self.store.list_runs(issue.id)[0]["status"], "interrupted")
+        event_types = [event["event_type"] for event in self.store.list_events(issue.id)]
+        self.assertIn("issue.recovered", event_types)
+        self.assertIn("issue.stopped", event_types)
+
+    def test_stop_rejects_active_lock_draft_and_closed_issue(self) -> None:
+        locked = self.store.create_issue("locked stop", "desc", ready=True)
+        self.assertTrue(self.store.acquire_lock(locked.id, "worker", 60, "run-locked"))
+        with self.assertRaisesRegex(ValueError, "active run|active lock"):
+            stop_issue(self.config, self.store, self.artifacts, locked.id)
+
+        draft = self.store.create_issue("draft stop", "desc")
+        with self.assertRaisesRegex(ValueError, "draft"):
+            stop_issue(self.config, self.store, self.artifacts, draft.id)
+
+        done = self.store.create_issue("done stop", "desc", ready=True)
+        self.store.transition_issue(done.id, "researching")
+        self.store.transition_issue(done.id, "ready_for_plan")
+        self.store.transition_issue(done.id, "planning")
+        self.store.transition_issue(done.id, "awaiting_plan_approval")
+        self.store.transition_issue(done.id, "ready_for_implementation")
+        self.store.transition_issue(done.id, "implementing")
+        self.store.transition_issue(done.id, "ready_for_validation")
+        self.store.transition_issue(done.id, "validating")
+        self.store.transition_issue(done.id, "ready_for_review")
+        self.store.transition_issue(done.id, "reviewing")
+        self.store.transition_issue(done.id, "awaiting_merge_approval")
+        self.store.transition_issue(done.id, "ready_for_merge")
+        self.store.transition_issue(done.id, "merging")
+        self.store.transition_issue(done.id, "done")
+        with self.assertRaisesRegex(ValueError, "closed"):
+            stop_issue(self.config, self.store, self.artifacts, done.id)
+
+    def test_cli_stop_prints_summary_and_uses_default_message(self) -> None:
+        issue = self.store.create_issue("cli stop", "desc", ready=True)
+        args = build_parser().parse_args(["issue", "stop", str(issue.id)])
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            exit_code = handle_issue(args, self.store, self.artifacts, self.config)
+
+        stopped = self.store.get_issue(issue.id)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stopped.phase, "blocked")
+        self.assertEqual(stopped.blocked_summary, "Issue stopped by manager")
+        self.assertIn(f"Issue {issue.id} stopped at blocked", output.getvalue())
+        show_output = io.StringIO()
+        with contextlib.redirect_stdout(show_output):
+            print_issue(stopped, self.store, self.artifacts)
+        self.assertIn("Blocked summary: Issue stopped by manager", show_output.getvalue())
+
+    def test_schema_migration_adds_issue_columns(self) -> None:
         old_db = self.home / "old-state.db"
         created_at = "2026-01-01T00:00:00+00:00"
         with sqlite3.connect(old_db) as conn:
@@ -196,9 +351,11 @@ class StoreAndWorkerTests(unittest.TestCase):
 
         with store.connect() as conn:
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(issues)").fetchall()}
-            row = conn.execute("SELECT last_scheduled_at FROM issues WHERE id = 1").fetchone()
+            row = conn.execute("SELECT last_scheduled_at, blocked_summary FROM issues WHERE id = 1").fetchone()
         self.assertIn("last_scheduled_at", columns)
+        self.assertIn("blocked_summary", columns)
         self.assertIsNone(row["last_scheduled_at"])
+        self.assertIsNone(row["blocked_summary"])
 
     def test_schema_migration_adds_run_next_phase(self) -> None:
         old_db = self.home / "old-runs-state.db"
@@ -893,6 +1050,45 @@ class StoreAndWorkerTests(unittest.TestCase):
         self.assertEqual(run["status"], "success")
         self.assertEqual(run["next_phase"], "blocked")
 
+    def test_recovery_prefers_terminal_artifact_blocked_summary(self) -> None:
+        issue = self.store.create_issue("title", "desc", ready=True)
+        blocked_summary = "The source checkout credentials are missing. Add them and rerun research."
+        self.assertTrue(self.store.acquire_lock(issue.id, "legacy-worker", 60, "failed-run"))
+        self.store.transition_issue(issue.id, "researching", "failed-run")
+        self.store.create_run("failed-run", issue.id, "research", "copilot-cli")
+        artifact_path = self.artifacts.write_phase_artifact(
+            issue.id,
+            "research",
+            "failed-run",
+            (
+                "# Research blocked\n\n"
+                "Verbose diagnostics and retry metadata should not be the primary blocked reason.\n\n"
+                f"Blocked summary: {blocked_summary}\n"
+                "Recommendation: `blocked`\n"
+            ),
+        )
+        self.store.complete_run(
+            "failed-run",
+            issue.id,
+            "failed",
+            "Copilot CLI research failed with verbose internal details.",
+            str(artifact_path),
+            "Traceback and subprocess output should stay technical.",
+        )
+        self._expire_lock(issue.id)
+
+        result = Orchestrator(self.store, self.artifacts, self.config).recover_interrupted_issue(issue.id)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.next_phase, "blocked")
+        recovered = self.store.get_issue(issue.id)
+        self.assertEqual(recovered.phase, "blocked")
+        self.assertEqual(recovered.blocked_summary, blocked_summary)
+        self.assertNotIn("Recovered terminal", recovered.blocked_summary)
+        issue_payload_path = self.config.artifacts_dir / str(issue.id) / "issue.json"
+        issue_payload = json.loads(issue_payload_path.read_text(encoding="utf-8"))
+        self.assertEqual(issue_payload["blocked_summary"], blocked_summary)
+
     def test_recovery_clears_stale_lock_after_plan_reaches_approval(self) -> None:
         issue = self.store.create_issue("title", "desc", ready=True)
         self.store.transition_issue(issue.id, "researching")
@@ -1160,6 +1356,38 @@ class StoreAndWorkerTests(unittest.TestCase):
         self.assertIn("debug output", log_text)
         history = json.loads((self.config.artifacts_dir / str(issue.id) / "history.jsonl").read_text(encoding="utf-8").strip())
         self.assertEqual(history["log_path"], str(logs[0]))
+
+    def test_orchestrator_persists_agent_blocked_summary(self) -> None:
+        issue = self.store.create_issue("title", "desc", repo_path="/tmp/repo", ready=True)
+
+        class BlockingRunner(AgentRunner):
+            name = "blocking"
+
+            def run(self, phase: str, issue: Issue, context: Dict[str, str]) -> AgentResult:
+                return AgentResult(
+                    status="blocked",
+                    summary="Verbose runner failed with many implementation details.",
+                    artifact_markdown=(
+                        "The runner cannot continue.\n\n"
+                        "Blocked summary: Missing repository credentials. Add the credentials and rerun research.\n"
+                        "Recommendation: `blocked`"
+                    ),
+                    suggested_next_phase="blocked",
+                    error="Verbose runner failed with many implementation details.",
+                    blocked_summary="Missing repository credentials. Add the credentials and rerun research.",
+                )
+
+        result = Orchestrator(self.store, self.artifacts, self.config, runner=BlockingRunner()).process_next()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.next_phase, "blocked")
+        blocked = self.store.get_issue(issue.id)
+        self.assertEqual(
+            blocked.blocked_summary,
+            "Missing repository credentials. Add the credentials and rerun research.",
+        )
+        history = json.loads((self.config.artifacts_dir / str(issue.id) / "history.jsonl").read_text(encoding="utf-8").strip())
+        self.assertEqual(history["blocked_summary"], blocked.blocked_summary)
 
     def test_dry_run_flow_blocks_merge_without_workspace(self) -> None:
         issue = self.store.create_issue("title", "desc", ready=True)

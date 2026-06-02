@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
+from .blocked_summary import extract_blocked_summary, summarize_blocked_reason
 from .locks import is_live_same_host_owner
 from .models import HumanInputRequest, HumanInputRequestDraft, Issue, utc_now_iso
 from .state_machine import (
@@ -38,6 +39,7 @@ CREATE TABLE IF NOT EXISTS issues (
   lock_expires_at TEXT,
   current_run_id TEXT,
   last_scheduled_at TEXT,
+  blocked_summary TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -186,6 +188,14 @@ class RecoveryResult:
     action: str
     summary: str
     agent_phase: str | None = None
+
+
+@dataclass(frozen=True)
+class StopIssueResult:
+    issue_id: int
+    prior_phase: str
+    issue: Issue
+    stopped_human_input_request: HumanInputRequest | None = None
 
 
 class IssueStore:
@@ -403,7 +413,8 @@ class IssueStore:
             ).fetchall()
             active_locks = conn.execute(
                 f"""
-                SELECT id, title, phase, priority, updated_at, lock_owner, lock_expires_at, current_run_id
+                SELECT id, title, phase, priority, updated_at, lock_owner, lock_expires_at, current_run_id,
+                       blocked_summary
                 FROM issues
                 WHERE lock_expires_at IS NOT NULL AND lock_expires_at >= ?
                 {issue_and}
@@ -436,7 +447,7 @@ class IssueStore:
             ).fetchall()
             open_issues = conn.execute(
                 f"""
-                SELECT id, title, phase, priority, updated_at
+                SELECT id, title, phase, priority, updated_at, blocked_summary
                 FROM issues
                 WHERE status = 'open'
                 {issue_and}
@@ -448,7 +459,7 @@ class IssueStore:
             awaiting_plan_approval = conn.execute(
                 f"""
                 SELECT id, title, phase, status, priority, updated_at,
-                       lock_owner, lock_expires_at, current_run_id
+                       lock_owner, lock_expires_at, current_run_id, blocked_summary
                 FROM issues
                 WHERE status = 'open' AND phase = 'awaiting_plan_approval'
                 {issue_and}
@@ -469,7 +480,7 @@ class IssueStore:
             awaiting_merge_approval = conn.execute(
                 f"""
                 SELECT id, title, phase, status, priority, updated_at,
-                       lock_owner, lock_expires_at, current_run_id
+                       lock_owner, lock_expires_at, current_run_id, blocked_summary
                 FROM issues
                 WHERE status = 'open' AND phase = 'awaiting_merge_approval'
                 {issue_and}
@@ -490,7 +501,7 @@ class IssueStore:
             human_input_needed = conn.execute(
                 f"""
                 SELECT issues.id, issues.title, issues.phase, issues.status, issues.priority, issues.updated_at,
-                       issues.lock_owner, issues.lock_expires_at, issues.current_run_id,
+                       issues.lock_owner, issues.lock_expires_at, issues.current_run_id, issues.blocked_summary,
                        human_input_requests.id AS request_id,
                        human_input_requests.question,
                        human_input_requests.resume_phase
@@ -517,7 +528,7 @@ class IssueStore:
             blocked_issues = conn.execute(
                 f"""
                 SELECT id, title, phase, status, priority, updated_at,
-                       lock_owner, lock_expires_at, current_run_id
+                       lock_owner, lock_expires_at, current_run_id, blocked_summary
                 FROM issues
                 WHERE status = 'open' AND phase = 'blocked'
                 {issue_and}
@@ -538,7 +549,7 @@ class IssueStore:
             draft_issues = conn.execute(
                 f"""
                 SELECT id, title, phase, status, priority, updated_at,
-                       lock_owner, lock_expires_at, current_run_id
+                       lock_owner, lock_expires_at, current_run_id, blocked_summary
                 FROM issues
                 WHERE status = 'open' AND phase = 'draft'
                 {issue_and}
@@ -562,7 +573,7 @@ class IssueStore:
             ready_issues = conn.execute(
                 f"""
                 SELECT id, title, phase, status, priority, updated_at,
-                       lock_owner, lock_expires_at, current_run_id
+                       lock_owner, lock_expires_at, current_run_id, blocked_summary
                 FROM issues
                 WHERE status = 'open'
                   AND phase IN ({ready_placeholders})
@@ -825,6 +836,7 @@ class IssueStore:
                     lock_expires_at = NULL,
                     current_run_id = NULL,
                     last_scheduled_at = NULL,
+                    blocked_summary = NULL,
                     updated_at = ?
                 WHERE id = ? AND lock_owner = ?
                 """,
@@ -868,7 +880,15 @@ class IssueStore:
             if cur.rowcount == 1:
                 self._add_event(conn, issue_id, run_id, "lock.released", f"{owner} released lock")
 
-    def transition_issue(self, issue_id: int, next_phase: str, run_id: str | None = None, message: str | None = None) -> Issue:
+    def transition_issue(
+        self,
+        issue_id: int,
+        next_phase: str,
+        run_id: str | None = None,
+        message: str | None = None,
+        *,
+        blocked_summary: str | None = None,
+    ) -> Issue:
         issue = self.get_issue(issue_id)
         if issue.phase == "awaiting_human_input":
             raise ValueError(
@@ -881,21 +901,26 @@ class IssueStore:
             )
         validate_transition(issue.phase, next_phase)
         status = "closed" if next_phase == "done" else "open"
+        stored_blocked_summary = (
+            summarize_blocked_reason(blocked_summary or message)
+            if next_phase == "blocked"
+            else None
+        )
         now = utc_now_iso()
         with self.connect() as conn:
             if run_id is None:
                 cur = conn.execute(
-                    "UPDATE issues SET phase = ?, status = ?, updated_at = ? WHERE id = ?",
-                    (next_phase, status, now, issue_id),
+                    "UPDATE issues SET phase = ?, status = ?, blocked_summary = ?, updated_at = ? WHERE id = ?",
+                    (next_phase, status, stored_blocked_summary, now, issue_id),
                 )
             else:
                 cur = conn.execute(
                     """
                     UPDATE issues
-                    SET phase = ?, status = ?, updated_at = ?
+                    SET phase = ?, status = ?, blocked_summary = ?, updated_at = ?
                     WHERE id = ? AND current_run_id = ?
                     """,
-                    (next_phase, status, now, issue_id, run_id),
+                    (next_phase, status, stored_blocked_summary, now, issue_id, run_id),
                 )
             if cur.rowcount != 1:
                 raise RuntimeError(f"Run {run_id} is no longer current for issue {issue_id}")
@@ -907,6 +932,100 @@ class IssueStore:
                 message or f"Transitioned {issue.phase} -> {next_phase}",
             )
         return self.get_issue(issue_id)
+
+    def stop_issue(
+        self,
+        issue_id: int,
+        message: str,
+        *,
+        stopped_by: str = "cli",
+    ) -> StopIssueResult:
+        cleaned_message = message.strip()
+        if not cleaned_message:
+            raise ValueError("Stop message is required")
+        cleaned_stopped_by = stopped_by.strip() or "unknown"
+        now = utc_now_iso()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM issues WHERE id = ?", (issue_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"Issue not found: {issue_id}")
+            issue = Issue.from_row(row)
+            if issue.status == "closed" or issue.phase == "done":
+                raise ValueError(f"Issue {issue.id} is already closed and cannot be stopped")
+            if issue.phase == "draft":
+                raise ValueError(f"Issue {issue.id} is a draft and is already inactive")
+            if issue.phase == "blocked":
+                return StopIssueResult(issue.id, issue.phase, issue, None)
+            if issue.current_run_id is not None:
+                raise ValueError(f"Cannot stop issue {issue.id} while it has an active run {issue.current_run_id}")
+            if issue.lock_expires_at is not None:
+                raise ValueError(
+                    f"Cannot stop issue {issue.id} while it has an active lock "
+                    f"held by {issue.lock_owner or 'unknown'} until {issue.lock_expires_at}"
+                )
+            validate_transition(issue.phase, "blocked")
+
+            stopped_request: HumanInputRequest | None = None
+            if issue.phase == "awaiting_human_input":
+                request_row = conn.execute(
+                    """
+                    SELECT * FROM human_input_requests
+                    WHERE issue_id = ? AND status = 'pending'
+                    ORDER BY created_at ASC, id ASC
+                    LIMIT 1
+                    """,
+                    (issue_id,),
+                ).fetchone()
+                if request_row is not None:
+                    request = HumanInputRequest.from_row(request_row)
+                    cur = conn.execute(
+                        """
+                        UPDATE human_input_requests
+                        SET status = 'stopped', answered_at = ?, answer = ?, answered_by = ?
+                        WHERE id = ? AND status = 'pending'
+                        """,
+                        (now, cleaned_message, cleaned_stopped_by, request.id),
+                    )
+                    if cur.rowcount != 1:
+                        raise RuntimeError(f"Human input request {request.id} was already resolved")
+                    stopped_row = conn.execute("SELECT * FROM human_input_requests WHERE id = ?", (request.id,)).fetchone()
+                    stopped_request = HumanInputRequest.from_row(stopped_row)
+                    self._add_event(
+                        conn,
+                        issue_id,
+                        stopped_request.run_id,
+                        "human_input.stopped",
+                        f"Stopped human input request {stopped_request.id}",
+                    )
+
+            cur = conn.execute(
+                """
+                UPDATE issues
+                SET phase = 'blocked',
+                    status = 'open',
+                    lock_owner = NULL,
+                    lock_expires_at = NULL,
+                    current_run_id = NULL,
+                    blocked_summary = ?,
+                    updated_at = ?
+                WHERE id = ? AND phase = ?
+                  AND current_run_id IS NULL
+                  AND lock_expires_at IS NULL
+                """,
+                (summarize_blocked_reason(cleaned_message), now, issue_id, issue.phase),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError(f"Issue {issue.id} could not be stopped because its state changed")
+            self._add_event(conn, issue_id, None, "issue.transitioned", f"Stopped issue; transitioned {issue.phase} -> blocked")
+            self._add_event(conn, issue_id, None, "issue.stopped", cleaned_message)
+            updated_row = conn.execute("SELECT * FROM issues WHERE id = ?", (issue_id,)).fetchone()
+        return StopIssueResult(
+            issue_id=issue_id,
+            prior_phase=issue.phase,
+            issue=Issue.from_row(updated_row),
+            stopped_human_input_request=stopped_request,
+        )
 
     def reject_plan(self, issue_id: int, feedback: str, run_id: str | None = None) -> Issue:
         cleaned = feedback.strip()
@@ -1306,7 +1425,7 @@ class IssueStore:
             ):
                 return None
             run_id = row["current_run_id"]
-            if not self._apply_recovery_issue_update(conn, row, next_phase, now_iso):
+            if not self._apply_recovery_issue_update(conn, row, next_phase, now_iso, summary):
                 return None
             run = self._run_for_recovery(conn, issue_id, run_id, "merge")
             if run is not None:
@@ -1376,6 +1495,7 @@ class IssueStore:
         agent_phase = agent_phase_for_running_phase(phase)
         run = self._run_for_recovery(conn, issue_id, row["current_run_id"], agent_phase)
         run_id = str(run["id"]) if run is not None else row["current_run_id"]
+        blocked_summary = None
         if run is None:
             next_phase = ready_phase
             action = "running_phase_reset"
@@ -1385,9 +1505,11 @@ class IssueStore:
             action = "run_interrupted"
             summary = f"Recovered interrupted {agent_phase} run {run['id']}; returned to {ready_phase}."
         else:
-            next_phase, action, summary = self._terminal_recovery_target(run, phase, terminal_next_phase_resolver)
+            next_phase, action, summary, blocked_summary = self._terminal_recovery_target(
+                run, phase, terminal_next_phase_resolver
+            )
 
-        if not self._apply_recovery_issue_update(conn, row, next_phase, now_iso):
+        if not self._apply_recovery_issue_update(conn, row, next_phase, now_iso, summary, blocked_summary):
             return None
         if run is not None and str(run["status"]) == "running":
             self._complete_recovered_run(conn, run, "interrupted", summary, next_phase, now_iso, None, summary)
@@ -1417,7 +1539,7 @@ class IssueStore:
         if run is not None and str(run["status"]) == "running":
             summary = f"Recovered interrupted {agent_phase} run {run['id']} before phase transition; kept {phase} ready."
             action = "ready_run_interrupted"
-        if not self._apply_recovery_issue_update(conn, row, phase, now_iso):
+        if not self._apply_recovery_issue_update(conn, row, phase, now_iso, summary):
             return None
         if run is not None and str(run["status"]) == "running":
             self._complete_recovered_run(conn, run, "interrupted", summary, phase, now_iso, None, summary)
@@ -1444,7 +1566,7 @@ class IssueStore:
             return None
         run_id = str(run["id"])
         summary = f"Cleared stale lock for completed {run['phase']} run {run_id} after issue reached {phase}."
-        if not self._apply_recovery_issue_update(conn, row, phase, now_iso):
+        if not self._apply_recovery_issue_update(conn, row, phase, now_iso, summary):
             return None
         if run["next_phase"] is None:
             conn.execute("UPDATE runs SET next_phase = ? WHERE id = ? AND next_phase IS NULL", (phase, run_id))
@@ -1456,26 +1578,36 @@ class IssueStore:
         run: sqlite3.Row,
         running_phase: str,
         terminal_next_phase_resolver: TerminalNextPhaseResolver | None,
-    ) -> tuple[str, str, str]:
+    ) -> tuple[str, str, str, str | None]:
         stored_next_phase = run["next_phase"]
         if stored_next_phase:
             next_phase = str(stored_next_phase)
             return self._validated_terminal_recovery_target(run, running_phase, next_phase)
         if str(run["status"]) != "success":
+            summary = (
+                f"Recovered terminal {run['phase']} run {run['id']} with status {run['status']}; "
+                "blocked for inspection."
+            )
             return (
                 "blocked",
                 "terminal_run_blocked",
-                f"Recovered terminal {run['phase']} run {run['id']} with status {run['status']}; blocked for inspection.",
+                summary,
+                self._terminal_run_blocked_summary(run, summary, include_artifact_text=True),
             )
         resolved = terminal_next_phase_resolver(run) if terminal_next_phase_resolver is not None else None
         if resolved is None and str(run["runner"]) == "dry-run":
             resolved = default_next_phase(str(run["phase"]))
         if resolved is not None:
             return self._validated_terminal_recovery_target(run, running_phase, resolved)
+        summary = (
+            f"Recovered completed {run['phase']} run {run['id']} but could not determine its next phase; "
+            "blocked for inspection."
+        )
         return (
             "blocked",
             "terminal_run_blocked",
-            f"Recovered completed {run['phase']} run {run['id']} but could not determine its next phase; blocked for inspection.",
+            summary,
+            self._terminal_run_blocked_summary(run, summary),
         )
 
     @staticmethod
@@ -1483,28 +1615,72 @@ class IssueStore:
         run: sqlite3.Row,
         running_phase: str,
         next_phase: str,
-    ) -> tuple[str, str, str]:
+    ) -> tuple[str, str, str, str | None]:
         if next_phase == "awaiting_human_input":
+            summary = (
+                f"Recovered completed {run['phase']} run {run['id']} that requested human input, "
+                "but no pending request was committed atomically; blocked for rerun or inspection."
+            )
             return (
                 "blocked",
                 "terminal_run_blocked",
-                f"Recovered completed {run['phase']} run {run['id']} that requested human input, "
-                "but no pending request was committed atomically; blocked for rerun or inspection.",
+                summary,
+                IssueStore._terminal_run_blocked_summary(run, summary),
             )
         try:
             validate_transition(running_phase, next_phase)
         except ValueError as exc:
+            summary = (
+                f"Recovered terminal {run['phase']} run {run['id']} with invalid next phase "
+                f"{next_phase!r} from {running_phase}; blocked for inspection. {exc}"
+            )
             return (
                 "blocked",
                 "terminal_run_blocked",
-                f"Recovered terminal {run['phase']} run {run['id']} with invalid next phase "
-                f"{next_phase!r} from {running_phase}; blocked for inspection. {exc}",
+                summary,
+                IssueStore._terminal_run_blocked_summary(run, summary),
+            )
+        blocked_summary = None
+        if next_phase == "blocked":
+            blocked_summary = IssueStore._terminal_run_blocked_summary(
+                run,
+                f"Recovered completed {run['phase']} run {run['id']}; advanced to {next_phase}.",
+                include_artifact_text=True,
             )
         return (
             next_phase,
             "run_forward_completed",
             f"Recovered completed {run['phase']} run {run['id']}; advanced to {next_phase}.",
+            blocked_summary,
         )
+
+    @staticmethod
+    def _terminal_run_blocked_summary(
+        run: sqlite3.Row,
+        fallback_summary: str,
+        *,
+        include_artifact_text: bool = False,
+    ) -> str:
+        artifact_text = None
+        artifact_path = run["artifact_path"]
+        if artifact_path:
+            path = Path(str(artifact_path))
+            if path.is_file():
+                try:
+                    artifact_text = path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    artifact_text = None
+                artifact_summary = extract_blocked_summary(artifact_text)
+                if artifact_summary:
+                    return artifact_summary
+        error = run["error"]
+        if error:
+            return summarize_blocked_reason(str(error))
+        if include_artifact_text and artifact_text:
+            return summarize_blocked_reason(artifact_text)
+        if str(run["status"]) != "success" and run["summary"]:
+            return summarize_blocked_reason(str(run["summary"]))
+        return summarize_blocked_reason(fallback_summary)
 
     @staticmethod
     def _lock_is_recoverable(
@@ -1569,10 +1745,16 @@ class IssueStore:
         row: sqlite3.Row,
         next_phase: str,
         now_iso: str,
+        summary: str | None,
+        blocked_summary: str | None = None,
     ) -> bool:
+        stored_blocked_summary = (
+            summarize_blocked_reason(blocked_summary or summary) if next_phase == "blocked" else None
+        )
         params: list[object] = [
             next_phase,
             "closed" if next_phase == "done" else "open",
+            stored_blocked_summary,
             now_iso,
             int(row["id"]),
             row["phase"],
@@ -1586,7 +1768,7 @@ class IssueStore:
             f"""
             UPDATE issues
             SET phase = ?, status = ?, lock_owner = NULL, lock_expires_at = NULL,
-                current_run_id = NULL, updated_at = ?
+                current_run_id = NULL, blocked_summary = ?, updated_at = ?
             WHERE id = ? AND phase = ?
               {''.join(guards)}
             """,
@@ -1662,6 +1844,8 @@ class IssueStore:
         columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(issues)").fetchall()}
         if "last_scheduled_at" not in columns:
             conn.execute("ALTER TABLE issues ADD COLUMN last_scheduled_at TEXT")
+        if "blocked_summary" not in columns:
+            conn.execute("ALTER TABLE issues ADD COLUMN blocked_summary TEXT")
 
     @staticmethod
     def _migrate_runs_schema(conn: sqlite3.Connection) -> None:

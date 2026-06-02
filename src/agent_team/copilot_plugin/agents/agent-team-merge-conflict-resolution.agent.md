@@ -47,3 +47,5 @@ The phase artifact must contain:
 The first sentence under `Resolution strategy` may become the Git snapshot commit subject, so make it concise and change-focused.
 
 Use `ready_for_validation` when conflicts were resolved and validation should run again. Use `ready_for_implementation` when broader code changes are required. Use `awaiting_human_input` when conflict resolution needs a critical human decision and include the structured request section. Use `blocked` for unresolved or unsafe conflicts.
+
+If the final recommendation is `blocked`, include exactly one `Blocked summary:` line immediately before the final `Recommendation:` line. The blocked summary must be 1-2 plain-language sentences explaining what prevents progress and what would unblock it.

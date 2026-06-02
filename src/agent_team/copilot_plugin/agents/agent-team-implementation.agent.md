@@ -48,3 +48,5 @@ The phase artifact must contain:
 The first sentence under `Summary of changes` may become the Git snapshot commit subject, so make it concise and change-focused.
 
 The final recommendation line must include exactly one allowed value. If implementation needs a critical human decision, use `awaiting_human_input` and include the structured request section. If implementation cannot proceed for non-human-input reasons, use the `blocked` recommendation and explain the blocker and any partial changes.
+
+If the final recommendation is `blocked`, include exactly one `Blocked summary:` line immediately before the final `Recommendation:` line. The blocked summary must be 1-2 plain-language sentences explaining what prevents progress and what would unblock it.

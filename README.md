@@ -127,7 +127,7 @@ PR finalization writes `pull_request.json` with provider, remote, source branch,
 
 Copilot CLI can use read-only tools automatically, but write tools, non-read-only shell commands, URL access, and other potentially risky tools need approval. Because this orchestrator runs Copilot CLI with `--no-ask-user`, the default `AGENT_TEAM_COPILOT_PERMISSION_MODE=phase` supplies phase-specific approval policies instead of `--yolo` or `--allow-all-tools`.
 
-Default phase policies approve narrowly read-only repository/artifact inspection commands for `research`, `plan`, and `review`; add explicit test/check commands such as `python3 -m unittest`, `pytest`, `npm test`, `npm run test`, and ecosystem test runners for `validation`; and add `write` only for `implementation` and `merge_conflict_resolution`, which operate in isolated worktrees. Validation intentionally excludes arbitrary interpreter and package-script approvals such as `python3:*`, `node:*`, and `npm run:*`; add a specific `AGENT_TEAM_COPILOT_ALLOW_TOOL` override when a repo needs another check command. Broad shell approvals for commands that can mutate in-place, such as `find:*` and `sed:*`, are intentionally excluded from read-only policies. Phase mode also denies clearly unsafe operations such as `git push`, `gh pr create`, `gh pr merge`, `rm -rf`, and `sudo`.
+Default phase policies approve narrowly read-only repository/artifact inspection commands for `research`, `plan`, and `review`, including Git diagnostics such as `git status`, `git status --short`, `git diff`, and `git diff --stat`; add explicit test/check commands such as `python3 -m unittest`, `pytest`, `npm test`, `npm run test`, and ecosystem test runners for `validation`; and add `write` only for `implementation` and `merge_conflict_resolution`, which operate in isolated worktrees. Validation intentionally excludes arbitrary interpreter and package-script approvals such as `python3:*`, `node:*`, and `npm run:*`; add a specific `AGENT_TEAM_COPILOT_ALLOW_TOOL` override when a repo needs another check command. Broad shell or Git approvals such as `shell(git:*)`, plus commands that can mutate in-place, such as `find:*` and `sed:*`, are intentionally excluded from read-only policies. Phase mode also denies clearly unsafe operations such as `git push`, `gh pr create`, `gh pr merge`, `rm -rf`, and `sudo`.
 
 Research is the only phase that also allows web URL access by default (`--allow-url=https://*,http://*`) so the custom research agent can match Copilot CLI `/research` behavior with current documentation and GitHub/web-backed investigation. This does not grant write tools or broad path access, and the read-only source mutation guard still applies. Operators can narrow or block URL access for a run with the existing URL pass-through flags below, such as `AGENT_TEAM_COPILOT_DENY_URL`.
 
@@ -177,6 +177,7 @@ agent-team issue approve-merge 1
 agent-team issue approve-merge 1 --branch main
 agent-team issue approve-merge 1 --mode pull-request --remote origin
 agent-team issue advance 1 --to ready_for_implementation
+agent-team issue stop 1 --message "Pause this work"
 agent-team issue delete 1 --confirm "DELETE 1"
 agent-team run --issue 1 --phase research
 agent-team run --issue 1 --phase merge
@@ -202,6 +203,8 @@ draft -> needs_research -> ready_for_plan -> awaiting_plan_approval
 Validation and review may loop back to `ready_for_implementation`; merge conflicts may route to `ready_for_merge_conflict_resolution`, then back through validation and review; any agent phase may pause at `awaiting_human_input` and resume to its stored phase after `agent-team issue answer-human-input`; any phase may return `blocked`.
 
 `draft` is a local backlog phase, not an agent phase. `agent-team issue create` defaults to `draft`; titles are generated from descriptions unless an optional CLI title override is provided. Use `agent-team issue edit <id>` for optional title overrides or regeneration, and use the CLI or web edit page to revise draft description, target repo, priority, and tags before publishing. Use `--ready` to create an immediately runnable issue or publish later with `agent-team issue advance <id> --to needs_research --message "publish draft"`.
+
+Use `agent-team issue stop <id> --message "..."` or the web Stop issue control to non-destructively stop an open non-draft issue. Stop first recovers stale interrupted state when possible, then moves the issue to `blocked`, records the stop reason as the blocked summary, and preserves runs, logs, artifacts, history, and workspaces. It does not force-cancel a live agent process; active locks or queued browser actions are rejected until the run finishes or becomes recoverable.
 
 When an issue is moved out of `blocked`, a non-empty manual transition message is saved as `unblock_context.md` and included in later agent prompts as user-provided context.
 
@@ -247,12 +250,12 @@ The web UI lets you:
 
 - view manager-first dashboard cards for active work, approval gates, human input, blocked issues, draft backlog, ready work, recently finalized issues, and compact run activity
 - create local issues with description, target repo, priority, and tags; generated titles appear in issue lists and detail pages; "Make runnable now" is checked by default to start in `needs_research`, and unchecking it keeps the issue as an editable draft
-- edit local draft issues with description, target repo, priority, and tags before publishing
+- edit local draft issues with description, target repo, priority, and tags, then use the issue-detail "Submit for research" action when the draft is ready for agents
 - list and filter issues, then open detail pages organized around status, next action, primary controls, workflow progress, evidence, collapsed diagnostics, advanced phase overrides, and a distinct danger zone
 - queue a run for the next ready issue or for the current issue's next runnable phase
-- answer human-input requests, approve plans, approve worktree finalization, and manually transition issues through the existing state-machine validation
+- answer human-input requests, approve plans, approve worktree finalization, stop open issues, and manually transition issues through the existing state-machine validation
 
-Generic manual transitions into or out of `awaiting_human_input` are rejected so every pause has a structured request and the decision log cannot be bypassed. Use the issue page's answer form or `agent-team issue answer-human-input`; answering marks the pending request answered, records an event, updates `human_input.jsonl`/`human_input.md`, and moves the issue back to the stored resume phase.
+Generic manual transitions into or out of `awaiting_human_input` are rejected so every pause has a structured request and the decision log cannot be bypassed. Use the issue page's answer form or `agent-team issue answer-human-input`; answering marks the pending request answered, records an event, updates `human_input.jsonl`/`human_input.md`, and moves the issue back to the stored resume phase. The explicit stop action is the exception: stopping an issue that is awaiting human input marks the pending request `stopped`, records the stop reason in `human_input.jsonl`/`human_input.md`, and moves the issue to `blocked` without treating the stop reason as an answered decision.
 
 The browser polls reserved read-only endpoints under `/api/` plus packaged static assets under `/static/app.js` and `/static/styles.css` for live updates and styling. Those endpoints are implementation details for the local UI and remain protected by the same host checks as the HTML pages; form-based mutations still use CSRF validation.
 

@@ -46,3 +46,5 @@ The phase artifact must contain:
 6. Recommendation: `awaiting_merge_approval`, `ready_for_implementation`, `awaiting_human_input`, or `blocked`
 
 Use `awaiting_merge_approval` only when no blocking issue remains. Use `ready_for_implementation` when code changes are needed. Use `awaiting_human_input` when review needs a critical human decision and include the structured request section. Use `blocked` for review blockers such as inaccessible workspaces or inconclusive validation.
+
+If the final recommendation is `blocked`, include exactly one `Blocked summary:` line immediately before the final `Recommendation:` line. The blocked summary must be 1-2 plain-language sentences explaining what prevents progress and what would unblock it.

@@ -357,6 +357,12 @@ class ArtifactStore:
             {"type": "answered", "request": _human_input_request_dict(request)},
         )
 
+    def append_human_input_stop(self, request: HumanInputRequest) -> Path:
+        return self._append_human_input_entry(
+            request.issue_id,
+            {"type": "stopped", "request": _human_input_request_dict(request)},
+        )
+
     def write_human_input_summary(self, issue_id: int, requests: list[HumanInputRequest]) -> Path:
         path = self.human_input_markdown_path(issue_id)
         lines = [
@@ -395,12 +401,15 @@ class ArtifactStore:
             if request.context:
                 lines.extend(["### Context", "", _quote_block(request.context), ""])
             if request.answer is not None:
+                answer_heading = "Stop reason" if request.status == "stopped" else "Answer"
+                answered_at_label = "Stopped at" if request.status == "stopped" else "Answered at"
+                answered_by_label = "Stopped by" if request.status == "stopped" else "Answered by"
                 lines.extend(
                     [
-                        "### Answer",
+                        f"### {answer_heading}",
                         "",
-                        f"- Answered at: {request.answered_at or ''}",
-                        f"- Answered by: {request.answered_by or ''}",
+                        f"- {answered_at_label}: {request.answered_at or ''}",
+                        f"- {answered_by_label}: {request.answered_by or ''}",
                         "",
                         _quote_block(request.answer),
                         "",

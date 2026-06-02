@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 
+from agent_team.blocked_summary import extract_blocked_summary, summarize_blocked_reason
 from agent_team.artifacts import (
     HUMAN_INPUT_JSONL_ARTIFACT,
     HUMAN_INPUT_MARKDOWN_ARTIFACT,
@@ -56,9 +57,11 @@ class PhasePermissionPolicy:
 
 
 READ_ONLY_ALLOW_TOOLS = (
+    "read",
     "shell(git status)",
     "shell(git status:*)",
     "shell(git diff)",
+    # Covers read-only diff summaries such as `git diff --stat`.
     "shell(git diff:*)",
     "shell(git log)",
     "shell(git log:*)",
@@ -74,6 +77,8 @@ READ_ONLY_ALLOW_TOOLS = (
     "shell(head:*)",
     "shell(tail:*)",
     "shell(wc:*)",
+    "shell(cat:*)",
+    "shell(grep:*)",
 )
 
 VALIDATION_ALLOW_TOOLS = READ_ONLY_ALLOW_TOOLS + (
@@ -176,9 +181,10 @@ class CopilotCliRunner(AgentRunner):
             return AgentResult(
                 status="blocked",
                 summary=path_error,
-                artifact_markdown=f"**Recommendation: `blocked`**\n\n{path_error}",
+                artifact_markdown=CopilotCliRunner._system_blocked_artifact(path_error),
                 suggested_next_phase="blocked",
                 error=path_error,
+                blocked_summary=summarize_blocked_reason(path_error),
             )
 
         source_snapshot, source_guard_error = self._source_snapshot_for_read_only_phase(phase, context)
@@ -186,9 +192,10 @@ class CopilotCliRunner(AgentRunner):
             return AgentResult(
                 status="blocked",
                 summary=source_guard_error,
-                artifact_markdown=f"**Recommendation: `blocked`**\n\n{source_guard_error}",
+                artifact_markdown=CopilotCliRunner._system_blocked_artifact(source_guard_error),
                 suggested_next_phase="blocked",
                 error=source_guard_error,
+                blocked_summary=summarize_blocked_reason(source_guard_error),
             )
         artifact_dir = self._artifact_dir_from_context(context)
         command = self._build_command(phase, prompt, execution_repo_path, artifact_dir)
@@ -216,6 +223,7 @@ class CopilotCliRunner(AgentRunner):
                 error=mutation_error,
                 raw_stdout=None if completed.logged else output,
                 raw_stderr=stderr,
+                blocked_summary=summarize_blocked_reason(mutation_error),
             )
         if completed.returncode != 0:
             return AgentResult(
@@ -226,6 +234,7 @@ class CopilotCliRunner(AgentRunner):
                 error=stderr or output or f"exit code {completed.returncode}",
                 raw_stdout=None if completed.logged else output,
                 raw_stderr=stderr,
+                blocked_summary=summarize_blocked_reason(stderr or output or f"Copilot CLI {phase} failed."),
             )
         recommendation = self._recommendation_diagnostic(phase, artifact)
         recommended_next_phase = recommendation.next_phase
@@ -239,8 +248,10 @@ class CopilotCliRunner(AgentRunner):
                 error=message,
                 raw_stdout=None if completed.logged else output,
                 raw_stderr=stderr,
+                blocked_summary=summarize_blocked_reason(message),
             )
         if recommended_next_phase == "blocked":
+            blocked_summary = self._blocked_summary_from_artifact(artifact)
             return AgentResult(
                 status="blocked",
                 summary=f"Copilot CLI {phase} recommended blocked for issue {issue.id}",
@@ -249,6 +260,7 @@ class CopilotCliRunner(AgentRunner):
                 error=f"Copilot CLI {phase} recommended blocked",
                 raw_stdout=None if completed.logged else output,
                 raw_stderr=stderr,
+                blocked_summary=blocked_summary,
             )
         return AgentResult(
             status="success",
@@ -602,8 +614,16 @@ class CopilotCliRunner(AgentRunner):
     @staticmethod
     def _blocked_artifact(existing_artifact: str, message: str) -> str:
         prefix = existing_artifact.rstrip()
-        blocked = f"**Recommendation: `blocked`**\n\n{message}"
+        blocked = CopilotCliRunner._system_blocked_artifact(message)
         return f"{prefix}\n\n{blocked}" if prefix else blocked
+
+    @staticmethod
+    def _system_blocked_artifact(message: str) -> str:
+        return (
+            f"{message}\n\n"
+            f"Blocked summary: {summarize_blocked_reason(message)}\n"
+            "Recommendation: `blocked`"
+        )
 
     @staticmethod
     def _recommendation_blocked_artifact(existing_artifact: str, message: str) -> str:
@@ -612,6 +632,7 @@ class CopilotCliRunner(AgentRunner):
             "Copilot CLI completed successfully, but the phase artifact could not be routed "
             "because it did not include exactly one phase-allowed final Recommendation.\n\n"
             f"{message}\n\n"
+            f"Blocked summary: {summarize_blocked_reason(message)}\n"
             "Recommendation: `blocked`"
         )
         prefix = existing_artifact.rstrip()
@@ -657,6 +678,10 @@ class CopilotCliRunner(AgentRunner):
             if detected_value is not None:
                 return _RecommendationDiagnostic(None, "invalid", detected_value, allowed)
         return _RecommendationDiagnostic(None, "missing", None, allowed)
+
+    @staticmethod
+    def _blocked_summary_from_artifact(artifact_markdown: str) -> str | None:
+        return extract_blocked_summary(artifact_markdown)
 
     @staticmethod
     def _detected_invalid_recommendation_value(lines: list[str]) -> str | None:

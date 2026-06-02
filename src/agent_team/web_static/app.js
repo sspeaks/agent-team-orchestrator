@@ -111,6 +111,9 @@
     link.textContent = "#" + item.id + " " + (item.title || "");
     var meta = el("span", "muted", "P" + item.priority + " - " + phaseLabel(item.phase) + " - updated " + item.updated_at);
     li.append(link, el("br"), meta);
+    if (item.blocked_summary) {
+      li.append(el("br"), el("span", "muted blocked-summary-inline", item.blocked_summary));
+    }
     return li;
   }
 
@@ -306,6 +309,19 @@
     container.hidden = false;
     container.className = "panel attention blocked-reason-panel";
     var summary = reason.summary || reason.headline || "No blocked reason was recorded.";
+
+    var nodes = [
+      el("h2", null, "Blocked reason"),
+      el("p", "blocked-reason-summary", summary)
+    ];
+    if (reason.suggested_transition && reason.suggested_transition.label) {
+      nodes.push(el("p", "muted", "Suggested retry: " + reason.suggested_transition.label));
+    }
+    nodes.push(blockedReasonTechnicalDetails(reason, summary));
+    container.replaceChildren.apply(container, nodes);
+  }
+
+  function blockedReasonTechnicalDetails(reason, summary) {
     var metaParts = ["Source: " + blockedReasonSourceLabel(reason.source)];
     if (reason.phase) metaParts.push("Phase: " + reason.phase);
     if (reason.status) metaParts.push("Status: " + reason.status);
@@ -316,24 +332,33 @@
       metaParts.push("Suggested retry: " + reason.suggested_transition.label);
     }
 
-    var nodes = [
-      el("h2", null, "Blocked reason"),
-      el("p", "blocked-reason-summary", summary),
-      el("p", "muted", metaParts.join(" - "))
-    ];
-    if (reason.error) {
-      nodes.push(el("pre", "blocked-reason-error", reason.error));
+    var details = el("details", "blocked-reason-technical");
+    details.append(el("summary", null, "Technical details"));
+    details.append(el("p", "muted", metaParts.join(" - ")));
+    if (reason.technical_summary && reason.technical_summary !== summary) {
+      details.append(el("p", "blocked-reason-technical-summary", reason.technical_summary));
     }
-    if (reason.artifact_excerpt && reason.artifact_excerpt !== summary) {
-      nodes.push(el("p", "blocked-reason-artifact-excerpt", reason.artifact_excerpt));
+    if (reason.run_summary && reason.run_summary !== summary && reason.run_summary !== reason.technical_summary) {
+      details.append(el("p", "blocked-reason-run-summary", reason.run_summary));
+    }
+    if (reason.error) {
+      details.append(el("pre", "blocked-reason-error", reason.error));
+    }
+    if (
+      reason.artifact_excerpt &&
+      reason.artifact_excerpt !== summary &&
+      reason.artifact_excerpt !== reason.technical_summary &&
+      reason.artifact_excerpt !== reason.run_summary
+    ) {
+      details.append(el("p", "blocked-reason-artifact-excerpt", reason.artifact_excerpt));
     }
     var links = el("p", "blocked-reason-links");
     renderBlockedReasonLink(links, reason.artifact);
     renderBlockedReasonLink(links, reason.log);
     if (links.children.length > 0) {
-      nodes.push(links);
+      details.append(links);
     }
-    container.replaceChildren.apply(container, nodes);
+    return details;
   }
 
   function renderClosedSynopsisLink(list, link) {
