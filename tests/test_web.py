@@ -202,13 +202,24 @@ class WebTests(unittest.TestCase):
         self.assertIn('<div class="artifact-list-viewer" data-issue-artifacts>', html)
         artifact_section = html[
             html.index('<div class="artifact-list-viewer" data-issue-artifacts>') : html.index(
-                '<div class="panel current-log-panel">'
+                '<details class="panel diagnostics issue-diagnostics">'
             )
         ]
         self.assertIn(f'href="/artifacts/{issue.id}/research.md"', artifact_section)
         self.assertIn(f'href="/artifacts/{issue.id}/plan.md"', artifact_section)
         self.assertIn(f'href="/artifacts/{issue.id}/logs/research-run-0.md"', artifact_section)
         self.assertIn(f'href="/artifacts/{issue.id}/logs/research-run-7.md"', artifact_section)
+
+    def test_issue_detail_places_current_log_before_primary_controls_and_issue_context(self) -> None:
+        issue = self.store.create_issue("current log layout issue", "desc", ready=True)
+
+        html = self.get(f"/issues/{issue.id}")
+
+        self.assertLess(html.index("Current log"), html.index("Primary controls"))
+        self.assertLess(html.index("Current log"), html.index("Issue context"))
+        self.assertIn("data-log-toggle", html)
+        self.assertIn("data-log-meta", html)
+        self.assertIn("data-log-output", html)
 
     def test_issue_detail_links_existing_phase_artifacts_when_blocked(self) -> None:
         issue = self.store.create_issue("blocked artifact issue", "desc", ready=True)

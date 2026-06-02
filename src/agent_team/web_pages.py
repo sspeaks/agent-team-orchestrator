@@ -162,6 +162,14 @@ def render_issue_detail_body(
             <section class="panel-grid issue-grid issue-action-grid">
               {plan_review}
               {human_input_panel}
+              <div class="panel current-log-panel">
+                <div class="section-header">
+                  <h2>Current log</h2>
+                  <button type="button" class="secondary" data-log-toggle aria-pressed="false">Pause log</button>
+                </div>
+                <p class="muted" data-log-meta>{_esc(_log_meta_text(log_payload))}</p>
+                <pre class="log-viewer" data-log-output>{_esc(log_payload.get("content") or "")}</pre>
+              </div>
               <div class="panel primary-controls-panel">
                 <h2>Primary controls</h2>
                 <div class="action-stack" data-action-stack data-controls-signature="{_esc(payload["manager_controls_signature"])}">{controls}</div>
@@ -185,14 +193,6 @@ def render_issue_detail_body(
               <div class="panel">
                 <h2>Artifacts and logs</h2>
                 <div class="artifact-list-viewer" data-issue-artifacts>{artifacts}</div>
-              </div>
-              <div class="panel current-log-panel">
-                <div class="section-header">
-                  <h2>Current log</h2>
-                  <button type="button" class="secondary" data-log-toggle aria-pressed="false">Pause log</button>
-                </div>
-                <p class="muted" data-log-meta>{_esc(_log_meta_text(log_payload))}</p>
-                <pre class="log-viewer" data-log-output>{_esc(log_payload.get("content") or "")}</pre>
               </div>
             </section>
             <details class="panel diagnostics issue-diagnostics">
