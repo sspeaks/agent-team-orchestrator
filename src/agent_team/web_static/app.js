@@ -628,9 +628,17 @@
   }
 
   function updateIssue(data) {
+    var nextPhase = data.issue.phase;
+    var phaseNode = document.querySelector("[data-issue-phase]");
+    var currentPhase = phaseNode ? String(phaseNode.textContent || "") : "";
+    if (nextPhase === "awaiting_merge_approval" && currentPhase !== "awaiting_merge_approval") {
+      setLiveStatus("Merge approval is ready; refreshing page layout.", false);
+      window.location.reload();
+      return;
+    }
     setText("[data-issue-title]", data.issue.title);
-    setText("[data-issue-phase]", data.issue.phase);
-    setText("[data-issue-phase-label]", phaseLabel(data.issue.phase));
+    setText("[data-issue-phase]", nextPhase);
+    setText("[data-issue-phase-label]", phaseLabel(nextPhase));
     setText("[data-issue-status]", data.issue.status);
     setText("[data-issue-priority]", "P" + data.issue.priority);
     setText("[data-issue-repo]", data.issue.repo_path);
