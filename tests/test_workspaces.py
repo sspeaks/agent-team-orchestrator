@@ -597,6 +597,25 @@ class WorkspaceManagerTests(unittest.TestCase):
         self.assertNotIn("token:secret", message)
         self.assertNotIn("secret@github.com", message)
 
+    def test_pull_request_remote_blocks_query_or_fragment_push_url(self) -> None:
+        cases = (
+            "https://github.com/owner/repo.git?access_token=secret",
+            "https://github.com/owner/repo.git#token=secret",
+        )
+        for push_url in cases:
+            with self.subTest(push_url=push_url):
+                issue = self._issue(1, self.repo)
+                info = self.manager.prepare(issue)
+                self._git(self.repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
+                self._git(self.repo, "remote", "set-url", "--push", "origin", push_url)
+
+                with self.assertRaisesRegex(WorkspaceError, "query or fragment") as caught:
+                    self.manager._select_finalization_mode(info, "pull_request", "origin")
+
+                message = str(caught.exception)
+                self.assertNotIn("secret", message)
+                self._git(self.repo, "remote", "remove", "origin")
+
     def test_push_pull_request_branch_uses_validated_push_url_directly(self) -> None:
         bare_remote = self.home / "validated-push.git"
         self._git(bare_remote.parent, "init", "--bare", str(bare_remote))
@@ -872,6 +891,41 @@ class WorkspaceManagerTests(unittest.TestCase):
                     "agent-team/issue-1",
                 )
 
+    def test_remote_branch_probe_rejects_query_or_fragment_url(self) -> None:
+        cases = (
+            "https://github.com/owner/repo.git?access_token=secret",
+            "https://github.com/owner/repo.git#token=secret",
+        )
+        for remote_ref in cases:
+            with self.subTest(remote_ref=remote_ref):
+                with self.assertRaisesRegex(WorkspaceError, "query or fragment") as caught:
+                    self.manager._remote_branch_head(self.repo, remote_ref, "agent-team/issue-1")
+                self.assertNotIn("secret", str(caught.exception))
+
+    def test_git_remote_error_redacts_query_and_fragment_secrets(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="",
+            stderr=(
+                "fatal: failed for "
+                "https://github.com/owner/repo.git?access_token=query-secret#password=fragment-secret"
+            ),
+        )
+        with patch("agent_team.workspaces.subprocess.run", return_value=completed):
+            with self.assertRaises(WorkspaceError) as caught:
+                self.manager._git_remote(
+                    self.repo,
+                    "ls-remote",
+                    "https://github.com/owner/repo.git?access_token=query-secret#password=fragment-secret",
+                    "agent-team/issue-1",
+                )
+
+        message = str(caught.exception)
+        self.assertIn("[redacted]", message)
+        self.assertNotIn("query-secret", message)
+        self.assertNotIn("fragment-secret", message)
+
     def test_push_pull_request_branch_runs_git_push_non_interactively_with_timeout(self) -> None:
         issue = self._issue(1, self.repo)
         info = self.manager.prepare(issue)
@@ -902,6 +956,7 @@ class WorkspaceManagerTests(unittest.TestCase):
                 "-C",
                 str(info.source_root),
                 "push",
+                f"--force-with-lease=refs/heads/{source_branch}:",
                 "https://github.com/owner/repo.git",
                 f"{head}:refs/heads/{source_branch}",
             ],

@@ -87,6 +87,18 @@ class PullRequestRemoteParsingTests(unittest.TestCase):
             with self.subTest(url=url):
                 self.assertIsNone(parse_pull_request_remote("origin", url))
 
+    def test_parse_remote_rejects_query_or_fragment_components(self) -> None:
+        urls = (
+            "https://github.com/owner/repo.git?access_token=secret",
+            "https://github.com/owner/repo.git#token=secret",
+            "git@github.com:owner/repo.git?access_token=secret",
+            "https://dev.azure.com/org/project/_git/repo?access_token=secret",
+            "ssh.dev.azure.com:v3/org/project/repo#password=secret",
+        )
+        for url in urls:
+            with self.subTest(url=url):
+                self.assertIsNone(parse_pull_request_remote("origin", url))
+
 
 class PullRequestProviderTests(unittest.TestCase):
     def test_github_reuses_existing_open_pull_request(self) -> None:
@@ -439,6 +451,45 @@ class PullRequestProviderTests(unittest.TestCase):
 
         self.assertFalse(is_safe_pull_request_url("https://user:secret@github.com/owner/repo/pull/42"))
 
+    def test_github_rejects_query_or_fragment_pull_request_url_from_provider(self) -> None:
+        remote = parse_pull_request_remote("origin", "https://github.com/owner/repo.git")
+        assert remote is not None
+        request = PullRequestRequest(
+            source_branch="feature",
+            target_branch="main",
+            title="Add feature",
+            body_path=Path("body.md"),
+        )
+        urls = (
+            "https://github.com/owner/repo/pull/42?access_token=secret",
+            "https://github.com/owner/repo/pull/42#token=secret",
+        )
+        for url in urls:
+            with self.subTest(url=url):
+                runner = FakeRunner(
+                    [
+                        command_result(
+                            [
+                                {
+                                    "number": 42,
+                                    "url": url,
+                                    "title": "Existing PR",
+                                    "headRefName": "feature",
+                                    "baseRefName": "main",
+                                    "headRepository": {"name": "repo", "nameWithOwner": "owner/repo"},
+                                    "headRepositoryOwner": {"login": "owner"},
+                                    "state": "OPEN",
+                                }
+                            ]
+                        )
+                    ]
+                )
+
+                with self.assertRaisesRegex(PullRequestError, "query or fragment"):
+                    create_or_get_pull_request(remote, request, runner)
+
+                self.assertFalse(is_safe_pull_request_url(url))
+
     def test_github_rejects_unsafe_create_url_before_viewing(self) -> None:
         remote = parse_pull_request_remote("origin", "https://github.com/owner/repo.git")
         assert remote is not None
@@ -466,6 +517,21 @@ class PullRequestProviderTests(unittest.TestCase):
         runner = FakeRunner([command_result([]), command_result("https://user:secret@github.com/owner/repo/pull/43\n")])
 
         with self.assertRaisesRegex(PullRequestError, "credential-bearing pull request URL"):
+            create_or_get_pull_request(remote, request, runner)
+        self.assertEqual(len(runner.calls), 2)
+
+    def test_github_rejects_query_or_fragment_create_url_before_viewing(self) -> None:
+        remote = parse_pull_request_remote("origin", "https://github.com/owner/repo.git")
+        assert remote is not None
+        request = PullRequestRequest(
+            source_branch="feature",
+            target_branch="main",
+            title="Add feature",
+            body_path=Path("body.md"),
+        )
+        runner = FakeRunner([command_result([]), command_result("https://github.com/owner/repo/pull/43?token=secret\n")])
+
+        with self.assertRaisesRegex(PullRequestError, "query or fragment"):
             create_or_get_pull_request(remote, request, runner)
         self.assertEqual(len(runner.calls), 2)
 
@@ -678,6 +744,7 @@ class PullRequestProviderTests(unittest.TestCase):
         assert remote is not None
         sensitive = (
             "failed https://user:secret@example.com/repo.git "
+            "https://github.com/owner/repo.git?access_token=query-secret#password=fragment-secret "
             "Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz123456 "
             "token=plain-secret "
             + ("x" * 3000)
@@ -700,6 +767,8 @@ class PullRequestProviderTests(unittest.TestCase):
         self.assertIn("[redacted]", message)
         self.assertIn("[truncated]", message)
         self.assertNotIn("secret@example.com", message)
+        self.assertNotIn("query-secret", message)
+        self.assertNotIn("fragment-secret", message)
         self.assertNotIn("plain-secret", message)
         self.assertNotIn("ghp_abcdefghijklmnopqrstuvwxyz123456", message)
         self.assertLess(len(message), 2300)

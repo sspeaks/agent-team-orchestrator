@@ -901,6 +901,12 @@ class WorkspaceManager:
                 "credential-bearing HTTPS URLs to git; use a Git credential helper, an authenticated SSH remote, "
                 "or approve with --mode local to merge locally instead."
             )
+        if _remote_url_has_query_or_fragment(push_url):
+            raise WorkspaceError(
+                f"Remote '{remote.remote_name}' push URL includes query or fragment components. Refusing to pass "
+                "potentially credential-bearing HTTPS URLs to git; use a Git credential helper, an authenticated "
+                "SSH remote, or approve with --mode local to merge locally instead."
+            )
         push_remote = parse_pull_request_remote(remote.remote_name, push_url)
         if push_remote is None:
             raise WorkspaceError(
@@ -941,7 +947,9 @@ class WorkspaceManager:
         if remote_head == integrated_head:
             return
         push_args = ["push"]
-        if remote_head is not None:
+        if remote_head is None:
+            push_args.append(f"--force-with-lease=refs/heads/{source_branch}:")
+        else:
             prior_metadata = self._read_pull_request_metadata_for_push(issue.id)
             expected_heads = self._metadata_pr_branch_expected_heads(
                 prior_metadata,
@@ -978,6 +986,11 @@ class WorkspaceManager:
             raise WorkspaceError(
                 "Refusing to pass a credential-bearing HTTPS remote URL to git. Use a Git credential helper "
                 "or an authenticated SSH remote instead."
+            )
+        if _remote_url_has_query_or_fragment(remote_ref):
+            raise WorkspaceError(
+                "Refusing to pass an HTTPS remote URL with query or fragment components to git. Use a Git "
+                "credential helper or an authenticated SSH remote instead."
             )
         output = self._git_remote(source_root, "ls-remote", "--heads", remote_ref, branch)
         for line in output.splitlines():
@@ -1931,11 +1944,27 @@ def _remote_url_embeds_credentials(value: str) -> bool:
     return parsed.username is not None or parsed.password is not None
 
 
+def _remote_url_has_query_or_fragment(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return False
+    return bool(parsed.query or parsed.fragment)
+
+
 _CREDENTIAL_URL_RE = re.compile(r"\b(https?://)([^/\s:@]+(?::[^/\s@]*)?@)", re.IGNORECASE)
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b("
+    r"access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd|pat|secret|sig|token"
+    r")(\s*[:=]\s*)([^\s&#;,]+)"
+)
 
 
 def _redact_git_text(value: str) -> str:
-    return _CREDENTIAL_URL_RE.sub(r"\1[redacted]@", value)
+    redacted = _CREDENTIAL_URL_RE.sub(r"\1[redacted]@", value)
+    return _SECRET_ASSIGNMENT_RE.sub(r"\1\2[redacted]", redacted)
 
 
 def _truncate_snapshot_subject_detail(value: str) -> str:

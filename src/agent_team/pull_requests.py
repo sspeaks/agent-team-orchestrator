@@ -123,7 +123,7 @@ _AUTH_HEADER_RE = re.compile(r"(?i)\b(authorization\s*[:=]\s*(?:bearer|basic|tok
 _SECRET_ASSIGNMENT_RE = re.compile(
     r"(?i)\b("
     r"access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd|pat|secret|sig|token"
-    r")(\s*[:=]\s*)([^\s&;,]+)"
+    r")(\s*[:=]\s*)([^\s&#;,]+)"
 )
 _GH_TOKEN_RE = re.compile(r"\b(gh[pousr]_[A-Za-z0-9_]{20,})\b")
 
@@ -134,6 +134,8 @@ def parse_pull_request_remote(remote_name: str, remote_url: str) -> PullRequestR
 
 def parse_github_remote(remote_name: str, remote_url: str) -> PullRequestRemote | None:
     url = remote_url.strip()
+    if _has_query_or_fragment(url):
+        return None
     match = _GITHUB_SCP_RE.match(url)
     if match:
         return PullRequestRemote(
@@ -168,6 +170,8 @@ def parse_github_remote(remote_name: str, remote_url: str) -> PullRequestRemote 
 
 def parse_azure_devops_remote(remote_name: str, remote_url: str) -> PullRequestRemote | None:
     url = remote_url.strip()
+    if _has_query_or_fragment(url):
+        return None
     match = _ADO_SCP_RE.match(url)
     if match:
         return _ado_remote(
@@ -231,6 +235,8 @@ def is_safe_pull_request_url(url: object) -> bool:
         and bool(parsed.netloc)
         and parsed.username is None
         and parsed.password is None
+        and not parsed.query
+        and not parsed.fragment
     )
 
 
@@ -668,7 +674,17 @@ def _validate_pull_request_url(url: str, command: str) -> str:
         raise PullRequestError(f"{command} returned an unsafe pull request URL scheme; expected http or https.")
     if parsed.username is not None or parsed.password is not None:
         raise PullRequestError(f"{command} returned a credential-bearing pull request URL.")
+    if parsed.query or parsed.fragment:
+        raise PullRequestError(f"{command} returned a pull request URL with query or fragment components.")
     return urlunparse(parsed._replace(scheme=parsed.scheme.lower()))
+
+
+def _has_query_or_fragment(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return any(marker in url for marker in ("?", "#"))
+    return bool(parsed.query or parsed.fragment)
 
 
 def _as_int(value: Any) -> int | None:
