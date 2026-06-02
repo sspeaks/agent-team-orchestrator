@@ -41,6 +41,7 @@ PYTHONPATH=src python3 -m agent_team.cli init
 ## Quick start
 
 Copy the example config, then uncomment only the values you need. For a safe smoke run, set `runner` to `"dry-run"`.
+Each `worker once` invocation drains ready work until the queue is idle or the next human gate is reached.
 
 ```bash
 cp agent-team.config.example.jsonc agent-team.config.jsonc
@@ -51,12 +52,9 @@ agent-team issue create \
   --description "Fix the flaky validation failure" \
   --ready
 
-agent-team worker once          # research
-agent-team worker once          # plan
+agent-team worker once          # research + planning, then awaits plan approval
 agent-team issue approve-plan 1 # use the id printed by issue create
-agent-team worker once          # implementation
-agent-team worker once          # validation
-agent-team worker once          # review
+agent-team worker once          # implementation + validation + review, then awaits merge approval
 agent-team issue approve-merge 1 --mode local
 agent-team worker once          # merge finalization
 ```
