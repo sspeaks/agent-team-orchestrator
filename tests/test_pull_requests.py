@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from collections.abc import Sequence
@@ -267,6 +268,45 @@ class PullRequestProviderTests(unittest.TestCase):
 
         with self.assertRaisesRegex(PullRequestError, "without head repository metadata"):
             create_or_get_pull_request(remote, request, runner)
+
+    def test_github_blocks_existing_same_repo_pr_without_complete_branch_metadata(self) -> None:
+        remote = parse_pull_request_remote("origin", "https://github.com/owner/repo.git")
+        assert remote is not None
+        request = PullRequestRequest(
+            source_branch="feature",
+            target_branch="main",
+            title="Add feature",
+            body_path=Path("body.md"),
+        )
+        cases = (
+            {
+                "number": 42,
+                "url": "https://github.com/owner/repo/pull/42",
+                "title": "Missing head branch",
+                "baseRefName": "main",
+                "headRepository": {"name": "repo", "nameWithOwner": "owner/repo"},
+                "headRepositoryOwner": {"login": "owner"},
+                "state": "OPEN",
+            },
+            {
+                "number": 43,
+                "url": "https://github.com/owner/repo/pull/43",
+                "title": "Null base branch",
+                "headRefName": "feature",
+                "baseRefName": None,
+                "headRepository": {"name": "repo", "nameWithOwner": "owner/repo"},
+                "headRepositoryOwner": {"login": "owner"},
+                "state": "OPEN",
+            },
+        )
+        for candidate in cases:
+            with self.subTest(title=candidate["title"]):
+                runner = FakeRunner([command_result([candidate])])
+
+                with self.assertRaisesRegex(PullRequestError, "without complete head/base branch metadata"):
+                    create_or_get_pull_request(remote, request, runner)
+
+                self.assertEqual(len(runner.calls), 1)
 
     def test_github_create_then_views_pull_request(self) -> None:
         remote = parse_pull_request_remote("origin", "git@github.com:owner/repo.git")
@@ -663,6 +703,32 @@ class PullRequestProviderTests(unittest.TestCase):
         self.assertNotIn("plain-secret", message)
         self.assertNotIn("ghp_abcdefghijklmnopqrstuvwxyz123456", message)
         self.assertLess(len(message), 2300)
+
+    def test_subprocess_runner_runs_provider_commands_non_interactively(self) -> None:
+        completed = subprocess.CompletedProcess(args=["gh", "--version"], returncode=0, stdout="gh version\n", stderr="")
+        with patch("agent_team.pull_requests.subprocess.run", return_value=completed) as run:
+            result = SubprocessCommandRunner(timeout_seconds=7).run(["gh", "--version"])
+
+        self.assertEqual(result.stdout, "gh version\n")
+        run.assert_called_once()
+        _, kwargs = run.call_args
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(kwargs["timeout"], 7)
+        self.assertFalse(kwargs["check"])
+        self.assertTrue(kwargs["capture_output"])
+        self.assertTrue(kwargs["text"])
+        env = kwargs["env"]
+        self.assertEqual(env["GH_PROMPT_DISABLED"], "1")
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(env["AZURE_EXTENSION_USE_DYNAMIC_INSTALL"], "no")
+
+    def test_subprocess_runner_timeout_surfaces_pull_request_error(self) -> None:
+        with patch(
+            "agent_team.pull_requests.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["gh", "pr", "list"], timeout=1),
+        ):
+            with self.assertRaisesRegex(PullRequestError, "timed out after 1 seconds.*non-interactively"):
+                SubprocessCommandRunner(timeout_seconds=1).run(["gh", "pr", "list"])
 
     def test_unsupported_provider_is_explicit(self) -> None:
         remote = PullRequestRemote(provider="unsupported", remote_name="origin", url="local://repo", repo="repo")

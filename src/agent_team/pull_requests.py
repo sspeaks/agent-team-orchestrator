@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -61,18 +62,42 @@ class CommandRunner(Protocol):
         ...
 
 
+_DEFAULT_PROVIDER_COMMAND_TIMEOUT_SECONDS = 120.0
+_NONINTERACTIVE_ENV = {
+    "GH_PROMPT_DISABLED": "1",
+    "GIT_TERMINAL_PROMPT": "0",
+    "AZURE_EXTENSION_USE_DYNAMIC_INSTALL": "no",
+}
+
+
 class SubprocessCommandRunner:
+    def __init__(self, timeout_seconds: float = _DEFAULT_PROVIDER_COMMAND_TIMEOUT_SECONDS) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be greater than zero.")
+        self.timeout_seconds = timeout_seconds
+
     def run(self, args: Sequence[str]) -> CommandResult:
         command = [str(arg) for arg in args]
         if not command:
             raise PullRequestError("Pull request provider command was empty.")
+        env = os.environ.copy()
+        env.update(_NONINTERACTIVE_ENV)
         try:
             completed = subprocess.run(
                 command,
                 check=False,
                 capture_output=True,
                 text=True,
+                stdin=subprocess.DEVNULL,
+                env=env,
+                timeout=self.timeout_seconds,
             )
+        except subprocess.TimeoutExpired as exc:
+            executable = Path(command[0]).name or command[0]
+            raise PullRequestError(
+                f"Pull request command '{executable}' timed out after {self.timeout_seconds:g} seconds. "
+                "Verify provider CLI authentication is configured non-interactively before retrying."
+            ) from exc
         except OSError as exc:
             executable = Path(command[0]).name or command[0]
             raise PullRequestError(_command_launch_error(executable, exc)) from exc
@@ -392,6 +417,16 @@ def _github_existing_pull_request(
         )
     if matching:
         return matching[0]
+    incomplete_same_repo = [
+        item
+        for item in candidates
+        if _github_branch_metadata_incomplete(item) and _github_head_repository_matches(remote, item)
+    ]
+    if incomplete_same_repo:
+        raise PullRequestError(
+            "gh pr list returned an open pull request from the selected head repository without complete "
+            "head/base branch metadata; unable to safely reuse it or create another pull request."
+        )
     ambiguous = []
     for item in candidates:
         if not _github_branch_matches(request, item):
@@ -408,9 +443,17 @@ def _github_existing_pull_request(
 
 
 def _github_branch_matches(request: PullRequestRequest, raw: dict[str, Any]) -> bool:
-    head = raw.get("headRefName")
-    base = raw.get("baseRefName")
-    return (head is None or str(head) == request.source_branch) and (base is None or str(base) == request.target_branch)
+    head, base = _github_branch_names(raw)
+    return head == request.source_branch and base == request.target_branch
+
+
+def _github_branch_metadata_incomplete(raw: dict[str, Any]) -> bool:
+    head, base = _github_branch_names(raw)
+    return head is None or base is None
+
+
+def _github_branch_names(raw: dict[str, Any]) -> tuple[str | None, str | None]:
+    return _clean_json_string(raw.get("headRefName")), _clean_json_string(raw.get("baseRefName"))
 
 
 def _github_head_repository_matches(remote: PullRequestRemote, raw: dict[str, Any]) -> bool:
