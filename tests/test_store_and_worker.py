@@ -21,7 +21,7 @@ import agent_team.cli as cli_module
 from agent_team.artifacts import ArtifactStore
 import agent_team.worker as worker_module
 from agent_team.cli import build_parser, handle_issue, handle_worker, print_issue
-from agent_team.config import AppConfig
+from agent_team.config import AppConfig, load_config
 from agent_team.db import IssueStore
 from agent_team.lifecycle import delete_issue, reset_issue_to_draft, stop_issue
 from agent_team.locks import make_lock_owner
@@ -1884,6 +1884,28 @@ class StoreAndWorkerTests(unittest.TestCase):
         self.assertEqual(loop.call_args.kwargs["interval_seconds"], 17)
         self.assertEqual(loop.call_args.kwargs["concurrency"], 3)
         self.assertIs(loop.call_args.kwargs["on_result"], cli_module.print_result)
+
+    def test_worker_once_uses_config_file_default(self) -> None:
+        config_path = self.home / "worker-config.jsonc"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "home": str(self.home / "config-file-state"),
+                    "runner": "dry-run",
+                    "worker": {"worker_concurrency": 5},
+                }
+            ),
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {}, clear=True):
+            config = load_config(config_path)
+        args = build_parser().parse_args(["worker", "once"])
+
+        with patch.object(cli_module, "process_batch", return_value=[]) as batch:
+            exit_code = handle_worker(args, self.store, self.artifacts, config)
+
+        self.assertEqual(exit_code, 0)
+        batch.assert_called_once_with(self.store, self.artifacts, config, 5)
 
     def test_reject_plan_records_feedback_and_returns_to_ready_for_plan(self) -> None:
         issue = self.store.create_issue("title", "desc")

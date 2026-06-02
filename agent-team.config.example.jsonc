@@ -1,0 +1,181 @@
+{
+  // Copy this file to agent-team.config.jsonc and uncomment values you want to
+  // keep locally. With every property commented out, the effective config is
+  // the empty object {} and all built-in defaults apply.
+  //
+  // Environment variables listed as "Legacy env" are backward-compatible
+  // overrides. They take precedence over this file.
+
+  // State and artifact root.
+  // Default: ~/.local/share/agent-team-orchestrator.
+  // Safety: stores SQLite state, issue artifacts, logs, and locks. Use a
+  // private local path and avoid sharing it between unrelated projects.
+  // Legacy env: AGENT_TEAM_HOME.
+  // "home": "~/.local/share/agent-team-orchestrator",
+
+  // Directory for persistent per-issue Git worktrees.
+  // Default: <home>/worktrees.
+  // Safety: agents edit code here during implementation and later phases; keep
+  // it on a trusted local disk and do not point it at a source checkout.
+  // Legacy env: AGENT_TEAM_WORKTREES_DIR.
+  // "worktrees_dir": "~/.local/share/agent-team-orchestrator/worktrees",
+
+  // Runner implementation.
+  // Default: "copilot-cli". Use "dry-run" for local smoke checks and tests
+  // that must not invoke Copilot.
+  // Safety: "copilot-cli" starts real agent runs; "dry-run" is deterministic
+  // and does not edit target repositories.
+  // Legacy env: AGENT_TEAM_RUNNER.
+  // "runner": "copilot-cli",
+
+  // Maximum seconds to wait for one runner invocation.
+  // Default: 1800.
+  // Safety: higher values allow longer unattended agent work before timeout;
+  // lower values fail stuck runs sooner.
+  // Legacy env: AGENT_TEAM_RUNNER_TIMEOUT_SECONDS.
+  // "runner_timeout_seconds": 1800,
+
+  // Issue lock lease time in seconds.
+  // Default: same as runner_timeout_seconds, which is 1800 when unchanged.
+  // Safety: higher values delay recovery after a killed worker; lower values
+  // can reclaim active long-running work too early.
+  // Legacy env: AGENT_TEAM_LOCK_TTL_SECONDS.
+  // "lock_ttl_seconds": 1800,
+
+  // "copilot": {
+    // Copilot CLI executable to invoke.
+    // Default: "copilot".
+    // Safety: changing this runs a different binary or wrapper for all real
+    // agent phases; only use trusted local commands.
+    // Legacy env: AGENT_TEAM_COPILOT_COMMAND.
+    // "command": "copilot",
+
+    // Permission policy for unattended Copilot runs.
+    // Default: "phase".
+    // Safety: "phase" uses least-privilege phase policies. "yolo" emits
+    // --yolo, skips phase policies, and should only be used in isolated
+    // throwaway environments.
+    // Legacy env: AGENT_TEAM_COPILOT_PERMISSION_MODE.
+    // "permission_mode": "phase",
+
+    // Override the bundled Copilot custom-agent plugin directory.
+    // Default: bundled package plugin directory.
+    // Safety: plugins define agent instructions; only point this at trusted
+    // plugin content.
+    // Legacy env: AGENT_TEAM_COPILOT_PLUGIN_DIR.
+    // "plugin_dir": "/path/to/copilot_plugin",
+
+    // Restrict the Copilot tool universe with --available-tools=VALUE.
+    // Default: unset; Copilot uses its default available tools plus the phase
+    // approvals added by the orchestrator.
+    // Safety: can remove needed tools or change which tools Copilot can see.
+    // Legacy env: AGENT_TEAM_COPILOT_AVAILABLE_TOOLS.
+    // "available_tools": "read,edit,bash",
+
+    // Exclude tools with --excluded-tools=VALUE.
+    // Default: unset.
+    // Safety: can block risky tools, but can also make a phase unable to run.
+    // Legacy env: AGENT_TEAM_COPILOT_EXCLUDED_TOOLS.
+    // "excluded_tools": "web_search",
+
+    // Add extra tool approvals with --allow-tool=VALUE.
+    // Default: unset; phase policy supplies narrow defaults.
+    // Safety: weakens least-privilege defaults. Prefer specific commands such
+    // as shell(npm test) instead of broad shell or Git wildcards.
+    // Legacy env: AGENT_TEAM_COPILOT_ALLOW_TOOL.
+    // "allow_tool": "shell(npm test),shell(npm run lint)",
+
+    // Add explicit tool denials with --deny-tool=VALUE.
+    // Default: unset, aside from phase-policy denials.
+    // Safety: useful for defense in depth against dangerous commands such as
+    // push, merge, sudo, or recursive deletion.
+    // Legacy env: AGENT_TEAM_COPILOT_DENY_TOOL.
+    // "deny_tool": "shell(git push),shell(rm -rf:*)",
+
+    // Add URL approvals with --allow-url=VALUE.
+    // Default: research allows https://* and http://*; other phases do not add
+    // URL access unless configured.
+    // Safety: allows network reads by Copilot; narrow this for sensitive work.
+    // Legacy env: AGENT_TEAM_COPILOT_ALLOW_URL.
+    // "allow_url": "https://learn.microsoft.com/*",
+
+    // Add URL denials with --deny-url=VALUE.
+    // Default: unset.
+    // Safety: blocks specific network destinations even when URL access is
+    // otherwise allowed.
+    // Legacy env: AGENT_TEAM_COPILOT_DENY_URL.
+    // "deny_url": "http://*",
+
+    // Emit --allow-all-tools.
+    // Default: false.
+    // Safety: grants broad tool access and can bypass phase least-privilege
+    // intent; avoid outside isolated throwaway environments.
+    // Legacy env: AGENT_TEAM_COPILOT_ALLOW_ALL_TOOLS.
+    // "allow_all_tools": false,
+
+    // Emit --allow-all-urls.
+    // Default: false.
+    // Safety: grants broad network read access; avoid for sensitive repos.
+    // Legacy env: AGENT_TEAM_COPILOT_ALLOW_ALL_URLS.
+    // "allow_all_urls": false,
+
+    // Extra raw Copilot CLI arguments appended last.
+    // Default: [].
+    // Safety: appended last so advanced flags can override or weaken defaults;
+    // review carefully before using in unattended runs.
+    // Legacy env: AGENT_TEAM_COPILOT_ARGS.
+    // "extra_args": ["--model", "claude-sonnet-4.6"]
+  // },
+
+  // "web": {
+    // Host for the web UI and serve mode.
+    // Default: "127.0.0.1".
+    // Safety: loopback keeps the unauthenticated UI local. Non-loopback binds
+    // require unsafe_allow_remote=true or the matching runtime flag.
+    // Legacy env: none; runtime flag --host overrides per command.
+    // "host": "127.0.0.1",
+
+    // Port for the web UI and serve mode.
+    // Default: 8765.
+    // Safety: choose a local port that does not expose or conflict with other
+    // services.
+    // Legacy env: none; runtime flag --port overrides per command.
+    // "port": 8765,
+
+    // Maximum queued browser-triggered background jobs.
+    // Default: 1.
+    // Safety: higher values can start more local work from UI actions.
+    // Legacy env: AGENT_TEAM_WEB_WORKERS.
+    // "web_workers": 1,
+
+    // Permit binding the unauthenticated web UI to non-loopback addresses.
+    // Default: false.
+    // Safety: true can expose local issue controls and artifacts to the
+    // network. Use only behind your own network and authentication controls.
+    // Legacy env: none; runtime flag --unsafe-allow-remote overrides per
+    // command.
+    // "unsafe_allow_remote": false,
+
+    // WSL distro name used for VS Code Remote-WSL links.
+    // Default: WSL_DISTRO_NAME when present, otherwise local file links. Set
+    // to an empty string to force local file links.
+    // Safety: affects generated editor links only; it does not grant access.
+    // Legacy env: AGENT_TEAM_VSCODE_WSL_DISTRO.
+    // "vscode_wsl_distro": "Ubuntu-22.04"
+  // },
+
+  // "worker": {
+    // Maximum autonomous ready-queue issue runs for serve/worker defaults.
+    // Default: 1.
+    // Safety: higher values increase concurrent Copilot runs and system load;
+    // leases still prevent duplicate processing of one issue.
+    // Legacy env: AGENT_TEAM_WORKER_CONCURRENCY.
+    // "worker_concurrency": 1,
+
+    // Idle poll interval in seconds for worker loop and serve mode.
+    // Default: 60.
+    // Safety: lower values poll more often; 0 can spin quickly when idle.
+    // Legacy env: AGENT_TEAM_WORKER_INTERVAL_SECONDS.
+    // "worker_interval_seconds": 60
+  // }
+}

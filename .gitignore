@@ -55,3 +55,6 @@ coverage.xml
 # OS files
 .DS_Store
 Thumbs.db
+
+# Local agent-team configuration
+/agent-team.config.jsonc

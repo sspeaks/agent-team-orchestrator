@@ -184,7 +184,7 @@ def render_issue_detail_body(
               </div>
               <div class="panel">
                 <h2>Artifacts and logs</h2>
-                <div data-issue-artifacts>{artifacts}</div>
+                <div class="artifact-list-viewer" data-issue-artifacts>{artifacts}</div>
               </div>
               <div class="panel current-log-panel">
                 <div class="section-header">
