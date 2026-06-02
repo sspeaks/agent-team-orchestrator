@@ -451,6 +451,26 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.worker_concurrency, 3)
         self.assertEqual(config.worker_interval_seconds, 15)
 
+    def test_merge_pr_defaults_can_be_overridden(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "AGENT_TEAM_MERGE_MODE": "pull-request",
+                "AGENT_TEAM_PR_REMOTE": " upstream ",
+                "AGENT_TEAM_PR_BRANCH_PREFIX": "bots/pr-",
+            },
+            clear=True,
+        ):
+            config = load_config()
+        self.assertEqual(config.merge_mode, "pull_request")
+        self.assertEqual(config.pr_remote, "upstream")
+        self.assertEqual(config.pr_branch_prefix, "bots/pr-")
+
+    def test_merge_mode_rejects_invalid_value(self) -> None:
+        with patch.dict(os.environ, {"AGENT_TEAM_MERGE_MODE": "remote-only"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "AGENT_TEAM_MERGE_MODE"):
+                load_config()
+
     def test_runtime_worker_env_values_must_be_valid(self) -> None:
         invalid_cases = (
             ("AGENT_TEAM_WEB_WORKERS", "0", "at least 1"),

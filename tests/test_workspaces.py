@@ -6,11 +6,19 @@ import subprocess
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_team.artifacts import ArtifactStore
 from agent_team.models import Issue
-from agent_team.workspaces import WorkspaceError, WorkspaceManager
+from agent_team.pull_requests import PullRequestError, PullRequestRemote, PullRequestResult
+from agent_team.workspaces import (
+    WorkspaceError,
+    WorkspaceManager,
+    _REMOTE_GIT_COMMAND_TIMEOUT_SECONDS,
+    _SelectedRemote,
+)
 
 
 @unittest.skipUnless(shutil.which("git"), "git is required for workspace tests")
@@ -360,6 +368,70 @@ class WorkspaceManagerTests(unittest.TestCase):
         self.assertIn("Merge approval: looks good", merge_message)
         self.assertIn("feature", merge_message)
 
+    def test_merge_rejects_symbolic_target_branch(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        source_head = self._git(self.repo, "rev-parse", "HEAD")
+        self.artifacts.write_merge_request(issue.id, target_branch="HEAD", message="approved", mode="local")
+
+        with self.assertRaisesRegex(WorkspaceError, "existing local branch name"):
+            self.manager.merge_and_cleanup(issue)
+
+        self.assertTrue(info.worktree_root.exists())
+        self.assertEqual(self._git(self.repo, "rev-parse", "HEAD"), source_head)
+        self.assertFalse((self.repo / "feature.txt").exists())
+
+    def test_merge_rejects_tag_target_branch(self) -> None:
+        self._git(self.repo, "tag", "release")
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        self.artifacts.write_merge_request(issue.id, target_branch="release", message="approved", mode="local")
+
+        with self.assertRaisesRegex(WorkspaceError, "not an existing local branch"):
+            self.manager.merge_and_cleanup(issue)
+
+        self.assertTrue(info.worktree_root.exists())
+        self.assertFalse((self.repo / "feature.txt").exists())
+
+    def test_merge_rejects_remote_tracking_target_branch(self) -> None:
+        default_branch = self._git(self.repo, "rev-parse", "--abbrev-ref", "HEAD")
+        bare_remote = self.home / "origin.git"
+        self._git(self.home, "init", "--bare", str(bare_remote))
+        self._git(self.repo, "remote", "add", "origin", str(bare_remote))
+        self._git(self.repo, "push", "-u", "origin", default_branch)
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        self.artifacts.write_merge_request(
+            issue.id,
+            target_branch=f"origin/{default_branch}",
+            message="approved",
+            mode="local",
+        )
+
+        with self.assertRaisesRegex(WorkspaceError, "not an existing local branch"):
+            self.manager.merge_and_cleanup(issue)
+
+        self.assertTrue(info.worktree_root.exists())
+        self.assertFalse((self.repo / "feature.txt").exists())
+
+    def test_merge_does_not_reset_or_delete_existing_predictable_merge_branch(self) -> None:
+        user_branch_head = self._git(self.repo, "rev-parse", "HEAD")
+        self._git(self.repo, "branch", "agent-team/issue-1-merge")
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        self.artifacts.write_merge_request(issue.id, target_branch=None, message="approved", mode="local")
+
+        result = self.manager.merge_and_cleanup(issue)
+
+        self.assertEqual(result.status, "merged")
+        self.assertEqual(self._git(self.repo, "rev-parse", "agent-team/issue-1-merge"), user_branch_head)
+        self.assertEqual((self.repo / "feature.txt").read_text(encoding="utf-8"), "feature\n")
+        self.assertEqual(self._git(self.repo, "branch", "--list", "agent-team/issue-1-merge-*"), "")
+
     def test_concurrent_same_repo_merges_are_serialized(self) -> None:
         first_issue = self._issue(1, self.repo)
         second_issue = self._issue(2, self.repo)
@@ -403,6 +475,767 @@ class WorkspaceManagerTests(unittest.TestCase):
         self.assertNotIn("Implement issue 1: issue 1", self._git(self.repo, "log", "--format=%s", "--max-count=3"))
         merged = json.loads(self.artifacts.merged_workspace_metadata_path(issue.id).read_text(encoding="utf-8"))
         self.assertEqual(merged["worktree_commit"], result.worktree_commit)
+
+    def test_auto_remote_finalizes_by_pull_request_without_merging_source(self) -> None:
+        self._git(self.repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
+        self._git(self.repo, "remote", "set-url", "--push", "origin", "https://github.com/owner/repo.git")
+        issue = replace(
+            self._issue(1, self.repo),
+            description="Sensitive customer context secret=issue-description-secret",
+        )
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        self.artifacts.write_merge_request(
+            issue.id,
+            target_branch=None,
+            message="Manager approval secret=approval-message-secret",
+            mode="auto",
+        )
+        source_head = self._git(self.repo, "rev-parse", "HEAD")
+        self._git(self.repo, "branch", f"agent-team/issue-{issue.id}-merge-{source_head[:12]}", source_head)
+        pr_result = PullRequestResult(
+            provider="github",
+            remote_name="origin",
+            source_branch="agent-team/issue-1",
+            target_branch="master",
+            title="Issue 1: issue 1",
+            url="https://github.com/owner/repo/pull/7",
+            id="7",
+            number=7,
+            status="OPEN",
+            is_existing=False,
+            raw={"number": 7},
+        )
+
+        with patch.object(self.manager, "_push_pull_request_branch") as push_branch:
+            with patch("agent_team.workspaces.create_or_get_pull_request", return_value=pr_result) as create_pr:
+                result = self.manager.merge_and_cleanup(issue)
+
+        self.assertEqual(result.status, "pull_request")
+        self.assertEqual(result.pr_url, "https://github.com/owner/repo/pull/7")
+        self.assertFalse(info.worktree_root.exists())
+        self.assertEqual(self._git(self.repo, "rev-parse", "HEAD"), source_head)
+        self.assertFalse((self.repo / "feature.txt").exists())
+        self.assertEqual(push_branch.call_args.args[3], "agent-team/issue-1")
+        self.assertEqual(push_branch.call_args.args[4], result.worktree_head)
+        request = create_pr.call_args.args[1]
+        self.assertEqual(request.source_branch, "agent-team/issue-1")
+        self.assertEqual(request.target_branch, "master")
+        body = Path(request.body_path).read_text(encoding="utf-8")
+        self.assertIn("Created by agent-team orchestrator", body)
+        self.assertIn("Agent-team finalization", body)
+        self.assertNotIn("issue-description-secret", body)
+        self.assertNotIn("approval-message-secret", body)
+        metadata = self.artifacts.read_pull_request_metadata(issue.id)
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertTrue(metadata["cleanup_removed"])
+        self.assertEqual(metadata["url"], "https://github.com/owner/repo/pull/7")
+        self.assertEqual(metadata["head_commit"], result.worktree_head)
+        self.assertEqual(metadata["remote_url"], "https://github.com/owner/repo.git")
+        self.assertEqual(metadata["remote_identity"], ["github", "owner", "repo"])
+        self.assertNotIn("remote_push_url", metadata)
+        self.assertNotIn("secret", json.dumps(metadata))
+        self.assertIsNone(self.artifacts.read_workspace_metadata(issue.id))
+        self.assertFalse(self.artifacts.merged_workspace_metadata_path(issue.id).exists())
+        self.assertEqual(self._git(self.repo, "branch", "--list", "agent-team/issue-1-merge-*"), "")
+
+    def test_pull_request_retry_after_push_before_metadata_reuses_matching_remote_branch(self) -> None:
+        bare_remote = self.home / "origin.git"
+        self._git(bare_remote.parent, "init", "--bare", str(bare_remote))
+        self._git(self.repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        target_branch = self._git(self.repo, "rev-parse", "--abbrev-ref", "HEAD")
+        self.artifacts.write_merge_request(
+            issue.id,
+            target_branch=None,
+            message="approved",
+            mode="pull_request",
+            remote_name="origin",
+        )
+        selected_remote = _SelectedRemote(
+            remote=PullRequestRemote(
+                provider="github",
+                remote_name="origin",
+                url="https://github.com/owner/repo.git",
+                repo="repo",
+                owner="owner",
+            ),
+            push_url=str(bare_remote),
+        )
+
+        with patch.object(self.manager, "_select_pull_request_remote", return_value=selected_remote):
+            with patch(
+                "agent_team.workspaces.create_or_get_pull_request",
+                side_effect=PullRequestError("simulated provider failure after push"),
+            ) as create_pr:
+                with self.assertRaisesRegex(WorkspaceError, "simulated provider failure after push"):
+                    self.manager.merge_and_cleanup(issue)
+
+        create_pr.assert_called_once()
+        pushed_head = self._git(self.repo, "ls-remote", str(bare_remote), "refs/heads/agent-team/issue-1").split()[0]
+        self.assertIsNone(self.artifacts.read_pull_request_metadata(issue.id))
+        self.assertIsNotNone(self.artifacts.read_workspace_metadata(issue.id))
+        self.assertTrue(info.worktree_root.exists())
+
+        pr_result = PullRequestResult(
+            provider="github",
+            remote_name="origin",
+            source_branch="agent-team/issue-1",
+            target_branch=target_branch,
+            title="Issue 1: issue 1",
+            url="https://github.com/owner/repo/pull/7",
+            id="7",
+            number=7,
+            status="OPEN",
+            is_existing=True,
+            raw={"number": 7},
+        )
+        with patch.object(self.manager, "_select_pull_request_remote", return_value=selected_remote):
+            with patch("agent_team.workspaces.create_or_get_pull_request", return_value=pr_result) as create_pr:
+                with patch.object(self.manager, "_git_remote", wraps=self.manager._git_remote) as git_remote:
+                    result = self.manager.merge_and_cleanup(issue)
+
+        self.assertEqual(result.status, "pull_request")
+        self.assertEqual(result.worktree_head, pushed_head)
+        self.assertTrue(result.pr_is_existing)
+        self.assertFalse(info.worktree_root.exists())
+        self.assertIsNone(self.artifacts.read_workspace_metadata(issue.id))
+        metadata = self.artifacts.read_pull_request_metadata(issue.id)
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertTrue(metadata["cleanup_removed"])
+        self.assertTrue(metadata["is_existing"])
+        self.assertEqual(metadata["head_commit"], pushed_head)
+        self.assertEqual(
+            self._git(self.repo, "ls-remote", str(bare_remote), "refs/heads/agent-team/issue-1").split()[0],
+            pushed_head,
+        )
+        push_calls = [call for call in git_remote.call_args_list if len(call.args) > 1 and call.args[1] == "push"]
+        self.assertEqual(push_calls, [])
+        create_pr.assert_called_once()
+
+    def test_pull_request_remote_allows_same_repo_https_and_ssh_push_urls(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        cases = (
+            (
+                "https://github.com/owner/repo.git",
+                "git@github.com:owner/repo.git",
+                "github",
+            ),
+            (
+                "https://dev.azure.com/org/project/_git/repo",
+                "ssh.dev.azure.com:v3/org/project/repo",
+                "azure-devops",
+            ),
+        )
+        self._git(self.repo, "remote", "add", "origin", cases[0][0])
+        for fetch_url, push_url, provider in cases:
+            with self.subTest(provider=provider):
+                self._git(self.repo, "remote", "set-url", "origin", fetch_url)
+                self._git(self.repo, "remote", "set-url", "--push", "origin", push_url)
+
+                mode, selected_remote = self.manager._select_finalization_mode(info, "pull_request", "origin")
+
+                self.assertEqual(mode, "pull_request")
+                self.assertIsNotNone(selected_remote)
+                assert selected_remote is not None
+                self.assertEqual(selected_remote.remote.provider, provider)
+
+    def test_pull_request_remote_blocks_mismatched_push_url(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._git(self.repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
+        self._git(self.repo, "remote", "set-url", "--push", "origin", "https://github.com/other/repo.git")
+
+        with self.assertRaisesRegex(WorkspaceError, "push URL resolves to GitHub other/repo"):
+            self.manager._select_finalization_mode(info, "pull_request", "origin")
+
+    def test_pull_request_remote_blocks_unsupported_push_url(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._git(self.repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
+        self._git(self.repo, "remote", "set-url", "--push", "origin", str(self.home / "remote.git"))
+
+        with self.assertRaisesRegex(WorkspaceError, "push URL does not resolve to a supported"):
+            self.manager._select_finalization_mode(info, "pull_request", "origin")
+
+    def test_pull_request_remote_blocks_credential_bearing_push_url(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._git(self.repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
+        self._git(self.repo, "remote", "set-url", "--push", "origin", "https://token:secret@github.com/owner/repo.git")
+
+        with self.assertRaisesRegex(WorkspaceError, "push URL embeds credentials") as caught:
+            self.manager._select_finalization_mode(info, "pull_request", "origin")
+
+        message = str(caught.exception)
+        self.assertNotIn("token:secret", message)
+        self.assertNotIn("secret@github.com", message)
+
+    def test_pull_request_remote_blocks_credential_bearing_ssh_push_urls(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        cases = (
+            (
+                "https://github.com/owner/repo.git",
+                "ssh://git:super-secret@github.com/owner/repo.git",
+                "github",
+            ),
+            (
+                "https://dev.azure.com/org/project/_git/repo",
+                "ssh://git:super-secret@ssh.dev.azure.com/v3/org/project/repo",
+                "azure-devops",
+            ),
+        )
+        self._git(self.repo, "remote", "add", "origin", cases[0][0])
+        for fetch_url, push_url, provider in cases:
+            with self.subTest(provider=provider):
+                self._git(self.repo, "remote", "set-url", "origin", fetch_url)
+                self._git(self.repo, "remote", "set-url", "--push", "origin", push_url)
+
+                with self.assertRaisesRegex(WorkspaceError, "push URL embeds credentials") as caught:
+                    self.manager._select_finalization_mode(info, "pull_request", "origin")
+
+                message = str(caught.exception)
+                self.assertNotIn("super-secret", message)
+
+    def test_pull_request_remote_blocks_query_or_fragment_push_url(self) -> None:
+        cases = (
+            "https://github.com/owner/repo.git?access_token=secret",
+            "https://github.com/owner/repo.git#token=secret",
+        )
+        for push_url in cases:
+            with self.subTest(push_url=push_url):
+                issue = self._issue(1, self.repo)
+                info = self.manager.prepare(issue)
+                self._git(self.repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
+                self._git(self.repo, "remote", "set-url", "--push", "origin", push_url)
+
+                with self.assertRaisesRegex(WorkspaceError, "query or fragment") as caught:
+                    self.manager._select_finalization_mode(info, "pull_request", "origin")
+
+                message = str(caught.exception)
+                self.assertNotIn("secret", message)
+                self._git(self.repo, "remote", "remove", "origin")
+
+    def test_auto_pull_request_remote_skips_invalid_push_url_before_valid_remote(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        cases = (
+            str(self.home / "unsupported.git"),
+            "https://github.com/other/repo.git",
+            "https://token:secret@github.com/owner/repo.git",
+        )
+        for origin_push_url in cases:
+            with self.subTest(origin_push_url=origin_push_url):
+                self._git(self.repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
+                self._git(self.repo, "remote", "set-url", "--push", "origin", origin_push_url)
+                self._git(self.repo, "remote", "add", "upstream", "https://github.com/upstream/repo.git")
+                self._git(self.repo, "remote", "set-url", "--push", "upstream", "git@github.com:upstream/repo.git")
+
+                mode, selected_remote = self.manager._select_finalization_mode(info, "auto", None)
+
+                self.assertEqual(mode, "pull_request")
+                self.assertIsNotNone(selected_remote)
+                assert selected_remote is not None
+                self.assertEqual(selected_remote.remote.remote_name, "upstream")
+                self.assertEqual(selected_remote.remote.owner, "upstream")
+                self._git(self.repo, "remote", "remove", "origin")
+                self._git(self.repo, "remote", "remove", "upstream")
+
+    def test_push_pull_request_branch_uses_validated_push_url_directly(self) -> None:
+        bare_remote = self.home / "validated-push.git"
+        self._git(bare_remote.parent, "init", "--bare", str(bare_remote))
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        selected_remote = _SelectedRemote(
+            remote=PullRequestRemote(
+                provider="github",
+                remote_name="origin",
+                url="https://github.com/owner/repo.git",
+                repo="repo",
+                owner="owner",
+            ),
+            push_url=str(bare_remote),
+        )
+        head = self._git(info.worktree_root, "rev-parse", "HEAD")
+
+        self.manager._push_pull_request_branch(issue, info, selected_remote, "agent-team/issue-1", head)
+
+        self.assertEqual(
+            self._git(self.repo, "ls-remote", str(bare_remote), "refs/heads/agent-team/issue-1").split()[0],
+            head,
+        )
+
+    def test_push_pull_request_branch_skips_existing_matching_remote_head(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        selected_remote = _SelectedRemote(
+            remote=PullRequestRemote(
+                provider="github",
+                remote_name="origin",
+                url="https://github.com/owner/repo.git",
+                repo="repo",
+                owner="owner",
+            ),
+            push_url="https://github.com/owner/repo.git",
+        )
+        head = self._git(info.worktree_root, "rev-parse", "HEAD")
+
+        with patch.object(self.manager, "_remote_branch_head", return_value=head):
+            with patch.object(self.manager, "_git", wraps=self.manager._git) as git:
+                self.manager._push_pull_request_branch(issue, info, selected_remote, "agent-team/issue-1", head)
+
+        git.assert_not_called()
+
+    def test_push_pull_request_branch_blocks_remote_collision_without_metadata(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        selected_remote = _SelectedRemote(
+            remote=PullRequestRemote(
+                provider="github",
+                remote_name="origin",
+                url="https://github.com/owner/repo.git",
+                repo="repo",
+                owner="owner",
+            ),
+            push_url="https://github.com/owner/repo.git",
+        )
+        source_branch = "agent-team/issue-1"
+        existing_remote_head = self._git(self.repo, "rev-parse", "HEAD")
+        integrated_head = self._git(info.worktree_root, "rev-parse", "HEAD")
+
+        with patch.object(self.manager, "_remote_branch_head", return_value=existing_remote_head):
+            with self.assertRaisesRegex(WorkspaceError, "Refusing to overwrite it without existing pull_request.json"):
+                self.manager._push_pull_request_branch(issue, info, selected_remote, source_branch, integrated_head)
+
+    def test_push_pull_request_branch_uses_force_with_lease_for_owned_retry(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        selected_remote = _SelectedRemote(
+            remote=PullRequestRemote(
+                provider="github",
+                remote_name="origin",
+                url="https://github.com/owner/repo.git",
+                repo="repo",
+                owner="owner",
+            ),
+            push_url="https://github.com/owner/repo.git",
+        )
+        source_branch = "agent-team/issue-1"
+        existing_remote_head = self._git(self.repo, "rev-parse", "HEAD")
+        integrated_head = self._git(info.worktree_root, "rev-parse", "HEAD")
+        self.artifacts.write_pull_request_metadata(
+            issue.id,
+            {
+                "provider": "github",
+                "remote_name": "origin",
+                "remote_url": "https://github.com/owner/repo.git",
+                "remote_identity": ["github", "owner", "repo"],
+                "source_branch": source_branch,
+                "head_commit": existing_remote_head,
+            },
+        )
+
+        with patch.object(self.manager, "_remote_branch_head", return_value=existing_remote_head):
+            with patch.object(self.manager, "_git_remote", return_value="") as git:
+                self.manager._push_pull_request_branch(issue, info, selected_remote, source_branch, integrated_head)
+
+        git.assert_called_once_with(
+            info.source_root,
+            "push",
+            f"--force-with-lease=refs/heads/{source_branch}:{existing_remote_head}",
+            "https://github.com/owner/repo.git",
+            f"{integrated_head}:refs/heads/{source_branch}",
+        )
+
+    def test_push_pull_request_branch_blocks_owned_retry_without_recorded_head(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        selected_remote = _SelectedRemote(
+            remote=PullRequestRemote(
+                provider="github",
+                remote_name="origin",
+                url="https://github.com/owner/repo.git",
+                repo="repo",
+                owner="owner",
+            ),
+            push_url="https://github.com/owner/repo.git",
+        )
+        source_branch = "agent-team/issue-1"
+        existing_remote_head = self._git(self.repo, "rev-parse", "HEAD")
+        integrated_head = self._git(info.worktree_root, "rev-parse", "HEAD")
+        self.artifacts.write_pull_request_metadata(
+            issue.id,
+            {
+                "provider": "github",
+                "remote_name": "origin",
+                "remote_url": "https://github.com/owner/repo.git",
+                "remote_identity": ["github", "owner", "repo"],
+                "source_branch": source_branch,
+            },
+        )
+
+        with patch.object(self.manager, "_remote_branch_head", return_value=existing_remote_head):
+            with patch.object(self.manager, "_git_remote", return_value="") as git:
+                with self.assertRaisesRegex(WorkspaceError, "recorded branch head"):
+                    self.manager._push_pull_request_branch(issue, info, selected_remote, source_branch, integrated_head)
+
+        git.assert_not_called()
+
+    def test_push_pull_request_branch_blocks_owned_retry_after_remote_branch_moves(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        selected_remote = _SelectedRemote(
+            remote=PullRequestRemote(
+                provider="github",
+                remote_name="origin",
+                url="https://github.com/owner/repo.git",
+                repo="repo",
+                owner="owner",
+            ),
+            push_url="https://github.com/owner/repo.git",
+        )
+        source_branch = "agent-team/issue-1"
+        old_owned_head = "a" * 40
+        moved_remote_head = "b" * 40
+        integrated_head = self._git(info.worktree_root, "rev-parse", "HEAD")
+        self.artifacts.write_pull_request_metadata(
+            issue.id,
+            {
+                "provider": "github",
+                "remote_name": "origin",
+                "remote_url": "https://github.com/owner/repo.git",
+                "remote_identity": ["github", "owner", "repo"],
+                "source_branch": source_branch,
+                "head_commit": old_owned_head,
+            },
+        )
+
+        with patch.object(self.manager, "_remote_branch_head", return_value=moved_remote_head):
+            with patch.object(self.manager, "_git_remote", return_value="") as git:
+                with self.assertRaisesRegex(WorkspaceError, "remote branch changes made after PR finalization"):
+                    self.manager._push_pull_request_branch(issue, info, selected_remote, source_branch, integrated_head)
+
+        git.assert_not_called()
+
+    def test_push_pull_request_branch_blocks_owned_retry_after_remote_repository_changes(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        selected_remote = _SelectedRemote(
+            remote=PullRequestRemote(
+                provider="github",
+                remote_name="origin",
+                url="https://github.com/other/repo.git",
+                repo="repo",
+                owner="other",
+            ),
+            push_url="https://github.com/other/repo.git",
+        )
+        source_branch = "agent-team/issue-1"
+        existing_remote_head = self._git(self.repo, "rev-parse", "HEAD")
+        integrated_head = self._git(info.worktree_root, "rev-parse", "HEAD")
+        self.artifacts.write_pull_request_metadata(
+            issue.id,
+            {
+                "provider": "github",
+                "remote_name": "origin",
+                "remote_url": "https://github.com/owner/repo.git",
+                "remote_identity": ["github", "owner", "repo"],
+                "source_branch": source_branch,
+            },
+        )
+
+        with patch.object(self.manager, "_remote_branch_head", return_value=existing_remote_head):
+            with patch.object(self.manager, "_git_remote", return_value="") as git:
+                with self.assertRaisesRegex(WorkspaceError, "same provider repository"):
+                    self.manager._push_pull_request_branch(issue, info, selected_remote, source_branch, integrated_head)
+
+        git.assert_not_called()
+
+    def test_push_pull_request_branch_rejects_credential_bearing_ssh_urls_before_git(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        head = self._git(info.worktree_root, "rev-parse", "HEAD")
+        cases = (
+            _SelectedRemote(
+                remote=PullRequestRemote(
+                    provider="github",
+                    remote_name="origin",
+                    url="https://github.com/owner/repo.git",
+                    repo="repo",
+                    owner="owner",
+                ),
+                push_url="ssh://git:super-secret@github.com/owner/repo.git",
+            ),
+            _SelectedRemote(
+                remote=PullRequestRemote(
+                    provider="azure-devops",
+                    remote_name="origin",
+                    url="https://dev.azure.com/org/project/_git/repo",
+                    repo="repo",
+                    org="org",
+                    project="project",
+                ),
+                push_url="ssh://git:super-secret@ssh.dev.azure.com/v3/org/project/repo",
+            ),
+        )
+        for selected_remote in cases:
+            with self.subTest(provider=selected_remote.remote.provider):
+                with patch("agent_team.workspaces.subprocess.run") as run:
+                    with self.assertRaisesRegex(WorkspaceError, "credential-bearing remote URL") as caught:
+                        self.manager._push_pull_request_branch(
+                            issue,
+                            info,
+                            selected_remote,
+                            "agent-team/issue-1",
+                            head,
+                        )
+
+                run.assert_not_called()
+                self.assertNotIn("super-secret", str(caught.exception))
+
+    def test_remote_branch_probe_rejects_credential_bearing_url_before_git(self) -> None:
+        with patch("agent_team.workspaces.subprocess.run") as run:
+            with self.assertRaisesRegex(WorkspaceError, "credential-bearing remote URL") as caught:
+                self.manager._remote_branch_head(
+                    self.repo,
+                    "https://token:secret@github.com/owner/repo.git",
+                    "agent-team/issue-1",
+                )
+
+        run.assert_not_called()
+        message = str(caught.exception)
+        self.assertIn("Refusing to pass a credential-bearing remote URL", message)
+        self.assertNotIn("token:secret", message)
+        self.assertNotIn("secret@github.com", message)
+
+    def test_remote_branch_probe_rejects_credential_bearing_ssh_urls_before_git(self) -> None:
+        cases = (
+            "ssh://git:super-secret@github.com/owner/repo.git",
+            "ssh://git:super-secret@ssh.dev.azure.com/v3/org/project/repo",
+        )
+        for remote_ref in cases:
+            with self.subTest(remote_ref=remote_ref):
+                with patch("agent_team.workspaces.subprocess.run") as run:
+                    with self.assertRaisesRegex(WorkspaceError, "credential-bearing remote URL") as caught:
+                        self.manager._remote_branch_head(self.repo, remote_ref, "agent-team/issue-1")
+
+                run.assert_not_called()
+                self.assertNotIn("super-secret", str(caught.exception))
+
+    def test_remote_branch_probe_runs_git_non_interactively_with_timeout(self) -> None:
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with patch("agent_team.workspaces.subprocess.run", return_value=completed) as run:
+            head = self.manager._remote_branch_head(
+                self.repo,
+                "https://github.com/owner/repo.git",
+                "agent-team/issue-1",
+            )
+
+        self.assertIsNone(head)
+        run.assert_called_once()
+        args, kwargs = run.call_args
+        self.assertEqual(
+            args[0],
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "ls-remote",
+                "--heads",
+                "https://github.com/owner/repo.git",
+                "agent-team/issue-1",
+            ],
+        )
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(kwargs["timeout"], _REMOTE_GIT_COMMAND_TIMEOUT_SECONDS)
+        self.assertFalse(kwargs["check"])
+        self.assertTrue(kwargs["capture_output"])
+        self.assertTrue(kwargs["text"])
+        env = kwargs["env"]
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(env["GCM_INTERACTIVE"], "never")
+
+    def test_remote_branch_probe_timeout_surfaces_workspace_error(self) -> None:
+        with patch(
+            "agent_team.workspaces.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["git", "ls-remote"], timeout=1),
+        ):
+            with self.assertRaisesRegex(WorkspaceError, "timed out after 120 seconds.*non-interactively"):
+                self.manager._remote_branch_head(
+                    self.repo,
+                    "https://github.com/owner/repo.git",
+                    "agent-team/issue-1",
+                )
+
+    def test_remote_branch_probe_rejects_query_or_fragment_url(self) -> None:
+        cases = (
+            "https://github.com/owner/repo.git?access_token=secret",
+            "https://github.com/owner/repo.git#token=secret",
+        )
+        for remote_ref in cases:
+            with self.subTest(remote_ref=remote_ref):
+                with self.assertRaisesRegex(WorkspaceError, "query or fragment") as caught:
+                    self.manager._remote_branch_head(self.repo, remote_ref, "agent-team/issue-1")
+                self.assertNotIn("secret", str(caught.exception))
+
+    def test_git_remote_error_redacts_query_and_fragment_secrets(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="",
+            stderr=(
+                "fatal: failed for "
+                "https://github.com/owner/repo.git?access_token=query-secret#password=fragment-secret"
+            ),
+        )
+        with patch("agent_team.workspaces.subprocess.run", return_value=completed):
+            with self.assertRaises(WorkspaceError) as caught:
+                self.manager._git_remote(
+                    self.repo,
+                    "ls-remote",
+                    "https://github.com/owner/repo.git?access_token=query-secret#password=fragment-secret",
+                    "agent-team/issue-1",
+                )
+
+        message = str(caught.exception)
+        self.assertIn("[redacted]", message)
+        self.assertNotIn("query-secret", message)
+        self.assertNotIn("fragment-secret", message)
+
+    def test_git_remote_error_redacts_ssh_userinfo_secrets(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="",
+            stderr="fatal: failed for ssh://git:super-secret@github.com/owner/repo.git",
+        )
+        with patch("agent_team.workspaces.subprocess.run", return_value=completed):
+            with self.assertRaises(WorkspaceError) as caught:
+                self.manager._git_remote(
+                    self.repo,
+                    "ls-remote",
+                    "ssh://git:super-secret@github.com/owner/repo.git",
+                    "agent-team/issue-1",
+                )
+
+        message = str(caught.exception)
+        self.assertIn("ssh://[redacted]@github.com", message)
+        self.assertNotIn("super-secret", message)
+
+    def test_push_pull_request_branch_runs_git_push_non_interactively_with_timeout(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        selected_remote = _SelectedRemote(
+            remote=PullRequestRemote(
+                provider="github",
+                remote_name="origin",
+                url="https://github.com/owner/repo.git",
+                repo="repo",
+                owner="owner",
+            ),
+            push_url="https://github.com/owner/repo.git",
+        )
+        source_branch = "agent-team/issue-1"
+        head = self._git(info.worktree_root, "rev-parse", "HEAD")
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+        with patch.object(self.manager, "_remote_branch_head", return_value=None):
+            with patch("agent_team.workspaces.subprocess.run", return_value=completed) as run:
+                self.manager._push_pull_request_branch(issue, info, selected_remote, source_branch, head)
+
+        run.assert_called_once()
+        args, kwargs = run.call_args
+        self.assertEqual(
+            args[0],
+            [
+                "git",
+                "-C",
+                str(info.source_root),
+                "push",
+                f"--force-with-lease=refs/heads/{source_branch}:",
+                "https://github.com/owner/repo.git",
+                f"{head}:refs/heads/{source_branch}",
+            ],
+        )
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(kwargs["timeout"], _REMOTE_GIT_COMMAND_TIMEOUT_SECONDS)
+        self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(kwargs["env"]["GCM_INTERACTIVE"], "never")
+
+    def test_auto_unsupported_remote_blocks_instead_of_local_merge(self) -> None:
+        self._git(self.repo, "remote", "add", "origin", "https://example.com/owner/repo.git")
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+
+        with self.assertRaisesRegex(WorkspaceError, "no.*supported pull request provider"):
+            self.manager.merge_and_cleanup(issue)
+
+        self.assertTrue(info.worktree_root.exists())
+        self.assertFalse((self.repo / "feature.txt").exists())
+
+    def test_explicit_local_mode_uses_local_merge_even_with_remote(self) -> None:
+        self._git(self.repo, "remote", "add", "origin", "https://example.com/owner/repo.git")
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        self.artifacts.write_merge_request(issue.id, target_branch=None, message="approved", mode="local")
+
+        result = self.manager.merge_and_cleanup(issue)
+
+        self.assertEqual(result.status, "merged")
+        self.assertEqual((self.repo / "feature.txt").read_text(encoding="utf-8"), "feature\n")
+
+    def test_pull_request_recovery_finishes_partial_cleanup(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        head = self._git(info.worktree_root, "rev-parse", "HEAD")
+        metadata = {
+            **info.to_metadata(),
+            "cleanup_removed": False,
+            "finalized_at": "2026-01-01T00:00:00+00:00",
+            "mode": "pull_request",
+            "provider": "github",
+            "remote_name": "origin",
+            "source_branch": "agent-team/issue-1",
+            "target_branch": "master",
+            "head_commit": head,
+            "worktree_head": head,
+            "worktree_commit": None,
+            "merge_branch": "agent-team/issue-1-merge",
+            "title": "Issue 1: issue 1",
+            "url": "https://github.com/owner/repo/pull/7",
+            "id": "7",
+            "number": 7,
+            "pr_status": "OPEN",
+            "is_existing": False,
+            "raw": {"number": 7},
+        }
+        self.artifacts.write_pull_request_metadata(issue.id, metadata)
+
+        recovery = self.manager.recover_interrupted_merge(issue)
+
+        self.assertEqual(recovery.next_phase, "done")
+        self.assertEqual(recovery.run_status, "success")
+        self.assertFalse(info.worktree_root.exists())
+        self.assertIsNone(self.artifacts.read_workspace_metadata(issue.id))
+        recovered = self.artifacts.read_pull_request_metadata(issue.id)
+        self.assertIsNotNone(recovered)
+        assert recovered is not None
+        self.assertTrue(recovered["cleanup_removed"])
+        self.assertIn("Pull request URL", recovery.artifact_markdown)
 
     def test_merge_blocks_when_source_branch_is_unknown(self) -> None:
         self._git(self.repo, "checkout", "--detach")
@@ -519,16 +1352,21 @@ class WorkspaceManagerTests(unittest.TestCase):
         with self.assertRaisesRegex(WorkspaceError, "no target repo"):
             self.manager.merge_and_cleanup(self._issue(1, None))
 
-    def test_reset_removes_recorded_worktree_and_merge_branch(self) -> None:
+    def test_reset_removes_recorded_worktree_and_owned_hashed_merge_branch(self) -> None:
         issue = self._issue(1, self.repo)
         info = self.manager.prepare(issue)
+        user_branch_head = self._git(self.repo, "rev-parse", "HEAD")
         self._git(self.repo, "branch", "agent-team/issue-1-merge")
+        self._git(self.repo, "branch", "agent-team/issue-1-merge-not-owned")
+        self._git(self.repo, "branch", "agent-team/issue-1-merge-deadbeef1234")
 
         result = self.manager.reset_issue_workspace(issue)
 
         self.assertIn(str(info.worktree_root), result.removed_paths)
         self.assertFalse(info.worktree_root.exists())
-        self.assertEqual(self._git(self.repo, "branch", "--list", "agent-team/issue-1-merge"), "")
+        self.assertEqual(self._git(self.repo, "branch", "--list", "agent-team/issue-1-merge-deadbeef1234"), "")
+        self.assertEqual(self._git(self.repo, "rev-parse", "agent-team/issue-1-merge"), user_branch_head)
+        self.assertEqual(self._git(self.repo, "rev-parse", "agent-team/issue-1-merge-not-owned"), user_branch_head)
 
     def test_reset_removes_deterministic_orphan_without_metadata(self) -> None:
         issue = self._issue(1, self.repo)

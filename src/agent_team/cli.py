@@ -118,6 +118,13 @@ def build_parser() -> argparse.ArgumentParser:
     approve_merge = issue_sub.add_parser("approve-merge")
     approve_merge.add_argument("id", type=int)
     approve_merge.add_argument("--branch")
+    approve_merge.add_argument(
+        "--mode",
+        choices=["auto", "local", "pull-request"],
+        default=None,
+        help="Finalize locally, by pull request, or auto-select based on remotes. Defaults to AGENT_TEAM_MERGE_MODE.",
+    )
+    approve_merge.add_argument("--remote", help="Optional remote name to use for pull-request mode.")
     approve_merge.add_argument("--message", default="Human approved worktree merge and cleanup")
 
     reset = issue_sub.add_parser("reset-to-draft")
@@ -315,12 +322,16 @@ def handle_issue(
         if issue.phase != "awaiting_merge_approval":
             raise ValueError(f"Issue {issue.id} is in phase {issue.phase!r}, not 'awaiting_merge_approval'")
         branch = args.branch.strip() if args.branch else None
+        mode = _merge_mode_arg(args.mode) if args.mode else (config.merge_mode if config else "auto")
+        remote = args.remote.strip() if args.remote else (config.pr_remote if config else None)
         message = args.message.strip() or "Human approved worktree merge and cleanup"
-        artifacts.write_merge_request(issue.id, target_branch=branch, message=message)
+        artifacts.write_merge_request(issue.id, target_branch=branch, message=message, mode=mode, remote_name=remote)
         issue = store.transition_issue(args.id, "ready_for_merge", None, message)
         artifacts.write_issue_snapshot(issue)
         branch_message = f" targeting {branch}" if branch else ""
-        print(f"Issue {issue.id} merge approved{branch_message}; advanced to {issue.phase}")
+        remote_message = f" via remote {remote}" if remote else ""
+        mode_message = "pull request" if mode == "pull_request" else mode
+        print(f"Issue {issue.id} merge approved{branch_message} using {mode_message} mode{remote_message}; advanced to {issue.phase}")
         return 0
     if args.issue_command == "reset-to-draft":
         if config is None:
@@ -500,6 +511,10 @@ def _required_repo_path(value: str | None) -> str:
     if not cleaned:
         raise ValueError("target repo is required")
     return cleaned
+
+
+def _merge_mode_arg(value: str) -> str:
+    return value.strip().lower().replace("-", "_")
 
 
 def print_issue(issue: object, store: IssueStore, artifacts: ArtifactStore) -> None:

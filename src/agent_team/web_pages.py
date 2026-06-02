@@ -57,7 +57,7 @@ def render_dashboard_body(
               {_summary_card("Blocked", "blocked", payload["summary"]["blocked"], "Issues that need intervention before agents can continue.")}
               {_summary_card("Draft backlog", "draft", payload["summary"]["draft"], "Issues waiting to be published before agents can run.")}
               {_summary_card("Ready to run", "ready", payload["summary"]["ready"], "Issues ready for an agent run.")}
-              {_summary_card("Recently merged", "recently_merged", payload["summary"]["recently_merged"], "Latest issues merged and closed.")}
+              {_summary_card("Recently finalized", "recently_merged", payload["summary"]["recently_merged"], "Latest issues merged locally or finalized by PR.")}
             </section>
             <section class="panel-grid manager-buckets" aria-label="Priority work buckets">
               <div class="panel priority">
@@ -87,7 +87,7 @@ def render_dashboard_body(
              </section>
              <section class="panel-grid activity-grid" aria-label="Recent activity">
                <div class="panel">
-                 <h2>Recently merged</h2>
+                 <h2>Recently finalized</h2>
                  <div data-dashboard-list="recently_merged">{_recently_merged_table(payload["recently_merged"], context)}</div>
                </div>
                <div class="panel compact-activity">
