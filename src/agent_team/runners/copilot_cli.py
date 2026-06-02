@@ -885,6 +885,8 @@ class CopilotCliRunner(AgentRunner):
             phase=phase,
             artifacts_dir=artifacts_dir,
             phase_artifact=phase_artifact,
+            human_input_mode=context.get("human_input_mode", ""),
+            human_input_policy=context.get("human_input_policy", ""),
             research_artifact=f"{artifacts_dir}/research.md" if artifacts_dir else "",
             plan_artifact=f"{artifacts_dir}/plan.md" if artifacts_dir else "",
             plan_feedback_artifact=plan_feedback_artifact,

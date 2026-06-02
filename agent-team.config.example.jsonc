@@ -42,6 +42,19 @@
   // Legacy env: AGENT_TEAM_LOCK_TTL_SECONDS.
   // "lock_ttl_seconds": 1800,
 
+  // Human input consultation policy.
+  // Default: { "mode": "balanced" }.
+  // Modes:
+  // - "autonomous": pause only for critical decisions that cannot be made safely.
+  // - "balanced": pause for material tradeoffs while avoiding routine clarifications.
+  // - "eager": ask earlier for nontrivial design or product tradeoffs.
+  // Safety: consultation pauses are separate from mandatory plan and merge
+  // approvals; they only control when agent phases request manager input.
+  // Environment override: AGENT_TEAM_HUMAN_INPUT_MODE.
+  // "human_input": {
+    // "mode": "balanced"
+  // },
+
   // "copilot": {
     // Copilot CLI executable to invoke.
     // Default: "copilot".

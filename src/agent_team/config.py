@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from .human_input_policy import DEFAULT_HUMAN_INPUT_MODE, normalize_human_input_mode
+
 
 DEFAULT_CONFIG_FILENAME = "agent-team.config.jsonc"
 _DEFAULT_HOME = Path.home() / ".local" / "share" / "agent-team-orchestrator"
@@ -17,6 +19,7 @@ _TOP_LEVEL_KEYS = {
     "runner_timeout_seconds",
     "lock_ttl_seconds",
     "copilot",
+    "human_input",
     "web",
     "worker",
 }
@@ -53,6 +56,9 @@ _WORKER_KEYS = {
     "worker_concurrency",
     "worker_interval_seconds",
 }
+_HUMAN_INPUT_KEYS = {
+    "mode",
+}
 
 
 @dataclass(frozen=True)
@@ -75,6 +81,7 @@ class AppConfig:
     web_unsafe_allow_remote: bool = False
     worker_concurrency: int = 1
     worker_interval_seconds: int = 60
+    human_input_mode: str = DEFAULT_HUMAN_INPUT_MODE
     vscode_wsl_distro: str | None = None
     merge_mode: str = "auto"
     pr_remote: str | None = None
@@ -84,6 +91,7 @@ class AppConfig:
 def load_config(config_path: str | Path | None = None) -> AppConfig:
     file_config = _load_config_file(config_path)
     copilot_config = _section(file_config, "copilot")
+    human_input_config = _section(file_config, "human_input")
     web_config = _section(file_config, "web")
     worker_config = _section(file_config, "worker")
 
@@ -128,6 +136,13 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
         "AGENT_TEAM_WORKER_INTERVAL_SECONDS",
         _config_non_negative_int(worker_config, "worker_interval_seconds", 60),
     )
+    human_input_mode = normalize_human_input_mode(
+        _env_string(
+            "AGENT_TEAM_HUMAN_INPUT_MODE",
+            _config_string(human_input_config, "mode", DEFAULT_HUMAN_INPUT_MODE),
+        ),
+        "human_input.mode/AGENT_TEAM_HUMAN_INPUT_MODE",
+    )
     vscode_wsl_distro = _vscode_wsl_distro(web_config)
     merge_mode = _merge_mode()
     pr_remote = _env_optional_string("AGENT_TEAM_PR_REMOTE")
@@ -151,6 +166,7 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
         web_unsafe_allow_remote=web_unsafe_allow_remote,
         worker_concurrency=worker_concurrency,
         worker_interval_seconds=worker_interval_seconds,
+        human_input_mode=human_input_mode,
         vscode_wsl_distro=vscode_wsl_distro,
         merge_mode=merge_mode,
         pr_remote=pr_remote,
@@ -286,6 +302,8 @@ def _validate_config_keys(config: Mapping[str, Any], path: Path) -> None:
     _reject_unknown_keys(config, _TOP_LEVEL_KEYS, path)
     if "copilot" in config:
         _reject_unknown_keys(_section(config, "copilot"), _COPILOT_KEYS, path, "copilot")
+    if "human_input" in config:
+        _reject_unknown_keys(_section(config, "human_input"), _HUMAN_INPUT_KEYS, path, "human_input")
     if "web" in config:
         _reject_unknown_keys(_section(config, "web"), _WEB_KEYS, path, "web")
     if "worker" in config:

@@ -21,7 +21,7 @@ Your behavior should roughly imitate Copilot CLI's `/review` mode without relyin
 
 ## Human input escalation
 
-Default to making reasonable assumptions. Recommend `awaiting_human_input` only for a critical open-ended decision or approval that materially affects correctness, safety, scope, data loss, or merge intent. If you recommend it, include exactly one section in the artifact:
+Follow the Human input policy supplied in the task prompt. In autonomous mode, preserve the critical-only threshold: recommend `awaiting_human_input` only for a critical open-ended decision or approval that materially affects correctness, safety, scope, data loss, or merge intent. In balanced mode, also ask for manager preference on material tradeoffs where plan approval would otherwise force review of a broad review/merge-intent assumption after you have committed to it. In eager mode, ask earlier for nontrivial design/product tradeoffs that materially shape review outcome or merge intent. Never ask for routine clarifications, facts available from repo/docs/tests, style preferences, or safe deferrals to plan or merge approval. If you recommend `awaiting_human_input`, include exactly one structured section in the artifact:
 
 ## Human input request
 
@@ -45,6 +45,6 @@ The phase artifact must contain:
 5. Missing tests or documentation
 6. Recommendation: `awaiting_merge_approval`, `ready_for_implementation`, `awaiting_human_input`, or `blocked`
 
-Use `awaiting_merge_approval` only when no blocking issue remains. Use `ready_for_implementation` when code changes are needed. Use `awaiting_human_input` when review needs a critical human decision and include the structured request section. Use `blocked` for review blockers such as inaccessible workspaces or inconclusive validation.
+Use `awaiting_merge_approval` only when no blocking issue remains. Use `ready_for_implementation` when code changes are needed. Use `awaiting_human_input` when review needs manager input under the selected Human input policy and include the structured request section. Use `blocked` for review blockers such as inaccessible workspaces or inconclusive validation.
 
 If the final recommendation is `blocked`, include exactly one `Blocked summary:` line immediately before the final `Recommendation:` line. The blocked summary must be 1-2 plain-language sentences explaining what prevents progress and what would unblock it.
