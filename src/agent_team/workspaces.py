@@ -17,6 +17,7 @@ from .pull_requests import (
     PullRequestRemote,
     PullRequestRequest,
     PullRequestResult,
+    SAFE_PULL_REQUEST_DESCRIPTION,
     create_or_get_pull_request,
     parse_pull_request_remote,
 )
@@ -599,7 +600,6 @@ class WorkspaceManager:
                 info,
                 preflight,
                 selected_remote,
-                approval_message,
             )
         return self._finalize_local_merge(issue, info, preflight, approval_message)
 
@@ -730,7 +730,6 @@ class WorkspaceManager:
         info: WorkspaceInfo,
         preflight: _MergePreflightResult,
         selected_remote: _SelectedRemote,
-        approval_message: str | None,
     ) -> WorkspaceMergeResult:
         integrated_head = _require_string(preflight.integrated_head, "integrated worktree head")
         source_branch = self._pull_request_branch(issue)
@@ -741,7 +740,6 @@ class WorkspaceManager:
             selected_remote,
             source_branch,
             integrated_head,
-            approval_message,
         )
         request = PullRequestRequest(
             source_branch=source_branch,
@@ -995,13 +993,12 @@ class WorkspaceManager:
         selected_remote: _SelectedRemote,
         source_branch: str,
         integrated_head: str,
-        approval_message: str | None,
     ) -> Path:
         path = self.artifacts.issue_dir(issue.id) / "pull_request_body.md"
         lines = [
             f"# Issue {issue.id}: {_single_line(issue.title)}",
             "",
-            issue.description.strip() or "No description provided.",
+            SAFE_PULL_REQUEST_DESCRIPTION,
             "",
             "## Agent-team finalization",
             "",
@@ -1013,8 +1010,6 @@ class WorkspaceManager:
         ]
         if preflight.worktree_commit:
             lines.append(f"- Final workspace snapshot commit: `{preflight.worktree_commit}`")
-        if approval_message:
-            lines.extend(["", "## Merge approval", "", _single_line(approval_message)])
         path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
         return path
 
@@ -1526,9 +1521,15 @@ class WorkspaceManager:
         return False
 
     def _delete_reset_merge_branch(self, issue_id: int, source_root: Path) -> None:
-        merge_branch = f"agent-team/issue-{issue_id}-merge"
-        if self._git_check(source_root, "rev-parse", "--verify", merge_branch):
-            self._git(source_root, "branch", "-D", merge_branch)
+        output = self._git(
+            source_root,
+            "for-each-ref",
+            "--format=%(refname:short)",
+            f"refs/heads/agent-team/issue-{issue_id}-merge-*",
+        )
+        for merge_branch in output.splitlines():
+            if self._is_internal_merge_branch(issue_id, merge_branch):
+                self._git(source_root, "branch", "-D", merge_branch)
 
     @staticmethod
     def _repo_lock_key(source_git_common_dir: Path) -> str:

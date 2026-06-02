@@ -107,6 +107,8 @@ class PullRequestProviderTests(unittest.TestCase):
                             "title": "Existing PR",
                             "headRefName": "feature",
                             "baseRefName": "main",
+                            "headRepository": {"name": "repo", "nameWithOwner": "owner/repo"},
+                            "headRepositoryOwner": {"login": "owner"},
                             "state": "OPEN",
                         }
                     ]
@@ -140,10 +142,131 @@ class PullRequestProviderTests(unittest.TestCase):
                     "--state",
                     "open",
                     "--json",
-                    "number,url,title,headRefName,baseRefName,state",
+                    "number,url,title,headRefName,baseRefName,state,headRepository,headRepositoryOwner",
                 )
             ],
         )
+
+    def test_github_reuses_matching_head_repository_when_fork_pr_is_listed_first(self) -> None:
+        remote = parse_pull_request_remote("origin", "https://github.com/owner/repo.git")
+        assert remote is not None
+        request = PullRequestRequest(
+            source_branch="feature",
+            target_branch="main",
+            title="Add feature",
+            body_path=Path("body.md"),
+        )
+        runner = FakeRunner(
+            [
+                command_result(
+                    [
+                        {
+                            "number": 41,
+                            "url": "https://github.com/owner/repo/pull/41",
+                            "title": "Fork PR",
+                            "headRefName": "feature",
+                            "baseRefName": "main",
+                            "headRepository": {"name": "repo", "nameWithOwner": "fork/repo"},
+                            "headRepositoryOwner": {"login": "fork"},
+                            "state": "OPEN",
+                        },
+                        {
+                            "number": 42,
+                            "url": "https://github.com/owner/repo/pull/42",
+                            "title": "Same repo PR",
+                            "headRefName": "feature",
+                            "baseRefName": "main",
+                            "headRepository": {"name": "repo", "nameWithOwner": "owner/repo"},
+                            "headRepositoryOwner": {"login": "owner"},
+                            "state": "OPEN",
+                        },
+                    ]
+                )
+            ]
+        )
+
+        result = create_or_get_pull_request(remote, request, runner)
+
+        self.assertTrue(result.is_existing)
+        self.assertEqual(result.number, 42)
+        self.assertEqual(result.title, "Same repo PR")
+
+    def test_github_creates_when_only_fork_pr_uses_same_branch_name(self) -> None:
+        remote = parse_pull_request_remote("origin", "https://github.com/owner/repo.git")
+        assert remote is not None
+        request = PullRequestRequest(
+            source_branch="feature",
+            target_branch="main",
+            title="Add feature",
+            body_path=Path("body.md"),
+        )
+        url = "https://github.com/owner/repo/pull/43"
+        runner = FakeRunner(
+            [
+                command_result(
+                    [
+                        {
+                            "number": 41,
+                            "url": "https://github.com/owner/repo/pull/41",
+                            "title": "Fork PR",
+                            "headRefName": "feature",
+                            "baseRefName": "main",
+                            "headRepository": {"name": "repo", "nameWithOwner": "fork/repo"},
+                            "headRepositoryOwner": {"login": "fork"},
+                            "state": "OPEN",
+                        }
+                    ]
+                ),
+                command_result(f"{url}\n"),
+                command_result(
+                    {
+                        "number": 43,
+                        "url": url,
+                        "title": "Add feature",
+                        "headRefName": "feature",
+                        "baseRefName": "main",
+                        "headRepository": {"name": "repo", "nameWithOwner": "owner/repo"},
+                        "headRepositoryOwner": {"login": "owner"},
+                        "state": "OPEN",
+                    }
+                ),
+            ]
+        )
+
+        result = create_or_get_pull_request(remote, request, runner)
+
+        self.assertFalse(result.is_existing)
+        self.assertEqual(result.number, 43)
+        self.assertEqual(runner.calls[1][:4], ("gh", "pr", "create", "--repo"))
+
+    def test_github_blocks_existing_pr_without_head_repository_metadata(self) -> None:
+        remote = parse_pull_request_remote("origin", "https://github.com/owner/repo.git")
+        assert remote is not None
+        request = PullRequestRequest(
+            source_branch="feature",
+            target_branch="main",
+            title="Add feature",
+            body_path=Path("body.md"),
+        )
+        runner = FakeRunner(
+            [
+                command_result(
+                    [
+                        {
+                            "number": 42,
+                            "url": "https://github.com/owner/repo/pull/42",
+                            "title": "Existing PR",
+                            "headRefName": "feature",
+                            "baseRefName": "main",
+                            "state": "OPEN",
+                        }
+                    ]
+                )
+            ]
+        )
+
+        with self.assertRaisesRegex(PullRequestError, "without head repository metadata"):
+            create_or_get_pull_request(remote, request, runner)
 
     def test_github_create_then_views_pull_request(self) -> None:
         remote = parse_pull_request_remote("origin", "git@github.com:owner/repo.git")
@@ -166,6 +289,8 @@ class PullRequestProviderTests(unittest.TestCase):
                         "title": "Add feature",
                         "headRefName": "feature",
                         "baseRefName": "main",
+                        "headRepository": {"name": "repo", "nameWithOwner": "owner/repo"},
+                        "headRepositoryOwner": {"login": "owner"},
                         "state": "OPEN",
                     }
                 ),
@@ -206,7 +331,7 @@ class PullRequestProviderTests(unittest.TestCase):
                 "--repo",
                 "owner/repo",
                 "--json",
-                "number,url,title,headRefName,baseRefName,state",
+                "number,url,title,headRefName,baseRefName,state,headRepository,headRepositoryOwner",
             ),
         )
 
@@ -229,6 +354,8 @@ class PullRequestProviderTests(unittest.TestCase):
                             "title": "Existing PR",
                             "headRefName": "feature",
                             "baseRefName": "main",
+                            "headRepository": {"name": "repo", "nameWithOwner": "owner/repo"},
+                            "headRepositoryOwner": {"login": "owner"},
                             "state": "OPEN",
                         }
                     ]
@@ -258,6 +385,8 @@ class PullRequestProviderTests(unittest.TestCase):
                             "title": "Existing PR",
                             "headRefName": "feature",
                             "baseRefName": "main",
+                            "headRepository": {"name": "repo", "nameWithOwner": "owner/repo"},
+                            "headRepositoryOwner": {"login": "owner"},
                             "state": "OPEN",
                         }
                     ]

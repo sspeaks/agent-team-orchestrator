@@ -84,7 +84,7 @@ class SubprocessCommandRunner:
         )
 
 
-_AZURE_DEVOPS_SAFE_DESCRIPTION = (
+SAFE_PULL_REQUEST_DESCRIPTION = (
     "Created by agent-team orchestrator. Full implementation context remains in local agent-team artifacts."
 )
 _COMMAND_OUTPUT_MAX_CHARS = 2_000
@@ -228,11 +228,11 @@ def _github_create_or_get(
         "--state",
         "open",
         "--json",
-        "number,url,title,headRefName,baseRefName,state",
+        "number,url,title,headRefName,baseRefName,state,headRepository,headRepositoryOwner",
     ]
     listed = runner.run(list_args)
     _ensure_success("gh pr list", listed, "Run 'gh auth login' and verify the repository is accessible.")
-    existing = _first_mapping_from_list(_load_json(listed.stdout, "gh pr list"), "gh pr list")
+    existing = _github_existing_pull_request(remote, request, _load_json(listed.stdout, "gh pr list"))
     if existing is not None:
         return _github_result(remote, request, existing, is_existing=True)
 
@@ -271,7 +271,7 @@ def _github_create_or_get(
             "--repo",
             repo,
             "--json",
-            "number,url,title,headRefName,baseRefName,state",
+            "number,url,title,headRefName,baseRefName,state,headRepository,headRepositoryOwner",
         ]
     )
     _ensure_success("gh pr view", viewed, "Verify the created pull request URL is accessible.")
@@ -336,7 +336,7 @@ def _ado_create_or_get(
             "--title",
             request.title,
             "--description",
-            _AZURE_DEVOPS_SAFE_DESCRIPTION,
+            SAFE_PULL_REQUEST_DESCRIPTION,
             "--output",
             "json",
         ]
@@ -372,6 +372,84 @@ def _github_result(
         is_existing=is_existing,
         raw=dict(raw),
     )
+
+
+def _github_existing_pull_request(
+    remote: PullRequestRemote,
+    request: PullRequestRequest,
+    value: Any,
+) -> dict[str, Any] | None:
+    candidates = _mappings_from_list(value, "gh pr list")
+    matching = [
+        item
+        for item in candidates
+        if _github_branch_matches(request, item) and _github_head_repository_matches(remote, item)
+    ]
+    if len(matching) > 1:
+        raise PullRequestError(
+            "gh pr list returned multiple open pull requests from the selected head repository; "
+            "unable to safely reuse an existing pull request."
+        )
+    if matching:
+        return matching[0]
+    ambiguous = []
+    for item in candidates:
+        if not _github_branch_matches(request, item):
+            continue
+        owner, repo = _github_head_repository(item)
+        if owner is None or repo is None:
+            ambiguous.append(item)
+    if ambiguous:
+        raise PullRequestError(
+            "gh pr list returned an open pull request without head repository metadata; "
+            "unable to safely reuse it or create another pull request."
+        )
+    return None
+
+
+def _github_branch_matches(request: PullRequestRequest, raw: dict[str, Any]) -> bool:
+    head = raw.get("headRefName")
+    base = raw.get("baseRefName")
+    return (head is None or str(head) == request.source_branch) and (base is None or str(base) == request.target_branch)
+
+
+def _github_head_repository_matches(remote: PullRequestRemote, raw: dict[str, Any]) -> bool:
+    owner, repo = _github_head_repository(raw)
+    return (
+        owner is not None
+        and repo is not None
+        and remote.owner is not None
+        and owner.casefold() == remote.owner.casefold()
+        and repo.casefold() == remote.repo.casefold()
+    )
+
+
+def _github_head_repository(raw: dict[str, Any]) -> tuple[str | None, str | None]:
+    owner: str | None = None
+    repo: str | None = None
+    head_repository = raw.get("headRepository")
+    if isinstance(head_repository, dict):
+        name_with_owner = _clean_json_string(head_repository.get("nameWithOwner"))
+        if name_with_owner and "/" in name_with_owner:
+            owner, repo = name_with_owner.split("/", 1)
+        repo = _clean_json_string(head_repository.get("name")) or repo
+        owner = _github_owner_login(head_repository.get("owner")) or owner
+    elif isinstance(head_repository, str):
+        value = head_repository.strip()
+        if "/" in value:
+            owner, repo = value.split("/", 1)
+        elif value:
+            repo = value
+    owner = _github_owner_login(raw.get("headRepositoryOwner")) or owner
+    return owner, repo
+
+
+def _github_owner_login(value: Any) -> str | None:
+    if isinstance(value, dict):
+        return _clean_json_string(value.get("login") or value.get("name"))
+    if isinstance(value, str):
+        return value.strip() or None
+    return None
 
 
 def _ado_result(
@@ -508,12 +586,19 @@ def _expect_mapping(value: Any, command: str) -> dict[str, Any]:
 
 
 def _first_mapping_from_list(value: Any, command: str) -> dict[str, Any] | None:
+    for item in _mappings_from_list(value, command):
+        return item
+    return None
+
+
+def _mappings_from_list(value: Any, command: str) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         raise PullRequestError(f"{command} returned unexpected JSON; expected a list.")
+    mappings: list[dict[str, Any]] = []
     for item in value:
         if isinstance(item, dict):
-            return item
-    return None
+            mappings.append(item)
+    return mappings
 
 
 def _first_non_empty_line(stdout: str) -> str:
@@ -554,3 +639,10 @@ def _as_int(value: Any) -> int | None:
         except ValueError:
             return None
     return None
+
+
+def _clean_json_string(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None

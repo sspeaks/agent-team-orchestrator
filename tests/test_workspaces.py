@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -473,9 +474,18 @@ class WorkspaceManagerTests(unittest.TestCase):
     def test_auto_remote_finalizes_by_pull_request_without_merging_source(self) -> None:
         self._git(self.repo, "remote", "add", "origin", "https://token:secret@github.com/owner/repo.git")
         self._git(self.repo, "remote", "set-url", "--push", "origin", "https://github.com/owner/repo.git")
-        issue = self._issue(1, self.repo)
+        issue = replace(
+            self._issue(1, self.repo),
+            description="Sensitive customer context secret=issue-description-secret",
+        )
         info = self.manager.prepare(issue)
         self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        self.artifacts.write_merge_request(
+            issue.id,
+            target_branch=None,
+            message="Manager approval secret=approval-message-secret",
+            mode="auto",
+        )
         source_head = self._git(self.repo, "rev-parse", "HEAD")
         pr_result = PullRequestResult(
             provider="github",
@@ -505,6 +515,11 @@ class WorkspaceManagerTests(unittest.TestCase):
         request = create_pr.call_args.args[1]
         self.assertEqual(request.source_branch, "agent-team/issue-1")
         self.assertEqual(request.target_branch, "master")
+        body = Path(request.body_path).read_text(encoding="utf-8")
+        self.assertIn("Created by agent-team orchestrator", body)
+        self.assertIn("Agent-team finalization", body)
+        self.assertNotIn("issue-description-secret", body)
+        self.assertNotIn("approval-message-secret", body)
         metadata = self.artifacts.read_pull_request_metadata(issue.id)
         self.assertIsNotNone(metadata)
         assert metadata is not None
@@ -874,16 +889,21 @@ class WorkspaceManagerTests(unittest.TestCase):
         with self.assertRaisesRegex(WorkspaceError, "no target repo"):
             self.manager.merge_and_cleanup(self._issue(1, None))
 
-    def test_reset_removes_recorded_worktree_and_merge_branch(self) -> None:
+    def test_reset_removes_recorded_worktree_and_owned_hashed_merge_branch(self) -> None:
         issue = self._issue(1, self.repo)
         info = self.manager.prepare(issue)
+        user_branch_head = self._git(self.repo, "rev-parse", "HEAD")
         self._git(self.repo, "branch", "agent-team/issue-1-merge")
+        self._git(self.repo, "branch", "agent-team/issue-1-merge-not-owned")
+        self._git(self.repo, "branch", "agent-team/issue-1-merge-deadbeef1234")
 
         result = self.manager.reset_issue_workspace(issue)
 
         self.assertIn(str(info.worktree_root), result.removed_paths)
         self.assertFalse(info.worktree_root.exists())
-        self.assertEqual(self._git(self.repo, "branch", "--list", "agent-team/issue-1-merge"), "")
+        self.assertEqual(self._git(self.repo, "branch", "--list", "agent-team/issue-1-merge-deadbeef1234"), "")
+        self.assertEqual(self._git(self.repo, "rev-parse", "agent-team/issue-1-merge"), user_branch_head)
+        self.assertEqual(self._git(self.repo, "rev-parse", "agent-team/issue-1-merge-not-owned"), user_branch_head)
 
     def test_reset_removes_deterministic_orphan_without_metadata(self) -> None:
         issue = self._issue(1, self.repo)
