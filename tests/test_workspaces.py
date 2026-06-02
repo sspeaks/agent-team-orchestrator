@@ -434,6 +434,91 @@ class WorkspaceManagerTests(unittest.TestCase):
         self.assertIn("<<<<<<<", (info.worktree_root / "README.md").read_text(encoding="utf-8"))
         self.assertNotIn("<<<<<<<", (self.repo / "README.md").read_text(encoding="utf-8"))
 
+    def test_source_sync_merges_clean_source_advance_into_workspace(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        self._commit_file(self.repo, "source.txt", "source\n")
+        source_head = self._git(self.repo, "rev-parse", "HEAD")
+
+        result = self.manager.sync_source_into_workspace(issue, info)
+
+        self.assertEqual(result.status, "synced")
+        self.assertEqual(result.new_source_head, source_head)
+        self.assertTrue(self._git_check(info.worktree_root, "merge-base", "--is-ancestor", source_head, "HEAD"))
+        self.assertEqual(self._git(info.worktree_root, "status", "--porcelain"), "")
+        self.assertEqual(self._git(self.repo, "status", "--porcelain"), "")
+        metadata = self.artifacts.read_workspace_metadata(issue.id)
+        self.assertIsNotNone(metadata)
+        self.assertEqual(metadata["source_head"], info.source_head)
+        self.assertEqual(metadata["last_source_sync_status"], "synced")
+        self.assertEqual(metadata["last_source_sync_head"], source_head)
+        self.assertEqual(metadata["last_source_sync_commit"], result.sync_commit)
+
+    def test_source_sync_reports_up_to_date_when_branch_is_already_ancestor(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        head_before = self._git(info.worktree_root, "rev-parse", "HEAD")
+
+        result = self.manager.sync_source_into_workspace(issue, info)
+
+        self.assertEqual(result.status, "up_to_date")
+        self.assertIsNone(result.sync_commit)
+        self.assertEqual(self._git(info.worktree_root, "rev-parse", "HEAD"), head_before)
+        metadata = self.artifacts.read_workspace_metadata(issue.id)
+        self.assertIsNotNone(metadata)
+        self.assertEqual(metadata["last_source_sync_status"], "up_to_date")
+
+    def test_source_sync_conflict_is_prepared_in_issue_worktree(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        (info.worktree_root / "README.md").write_text("workspace change\n", encoding="utf-8")
+        self._git(info.worktree_root, "add", "README.md")
+        self._git(info.worktree_root, "commit", "-m", "workspace change")
+        (self.repo / "README.md").write_text("source change\n", encoding="utf-8")
+        self._git(self.repo, "add", "README.md")
+        self._git(self.repo, "commit", "-m", "source change")
+
+        result = self.manager.sync_source_into_workspace(issue, info)
+
+        self.assertEqual(result.status, "conflicts")
+        self.assertEqual(result.conflict_files, ("README.md",))
+        self.assertIn("Workspace Source Sync", result.artifact_markdown())
+        self.assertIn("review requested implementation rework", result.artifact_markdown())
+        self.assertIn("<<<<<<<", (info.worktree_root / "README.md").read_text(encoding="utf-8"))
+        self.assertNotIn("<<<<<<<", (self.repo / "README.md").read_text(encoding="utf-8"))
+        metadata = self.artifacts.read_workspace_metadata(issue.id)
+        self.assertIsNotNone(metadata)
+        self.assertEqual(metadata["last_source_sync_status"], "conflicts")
+        self.assertEqual(metadata["last_source_sync_conflict_files"], ["README.md"])
+
+    def test_source_sync_skips_detached_source_branch(self) -> None:
+        self._git(self.repo, "checkout", "--detach")
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+
+        result = self.manager.sync_source_into_workspace(issue, info)
+
+        self.assertEqual(result.status, "skipped")
+        self.assertIsNone(result.target_branch)
+        metadata = self.artifacts.read_workspace_metadata(issue.id)
+        self.assertIsNotNone(metadata)
+        self.assertEqual(metadata["last_source_sync_status"], "skipped")
+
+    def test_source_sync_blocks_dirty_source_or_worktree(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        (self.repo / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(WorkspaceError, "Source repo has uncommitted"):
+            self.manager.sync_source_into_workspace(issue, info)
+
+        (self.repo / "dirty.txt").unlink()
+        (info.worktree_root / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+        with self.assertRaisesRegex(WorkspaceError, "Issue worktree has uncommitted"):
+            self.manager.sync_source_into_workspace(issue, info)
+
     def test_merge_recovery_routes_existing_conflicts_to_resolution(self) -> None:
         issue = self._issue(1, self.repo)
         info = self.manager.prepare(issue)
@@ -658,6 +743,11 @@ class WorkspaceManagerTests(unittest.TestCase):
     def _git(repo: Path, *args: str) -> str:
         completed = subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True, check=True)
         return completed.stdout.strip()
+
+    @staticmethod
+    def _git_check(repo: Path, *args: str) -> bool:
+        completed = subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True, check=False)
+        return completed.returncode == 0
 
 
 if __name__ == "__main__":
