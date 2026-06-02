@@ -187,6 +187,29 @@ class WebTests(unittest.TestCase):
         self.assertNotIn("Research body", html)
         self.assertNotIn("&lt;script&gt;timeline&lt;/script&gt;", html)
 
+    def test_issue_detail_artifacts_section_is_scroll_bounded(self) -> None:
+        issue = self.store.create_issue("long artifact issue", "desc", ready=True)
+        self.artifacts.write_phase_artifact(issue.id, "research", "run-research", "Research body")
+        self.artifacts.write_phase_artifact(issue.id, "plan", "run-plan", "Plan body")
+        for index in range(8):
+            self.artifacts.run_log_path(issue.id, "research", f"run-{index}").write_text(
+                f"research log {index}",
+                encoding="utf-8",
+            )
+
+        html = self.get(f"/issues/{issue.id}")
+
+        self.assertIn('<div class="artifact-list-viewer" data-issue-artifacts>', html)
+        artifact_section = html[
+            html.index('<div class="artifact-list-viewer" data-issue-artifacts>') : html.index(
+                '<div class="panel current-log-panel">'
+            )
+        ]
+        self.assertIn(f'href="/artifacts/{issue.id}/research.md"', artifact_section)
+        self.assertIn(f'href="/artifacts/{issue.id}/plan.md"', artifact_section)
+        self.assertIn(f'href="/artifacts/{issue.id}/logs/research-run-0.md"', artifact_section)
+        self.assertIn(f'href="/artifacts/{issue.id}/logs/research-run-7.md"', artifact_section)
+
     def test_issue_detail_links_existing_phase_artifacts_when_blocked(self) -> None:
         issue = self.store.create_issue("blocked artifact issue", "desc", ready=True)
         self.artifacts.write_phase_artifact(issue.id, "research", "run-1", "Blocked issue research")
@@ -317,7 +340,11 @@ class WebTests(unittest.TestCase):
         self.assertIn("User controlled &lt;context&gt;", html)
         self.assertIn(f"/issues/{issue.id}/actions/answer-human-input", html)
         self.assertIn("Answer human input", html)
+        self.assertIn(f"/issues/{issue.id}/actions/stop", html)
+        self.assertIn("Stop issue", html)
         self.assertNotIn(f"/issues/{issue.id}/actions/transition", html)
+        actions = {control["action"] for control in payload["manager_controls"]}
+        self.assertIn(f"/issues/{issue.id}/actions/stop", actions)
         self.assertEqual(payload["human_input"]["pending"]["question"], "Which & option <now>?")
         self.assertEqual(payload["human_input"]["pending"]["resume_phase"], "needs_research")
         self.assertEqual(timeline_by_label["Human input"]["status"], "current")
@@ -1488,6 +1515,16 @@ setTimeout(() => {{
             self.assertEqual(response.headers.get("Cache-Control"), "no-store")
             self.assertEqual(response.headers.get("X-Content-Type-Options"), "nosniff")
         self.assertIn(".danger-zone", styles)
+        self.assertIn(".diagnostics-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr));", styles)
+        self.assertIn(".diagnostics-grid > * { min-width: 0; }", styles)
+        self.assertIn(".diagnostics [data-dashboard-list] { max-width: 100%; overflow-x: auto; }", styles)
+        self.assertIn(".diagnostics table { table-layout: fixed; }", styles)
+        self.assertIn(".artifact-list-viewer { max-height: 18rem; overflow: auto; }", styles)
+        self.assertIn(
+            ".diagnostics th, .diagnostics td, .diagnostics code, .diagnostics .muted { overflow-wrap: anywhere; }",
+            styles,
+        )
+        self.assertIn(".diagnostics code { white-space: normal; }", styles)
         self.assertIn('<link rel="stylesheet" href="/static/styles.css">', self.get("/"))
 
         issue = self.store.create_issue("job api issue", "desc", ready=True)
@@ -1703,6 +1740,72 @@ setTimeout(() => {{
             self.post(f"/issues/{issue.id}/actions/transition", {"next_phase": "needs_research"})
         self.assertEqual(bypass.exception.code, 400)
         self.assertEqual(self.store.get_issue(issue.id).phase, "awaiting_human_input")
+
+    def test_stop_action_blocks_ready_approval_and_human_input_issues(self) -> None:
+        ready = self.store.create_issue("ready stop", "desc", ready=True)
+        approval = self.store.create_issue("approval stop", "desc", ready=True)
+        self._move_to_plan_approval(approval.id)
+        human_input = self.store.create_issue("human stop", "desc")
+        self._move_to_human_input(human_input.id)
+
+        ready_html = self.post(f"/issues/{ready.id}/actions/stop", {"message": "Pause ready from web."})
+        self.post(f"/issues/{approval.id}/actions/stop", {})
+        self.post(f"/issues/{human_input.id}/actions/stop", {"message": "Pause human input from web."})
+
+        self.assertEqual(self.store.get_issue(ready.id).phase, "blocked")
+        self.assertEqual(self.store.get_issue(ready.id).blocked_summary, "Pause ready from web.")
+        self.assertIn(f"Issue {ready.id} stopped at blocked", ready_html)
+        approval_issue = self.store.get_issue(approval.id)
+        self.assertEqual(approval_issue.phase, "blocked")
+        self.assertEqual(approval_issue.blocked_summary, "Issue stopped by manager")
+        human_issue = self.store.get_issue(human_input.id)
+        self.assertEqual(human_issue.phase, "blocked")
+        self.assertEqual(human_issue.blocked_summary, "Pause human input from web.")
+        requests = self.store.list_human_input_requests(human_input.id)
+        self.assertEqual(requests[0].status, "stopped")
+        self.assertIsNone(self.store.get_pending_human_input_request(human_input.id))
+        payload, _headers = self.get_json(f"/api/issues/{human_input.id}")
+        self.assertIsNone(payload["human_input"]["pending"])
+        self.assertEqual(payload["human_input"]["requests"][0]["status"], "stopped")
+
+    def test_stop_action_rejects_draft_blocked_done_lock_and_active_job(self) -> None:
+        draft = self.store.create_issue("draft stop", "desc")
+        with self.assertRaises(urllib.error.HTTPError) as draft_error:
+            self.post(f"/issues/{draft.id}/actions/stop", {})
+        self.assertEqual(draft_error.exception.code, 400)
+
+        blocked = self.store.create_issue("blocked stop", "desc", ready=True)
+        self.store.transition_issue(blocked.id, "blocked")
+        self.post(f"/issues/{blocked.id}/actions/stop", {"message": "already stopped"})
+        self.assertEqual(self.store.get_issue(blocked.id).phase, "blocked")
+
+        done = self.store.create_issue("done stop", "desc")
+        self._close_with_merge(done.id, "run-done-stop", "done")
+        with self.assertRaises(urllib.error.HTTPError) as done_error:
+            self.post(f"/issues/{done.id}/actions/stop", {})
+        self.assertEqual(done_error.exception.code, 400)
+
+        locked = self.store.create_issue("locked stop", "desc", ready=True)
+        self.assertTrue(self.store.acquire_lock(locked.id, "test-owner", 60, "run-1"))
+        with self.assertRaises(urllib.error.HTTPError) as lock_error:
+            self.post(f"/issues/{locked.id}/actions/stop", {})
+        self.assertEqual(lock_error.exception.code, 409)
+
+        queued = self.store.create_issue("queued stop", "desc", ready=True)
+        now = utc_now_iso()
+        with self.app.jobs._lock:
+            self.app.jobs._jobs["queued-stop"] = WebJob(
+                id="queued-stop",
+                action="Run issue",
+                issue_id=queued.id,
+                status="queued",
+                message="Queued",
+                created_at=now,
+                updated_at=now,
+            )
+        with self.assertRaises(urllib.error.HTTPError) as job_error:
+            self.post(f"/issues/{queued.id}/actions/stop", {})
+        self.assertEqual(job_error.exception.code, 409)
 
     def test_transition_to_human_input_without_request_is_rejected(self) -> None:
         issue = self.store.create_issue("manual human input", "desc", ready=True)
@@ -2175,6 +2278,10 @@ setTimeout(() => {{
 
         actions = {control["action"] for control in payload["manager_controls"]}
         self.assertIn(f"/issues/{issue.id}/actions/reset-to-draft", actions)
+        self.assertIn(f"/issues/{issue.id}/actions/stop", actions)
+        stop_control = next(control for control in payload["manager_controls"] if control["action"].endswith("/actions/stop"))
+        self.assertEqual(stop_control["button"], "Stop issue")
+        self.assertEqual(stop_control["fields"][0]["label"], "Stop reason")
         transition = next(control for control in payload["manager_controls"] if control["action"].endswith("/actions/transition"))
         transition_options = {option["value"] for option in transition["fields"][0]["options"]}
         self.assertNotIn("draft", transition_options)
@@ -2184,8 +2291,24 @@ setTimeout(() => {{
         self.assertEqual(reset_control["fields"][0]["placeholder"], f"RESET {issue.id}")
         self.assertIn("/actions/reset-to-draft", html)
         self.assertIn("Reset to draft (destructive)", html)
+        self.assertIn("/actions/stop", html)
+        self.assertIn("Stop issue", html)
         self.assertIn("Danger zone: reset or delete this issue", html)
         self.assertIn("Advanced actions: override phase", html)
+
+    def test_stop_control_is_absent_for_draft_blocked_and_done_issues(self) -> None:
+        draft = self.store.create_issue("draft no stop", "desc")
+        blocked = self.store.create_issue("blocked no stop", "desc", ready=True)
+        self.store.transition_issue(blocked.id, "blocked")
+        done = self.store.create_issue("done no stop", "desc")
+        self._close_with_merge(done.id, "run-done-no-stop", "done")
+
+        for issue in (draft, blocked, self.store.get_issue(done.id)):
+            payload, _headers = self.get_json(f"/api/issues/{issue.id}")
+            html = self.get(f"/issues/{issue.id}")
+            actions = {control["action"] for control in payload["manager_controls"]}
+            self.assertNotIn(f"/issues/{issue.id}/actions/stop", actions)
+            self.assertNotIn(f"/issues/{issue.id}/actions/stop", html)
 
     def test_delete_control_is_available_for_draft_and_non_draft_issues(self) -> None:
         draft = self.store.create_issue("draft delete controls issue", "desc")

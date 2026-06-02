@@ -68,7 +68,12 @@ legend { font-weight: 800; margin-bottom: 0.45rem; }
 .danger-zone { background: var(--danger-soft); border-color: #fecaca; }
 .danger-zone button { background: var(--danger); }
 .diagnostics { margin-bottom: 2rem; }
-.diagnostics-grid { margin-top: 1rem; }
+.diagnostics-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr)); margin-top: 1rem; }
+.diagnostics-grid > * { min-width: 0; }
+.diagnostics [data-dashboard-list] { max-width: 100%; overflow-x: auto; }
+.diagnostics table { table-layout: fixed; }
+.diagnostics th, .diagnostics td, .diagnostics code, .diagnostics .muted { overflow-wrap: anywhere; }
+.diagnostics code { white-space: normal; }
 .next-action-panel { border-left: 6px solid var(--brand); }
 .phase-line { display: grid; gap: 0.25rem; margin-bottom: 0; }
 .timeline { display: flex; flex-wrap: wrap; gap: 0.5rem; }
@@ -79,6 +84,7 @@ legend { font-weight: 800; margin-bottom: 0.45rem; }
 a.phase-step.has-artifact { cursor: pointer; text-decoration: none; }
 a.phase-step.has-artifact:hover { filter: brightness(0.97); text-decoration: underline; text-underline-offset: 0.18rem; }
 a.phase-step.has-artifact:focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }
+.artifact-list-viewer { max-height: 18rem; overflow: auto; }
 .log-viewer { max-height: 28rem; min-height: 12rem; overflow: auto; }
 .current-log-panel { grid-column: 1 / -1; }
 .item-list { display: grid; gap: 0.6rem; list-style: none; margin: 0; padding: 0; }
