@@ -89,7 +89,7 @@ Config discovery order is:
 3. `agent-team.config.jsonc` in the current working directory
 4. Built-in defaults
 
-Environment variables remain supported as compatibility overrides, and command flags such as `serve --host`, `serve --port`, and `worker --concurrency` affect only that invocation.
+Environment variables remain supported as compatibility overrides, and command flags such as `serve --host`, `serve --port`, `worker once --concurrency`, and `worker loop --concurrency` affect only that invocation.
 
 ## Safety highlights
 
