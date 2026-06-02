@@ -216,7 +216,7 @@ class DashboardAndConcurrencyTests(unittest.TestCase):
         self.assertEqual(summary_a["recently_merged"][0]["summary"], "newest successful merge")
         self.assertEqual([row["issue_id"] for row in summary_b["recently_merged"]], [merged_b.id])
         self.assertNotIn(open_with_merge_run.id, {row["issue_id"] for row in summary_all["recently_merged"]})
-        self.assertIn("Recently merged", output)
+        self.assertIn("Recently finalized", output)
         self.assertIn("newest successful merge", output)
         self.assertIn("merged a", output)
 

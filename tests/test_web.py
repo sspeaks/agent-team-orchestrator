@@ -25,6 +25,77 @@ from agent_team.config import AppConfig
 from agent_team.models import HumanInputRequestDraft, utc_now_iso
 from agent_team.orchestrator import Orchestrator
 from agent_team.web import AgentTeamWebApp, LOG_TAIL_BYTES, WebJob, serve_web, serve_web_and_worker
+from agent_team.web_html import _render_closed_synopsis
+
+
+class WebRenderingTests(unittest.TestCase):
+    def test_server_closed_synopsis_does_not_link_unsafe_pull_request_url(self) -> None:
+        rendered = _render_closed_synopsis(
+            {
+                "summary": "Finalized by PR",
+                "pull_request": {
+                    "number": 7,
+                    "url": "javascript:alert(1)",
+                    "source_branch": "agent-team/issue-7",
+                    "target_branch": "main",
+                    "status": "OPEN",
+                },
+            }
+        )
+
+        self.assertIn("Pull request #7", rendered)
+        self.assertNotIn("<a ", rendered)
+        self.assertNotIn("javascript:alert", rendered)
+
+    def test_server_closed_synopsis_links_http_pull_request_url(self) -> None:
+        rendered = _render_closed_synopsis(
+            {
+                "summary": "Finalized by PR",
+                "pull_request": {
+                    "number": 7,
+                    "url": "https://github.com/owner/repo/pull/7",
+                    "source_branch": "agent-team/issue-7",
+                    "target_branch": "main",
+                    "status": "OPEN",
+                },
+            }
+        )
+
+        self.assertIn('<a href="https://github.com/owner/repo/pull/7" rel="noreferrer">Pull request #7</a>', rendered)
+
+    def test_server_closed_synopsis_does_not_link_credential_bearing_pull_request_url(self) -> None:
+        rendered = _render_closed_synopsis(
+            {
+                "summary": "Finalized by PR",
+                "pull_request": {
+                    "number": 7,
+                    "url": "https://user:secret@github.com/owner/repo/pull/7",
+                    "source_branch": "agent-team/issue-7",
+                    "target_branch": "main",
+                    "status": "OPEN",
+                },
+            }
+        )
+
+        self.assertIn("Pull request #7", rendered)
+        self.assertNotIn("<a ", rendered)
+        self.assertNotIn("user:secret", rendered)
+
+    def test_browser_closed_synopsis_checks_pr_url_scheme_before_linking(self) -> None:
+        script = (Path(web_module.__file__).with_name("web_static") / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("function isSafeHttpUrl", script)
+        self.assertIn("if (isSafeHttpUrl(pullRequest.url))", script)
+        self.assertIn("!/^https?:\\/\\//i.test(text)", script)
+        self.assertIn("!parsed.username", script)
+        self.assertIn("!parsed.password", script)
+        self.assertNotIn("if (pullRequest.url) {\n      var link", script)
+
+    def test_browser_closed_synopsis_rejects_pr_url_query_and_fragment(self) -> None:
+        script = (Path(web_module.__file__).with_name("web_static") / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("!parsed.search", script)
+        self.assertIn("!parsed.hash", script)
 
 
 class WebTests(unittest.TestCase):
@@ -394,7 +465,7 @@ class WebTests(unittest.TestCase):
         payload, _headers = self.get_json(f"/api/dashboard?{query}")
         script = self.get("/static/app.js")
 
-        self.assertIn("Recently merged", dashboard)
+        self.assertIn("Recently finalized", dashboard)
         self.assertIn('data-dashboard-list="recently_merged"', dashboard)
         self.assertIn("merged dashboard issue", dashboard)
         self.assertIn("Merged issue into main at abc123", dashboard)
@@ -1834,6 +1905,39 @@ setTimeout(() => {{
         self.assertIsNotNone(request)
         self.assertEqual(request["target_branch"], "main")
         self.assertEqual(request["message"], "merge approved")
+        self.assertEqual(request["mode"], "auto")
+
+    def test_approve_merge_action_defaults_to_configured_merge_mode(self) -> None:
+        self.app.config = replace(self.app.config, merge_mode="local")
+        issue = self.store.create_issue("merge issue", "desc")
+        self._move_to_merge_approval(issue.id)
+
+        self.post(
+            f"/issues/{issue.id}/actions/approve-merge",
+            {"branch": "main", "message": "merge approved"},
+        )
+
+        self.assertEqual(self.store.get_issue(issue.id).phase, "ready_for_merge")
+        request = self.artifacts.read_merge_request(issue.id)
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertEqual(request["mode"], "local")
+
+    def test_approve_merge_action_records_explicit_pull_request_mode_and_remote(self) -> None:
+        issue = self.store.create_issue("merge issue", "desc")
+        self._move_to_merge_approval(issue.id)
+
+        self.post(
+            f"/issues/{issue.id}/actions/approve-merge",
+            {"branch": "main", "message": "open a PR", "mode": "pull-request", "remote": "upstream"},
+        )
+
+        self.assertEqual(self.store.get_issue(issue.id).phase, "ready_for_merge")
+        request = self.artifacts.read_merge_request(issue.id)
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertEqual(request["mode"], "pull_request")
+        self.assertEqual(request["remote_name"], "upstream")
 
     def test_approve_merge_rejects_wrong_phase(self) -> None:
         issue = self.store.create_issue("not ready", "desc")
@@ -1908,7 +2012,21 @@ setTimeout(() => {{
         self.assertIn("/actions/approve-merge", html)
         self.assertIn("Target branch", html)
         self.assertIn('value="main"', html)
+        self.assertIn("Finalization mode", html)
+        self.assertIn('<option value="auto" selected>', html)
+        self.assertIn("PR remote (optional)", html)
         self.assertIn("Approve merge", html)
+
+    def test_issue_detail_approve_merge_form_defaults_to_configured_mode_and_remote(self) -> None:
+        self.app.config = replace(self.app.config, merge_mode="local", pr_remote="upstream")
+        issue = self.store.create_issue("merge form issue", "desc")
+        self._move_to_merge_approval(issue.id)
+        self.artifacts.write_workspace_metadata(issue.id, {"source_branch": "main"})
+
+        html = self.get(f"/issues/{issue.id}")
+
+        self.assertIn('<option value="local" selected>', html)
+        self.assertIn('name="remote" value="upstream"', html)
 
     def test_post_requires_csrf_token(self) -> None:
         with self.assertRaises(urllib.error.HTTPError) as caught:
