@@ -91,6 +91,8 @@ Config discovery order is:
 
 Environment variables remain supported as compatibility overrides, and command flags such as `serve --host`, `serve --port`, `worker once --concurrency`, and `worker loop --concurrency` affect only that invocation.
 
+Copilot model and reasoning effort can be configured globally or per Copilot-backed phase in the example config. Defaults remain unset, model IDs depend on the local Copilot CLI/account, raw `extra_args` are appended last for advanced overrides, and custom-agent `model` frontmatter can override CLI model selection.
+
 ## Safety highlights
 
 - The default runner is `copilot-cli`; dry-run mode is deterministic and does not invoke Copilot.

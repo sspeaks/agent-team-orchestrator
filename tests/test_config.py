@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Iterator
 from unittest.mock import patch
 
-from agent_team.config import AppConfig, DEFAULT_CONFIG_FILENAME, ensure_home, load_config
+from agent_team.config import AppConfig, CopilotModelSelection, DEFAULT_CONFIG_FILENAME, ensure_home, load_config
 
 
 class ConfigTests(unittest.TestCase):
@@ -130,6 +130,41 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.runner, "dry-run")
         self.assertEqual(config.copilot_args, ("--flag",))
 
+    def test_copilot_model_selection_config_loads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_config(
+                tmp,
+                """
+                {
+                  "copilot": {
+                    "model": " gpt-5.4-mini ",
+                    "reasoning_effort": "Medium",
+                    "phase_overrides": {
+                      "validation": {
+                        "model": "gpt-5-mini",
+                        "reasoning_effort": "none"
+                      },
+                      "review": {
+                        "reasoning_effort": "XHIGH"
+                      }
+                    }
+                  }
+                }
+                """,
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                config = load_config(path)
+
+        self.assertEqual(config.copilot_model, "gpt-5.4-mini")
+        self.assertEqual(config.copilot_reasoning_effort, "medium")
+        self.assertEqual(
+            config.copilot_phase_overrides,
+            {
+                "validation": CopilotModelSelection(model="gpt-5-mini", reasoning_effort="none"),
+                "review": CopilotModelSelection(reasoning_effort="xhigh"),
+            },
+        )
+
     def test_default_config_file_is_discovered_in_current_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -181,6 +216,38 @@ class ConfigTests(unittest.TestCase):
             ("bad-int.jsonc", '{"runner_timeout_seconds": 0}', "runner_timeout_seconds must be at least 1"),
             ("bad-bool.jsonc", '{"web": {"unsafe_allow_remote": "yes"}}', "unsafe_allow_remote must be a boolean"),
             ("bad-extra.jsonc", '{"copilot": {"extra_args": [1]}}', "copilot.extra_args"),
+            ("bad-model.jsonc", '{"copilot": {"model": 5}}', "copilot.model must be a string or null"),
+            ("empty-model.jsonc", '{"copilot": {"model": "  "}}', "copilot.model must be a non-empty string"),
+            (
+                "bad-effort.jsonc",
+                '{"copilot": {"reasoning_effort": "extreme"}}',
+                "copilot.reasoning_effort must be one of",
+            ),
+            (
+                "bad-phase-overrides.jsonc",
+                '{"copilot": {"phase_overrides": []}}',
+                "copilot.phase_overrides must be an object",
+            ),
+            (
+                "bad-phase-override.jsonc",
+                '{"copilot": {"phase_overrides": {"validation": []}}}',
+                "copilot.phase_overrides.validation must be an object",
+            ),
+            (
+                "bad-phase-model.jsonc",
+                '{"copilot": {"phase_overrides": {"validation": {"model": 5}}}}',
+                "copilot.phase_overrides.validation.model must be a string or null",
+            ),
+            (
+                "bad-phase-effort.jsonc",
+                '{"copilot": {"phase_overrides": {"validation": {"reasoning_effort": "extreme"}}}}',
+                "copilot.phase_overrides.validation.reasoning_effort must be one of",
+            ),
+            (
+                "bad-phase-key.jsonc",
+                '{"copilot": {"phase_overrides": {"validation": {"effort": "low"}}}}',
+                "Unknown config key 'copilot.phase_overrides.validation.effort'",
+            ),
             ("bad-comment.jsonc", '{"runner": "dry-run" /* unterminated', "Unterminated block comment"),
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -522,6 +589,9 @@ class ConfigTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             config = load_config()
         self.assertEqual(config.copilot_permission_mode, "phase")
+        self.assertIsNone(config.copilot_model)
+        self.assertIsNone(config.copilot_reasoning_effort)
+        self.assertEqual(config.copilot_phase_overrides, {})
         self.assertNotIn("--yolo", config.copilot_args)
 
     def test_copilot_permission_mode_can_use_yolo_escape_hatch(self) -> None:
