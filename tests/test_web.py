@@ -18,6 +18,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
+import agent_team.cli as cli_module
 import agent_team.web as web_module
 from agent_team.cli import build_parser
 from agent_team.config import AppConfig
@@ -86,6 +87,11 @@ class WebTests(unittest.TestCase):
         )
         with urllib.request.urlopen(request, timeout=5) as response:
             return response.read().decode("utf-8")
+
+    def write_cli_config(self, payload: dict[str, object]) -> Path:
+        path = self.home / "cli-config.jsonc"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
 
     def test_create_issue_dashboard_and_list_render_escaped_issue(self) -> None:
         html = self.post(
@@ -2480,6 +2486,73 @@ setTimeout(() => {{
         args = build_parser().parse_args(["web", "--web-workers", "3"])
         self.assertEqual(args.web_workers, 3)
 
+    def test_cli_top_level_config_argument_is_parsed_before_subcommand(self) -> None:
+        args = build_parser().parse_args(["--config", "agent-team.config.jsonc", "init"])
+        self.assertEqual(args.config, "agent-team.config.jsonc")
+        self.assertEqual(args.command, "init")
+
+    def test_cli_web_uses_config_defaults_when_flags_are_omitted(self) -> None:
+        config_path = self.write_cli_config(
+            {
+                "home": str(self.home / "cli-web-state"),
+                "runner": "dry-run",
+                "web": {
+                    "host": "127.0.0.2",
+                    "port": 9001,
+                    "web_workers": 3,
+                    "unsafe_allow_remote": True,
+                },
+            }
+        )
+
+        with mock.patch.object(cli_module, "serve_web", return_value=0) as serve:
+            exit_code = cli_module.main(["--config", str(config_path), "web"])
+
+        self.assertEqual(exit_code, 0)
+        called_config, host, port, workers, unsafe = serve.call_args.args
+        self.assertEqual(called_config.web_host, "127.0.0.2")
+        self.assertEqual(host, "127.0.0.2")
+        self.assertEqual(port, 9001)
+        self.assertEqual(workers, 3)
+        self.assertTrue(unsafe)
+
+    def test_cli_web_flags_override_config_defaults(self) -> None:
+        config_path = self.write_cli_config(
+            {
+                "home": str(self.home / "cli-web-override-state"),
+                "runner": "dry-run",
+                "web": {
+                    "host": "127.0.0.2",
+                    "port": 9001,
+                    "web_workers": 3,
+                    "unsafe_allow_remote": True,
+                },
+            }
+        )
+
+        with mock.patch.object(cli_module, "serve_web", return_value=0) as serve:
+            exit_code = cli_module.main(
+                [
+                    "--config",
+                    str(config_path),
+                    "web",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    "0",
+                    "--web-workers",
+                    "2",
+                    "--no-unsafe-allow-remote",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        _, host, port, workers, unsafe = serve.call_args.args
+        self.assertEqual(host, "127.0.0.1")
+        self.assertEqual(port, 0)
+        self.assertEqual(workers, 2)
+        self.assertFalse(unsafe)
+
     def test_cli_serve_help_includes_web_and_worker_options(self) -> None:
         output = io.StringIO()
         with self.assertRaises(SystemExit) as caught, contextlib.redirect_stdout(output):
@@ -2495,6 +2568,48 @@ setTimeout(() => {{
             "--unsafe-allow-remote",
         ):
             self.assertIn(option, help_text)
+
+    def test_cli_serve_uses_config_defaults_and_cli_overrides(self) -> None:
+        config_path = self.write_cli_config(
+            {
+                "home": str(self.home / "cli-serve-state"),
+                "runner": "dry-run",
+                "web": {
+                    "host": "127.0.0.2",
+                    "port": 9002,
+                    "web_workers": 3,
+                    "unsafe_allow_remote": False,
+                },
+                "worker": {
+                    "worker_concurrency": 4,
+                    "worker_interval_seconds": 15,
+                },
+            }
+        )
+
+        with mock.patch.object(cli_module, "serve_web_and_worker", return_value=0) as serve:
+            exit_code = cli_module.main(
+                [
+                    "--config",
+                    str(config_path),
+                    "serve",
+                    "--port",
+                    "0",
+                    "--worker-concurrency",
+                    "2",
+                    "--unsafe-allow-remote",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        called_config = serve.call_args.args[0]
+        self.assertEqual(called_config.worker_concurrency, 4)
+        self.assertEqual(serve.call_args.kwargs["host"], "127.0.0.2")
+        self.assertEqual(serve.call_args.kwargs["port"], 0)
+        self.assertEqual(serve.call_args.kwargs["web_workers"], 3)
+        self.assertEqual(serve.call_args.kwargs["worker_concurrency"], 2)
+        self.assertEqual(serve.call_args.kwargs["interval_seconds"], 15)
+        self.assertTrue(serve.call_args.kwargs["unsafe_allow_remote"])
 
     def test_web_rejects_non_loopback_bind_without_explicit_unsafe_opt_in(self) -> None:
         with self.assertRaises(ValueError):
