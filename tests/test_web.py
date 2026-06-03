@@ -844,6 +844,35 @@ class WebTests(unittest.TestCase):
         self.assertIn("Fallback merge summary &lt;ok&gt;", html)
         self.assertNotIn("Fallback <description>.", html)
 
+    def test_closed_pull_request_synopsis_prefers_provider_closure_time(self) -> None:
+        issue = self.store.create_issue("closed pr issue", "desc", ready=True)
+        self.artifacts.write_pull_request_metadata(
+            issue.id,
+            {
+                "provider": "github",
+                "remote_name": "origin",
+                "source_branch": "agent-team/issue-1",
+                "target_branch": "main",
+                "head_commit": "a" * 40,
+                "url": "https://github.com/owner/repo/pull/7",
+                "number": 7,
+                "id": "7",
+                "pr_status": "MERGED",
+                "final_status": "merged",
+                "finalized_at": "2026-01-01T00:00:00+00:00",
+                "merged_at": "2026-01-03T00:00:00+00:00",
+                "closed_at": "2026-01-03T00:00:00+00:00",
+            },
+        )
+        self._close_with_merge(issue.id, "merge-pr", "Opened pull request")
+
+        payload, _headers = self.get_json(f"/api/issues/{issue.id}")
+        synopsis = payload["closed_synopsis"]
+
+        self.assertIsNotNone(synopsis)
+        self.assertEqual(synopsis["completed_at"], "2026-01-03T00:00:00+00:00")
+        self.assertEqual(synopsis["pull_request"]["status"], "merged")
+
     def test_issue_detail_surfaces_blocked_run_reason(self) -> None:
         issue = self.store.create_issue("blocked run issue", "desc", ready=True)
         self._block_with_run(

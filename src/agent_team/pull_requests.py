@@ -89,8 +89,6 @@ class PullRequestStatusSnapshot:
             "final_status": final_status,
             "raw_status": self.raw,
         }
-        if self.head_sha is not None:
-            updates["head_commit"] = self.head_sha
         if self.closed_at is not None:
             updates["closed_at"] = self.closed_at
         if self.merged_at is not None:

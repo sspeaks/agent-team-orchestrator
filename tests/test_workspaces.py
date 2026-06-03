@@ -927,6 +927,44 @@ class WorkspaceManagerTests(unittest.TestCase):
 
         git.assert_not_called()
 
+    def test_push_pull_request_branch_ignores_provider_observed_head_for_ownership(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        selected_remote = _SelectedRemote(
+            remote=PullRequestRemote(
+                provider="github",
+                remote_name="origin",
+                url="https://github.com/owner/repo.git",
+                repo="repo",
+                owner="owner",
+            ),
+            push_url="https://github.com/owner/repo.git",
+        )
+        source_branch = "agent-team/issue-1"
+        old_owned_head = "a" * 40
+        provider_observed_head = "b" * 40
+        integrated_head = self._git(info.worktree_root, "rev-parse", "HEAD")
+        self.artifacts.write_pull_request_metadata(
+            issue.id,
+            {
+                "provider": "github",
+                "remote_name": "origin",
+                "remote_url": "https://github.com/owner/repo.git",
+                "remote_identity": ["github", "owner", "repo"],
+                "source_branch": source_branch,
+                "head_commit": old_owned_head,
+                "last_head_commit": provider_observed_head,
+            },
+        )
+
+        with patch.object(self.manager, "_remote_branch_head", return_value=provider_observed_head):
+            with patch.object(self.manager, "_git_remote", return_value="") as git:
+                with self.assertRaisesRegex(WorkspaceError, "remote branch changes made after PR finalization"):
+                    self.manager._push_pull_request_branch(issue, info, selected_remote, source_branch, integrated_head)
+
+        git.assert_not_called()
+
     def test_push_pull_request_branch_blocks_owned_retry_after_remote_repository_changes(self) -> None:
         issue = self._issue(1, self.repo)
         info = self.manager.prepare(issue)
@@ -1432,6 +1470,54 @@ class WorkspaceManagerTests(unittest.TestCase):
         self.assertIsNotNone(repair_metadata)
         self.assertEqual(repair_metadata["hosted_pull_request_target_sync_status"], "synced")
         self.assertEqual(repair_metadata["hosted_pull_request_target_sync_commit"], result.worktree_head)
+
+    def test_prepare_pull_request_conflict_workspace_blocks_stale_conflicted_worktree(self) -> None:
+        issue, metadata, snapshot, bare_remote = self._hosted_pull_request_repair_fixture(conflict=True)
+        with patch.object(self.manager, "_git_remote", side_effect=self._fetch_from_bare_remote(bare_remote)):
+            self.manager.prepare_pull_request_conflict_workspace(issue, metadata, snapshot)
+
+        self._git(self.repo, "checkout", "agent-team/issue-1")
+        self._commit_file(self.repo, "new.txt", "new remote work\n")
+        new_head = self._git(self.repo, "rev-parse", "HEAD")
+        self._git(self.repo, "push", str(bare_remote), "HEAD:agent-team/issue-1")
+        stale_snapshot = PullRequestStatusSnapshot(
+            **{
+                **snapshot.__dict__,
+                "head_sha": new_head,
+                "checked_at": "2026-01-02T00:00:00+00:00",
+            }
+        )
+
+        with patch.object(self.manager, "_git_remote", side_effect=self._fetch_from_bare_remote(bare_remote)):
+            with self.assertRaisesRegex(WorkspaceError, "Refusing to reuse stale conflict markers"):
+                self.manager.prepare_pull_request_conflict_workspace(issue, metadata, stale_snapshot)
+
+        info = self.manager.existing(issue)
+        self.assertIn("<<<<<<<", (info.worktree_root / "README.md").read_text(encoding="utf-8"))
+
+    def test_merge_recovery_prefers_hosted_repair_workspace_over_stale_pr_metadata(self) -> None:
+        issue, metadata, snapshot, bare_remote = self._hosted_pull_request_repair_fixture(conflict=True)
+        with patch.object(self.manager, "_git_remote", side_effect=self._fetch_from_bare_remote(bare_remote)):
+            self.manager.prepare_pull_request_conflict_workspace(issue, metadata, snapshot)
+        stale_pr_metadata = {
+            **metadata,
+            "cleanup_removed": True,
+            "finalized_at": "2026-01-01T00:00:00+00:00",
+            "mode": "pull_request",
+            "worktree_head": metadata["head_commit"],
+            "pr_status": "OPEN",
+            "is_existing": False,
+            "raw": {"number": 7},
+        }
+        self.artifacts.write_pull_request_metadata(issue.id, stale_pr_metadata)
+
+        recovery = self.manager.recover_interrupted_merge(issue)
+
+        self.assertEqual(recovery.next_phase, "ready_for_merge_conflict_resolution")
+        self.assertEqual(recovery.run_status, "interrupted")
+        self.assertIn("README.md", recovery.artifact_markdown)
+        self.assertIsNotNone(self.artifacts.read_workspace_metadata(issue.id))
+        self.assertTrue(self.manager.existing(issue).worktree_root.is_dir())
 
     def test_merge_recovery_routes_existing_conflicts_to_resolution(self) -> None:
         issue = self._issue(1, self.repo)

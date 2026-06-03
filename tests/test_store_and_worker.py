@@ -3176,7 +3176,9 @@ class StoreAndWorkerTests(unittest.TestCase):
     def test_pull_request_monitor_keeps_open_pr_waiting(self) -> None:
         issue = self._issue_awaiting_pr_closure()
         self._write_waiting_pr_metadata(issue.id)
-        snapshot = self._pr_snapshot(status="OPEN", is_open=True)
+        original_head = "a" * 40
+        observed_head = "b" * 40
+        snapshot = self._pr_snapshot(status="OPEN", is_open=True, head_sha=observed_head)
 
         with patch("agent_team.orchestrator.get_pull_request_status", return_value=snapshot):
             results = Orchestrator(self.store, self.artifacts, self.config).monitor_pull_requests()
@@ -3191,6 +3193,8 @@ class StoreAndWorkerTests(unittest.TestCase):
         self.assertIsNotNone(metadata)
         assert metadata is not None
         self.assertEqual(metadata["last_status"], "OPEN")
+        self.assertEqual(metadata["head_commit"], original_head)
+        self.assertEqual(metadata["last_head_commit"], observed_head)
         self.assertTrue(metadata["last_is_open"])
         self.assertNotIn(issue.id, {ready.id for ready in self.store.list_next_ready_issues(10)})
 
@@ -3896,6 +3900,7 @@ print(artifact)
         is_merged: bool = False,
         has_conflicts: bool = False,
         merged_at: str | None = None,
+        head_sha: str = "a" * 40,
     ) -> PullRequestStatusSnapshot:
         return PullRequestStatusSnapshot(
             provider="github",
@@ -3906,7 +3911,7 @@ print(artifact)
             is_closed=is_closed,
             is_merged=is_merged,
             has_conflicts=has_conflicts,
-            head_sha="a" * 40,
+            head_sha=head_sha,
             url="https://github.com/owner/repo/pull/7",
             raw={"state": status},
             id="7",

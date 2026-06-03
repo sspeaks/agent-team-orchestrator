@@ -1716,8 +1716,10 @@ def _closed_synopsis_payload(
     merge_summary = merge_summary or merge_excerpt
 
     completed_at = None
+    if pull_request_metadata:
+        completed_at = pull_request_metadata.get("merged_at") or pull_request_metadata.get("closed_at")
     if latest_merge is not None:
-        completed_at = latest_merge["completed_at"] or latest_merge["started_at"]
+        completed_at = completed_at or latest_merge["completed_at"] or latest_merge["started_at"]
     if not completed_at and merged_metadata:
         completed_at = merged_metadata.get("merged_at")
     if not completed_at and pull_request_metadata:
