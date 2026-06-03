@@ -1133,6 +1133,54 @@ class WorkspaceManagerTests(unittest.TestCase):
         self.assertIn("ssh://[redacted]@github.com", message)
         self.assertNotIn("super-secret", message)
 
+    def test_git_remote_error_redacts_standalone_github_tokens(self) -> None:
+        token = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="",
+            stderr=f"fatal: Authentication failed with token {token}",
+        )
+        with patch("agent_team.workspaces.subprocess.run", return_value=completed):
+            with self.assertRaises(WorkspaceError) as caught:
+                self.manager._git_remote(
+                    self.repo,
+                    "ls-remote",
+                    "https://github.com/owner/repo.git",
+                    "agent-team/issue-1",
+                )
+
+        message = str(caught.exception)
+        self.assertIn("[redacted]", message)
+        self.assertNotIn(token, message)
+
+    def test_git_remote_error_redacts_authorization_header_secrets(self) -> None:
+        bearer_token = "gho_abcdefghijklmnopqrstuvwxyz123456"
+        basic_secret = "dXNlcjpzdXBlci1zZWNyZXQ="
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="",
+            stderr=(
+                f"fatal: remote sent Authorization: Bearer {bearer_token}\n"
+                f"trace: http.extraheader=Authorization: Basic {basic_secret}"
+            ),
+        )
+        with patch("agent_team.workspaces.subprocess.run", return_value=completed):
+            with self.assertRaises(WorkspaceError) as caught:
+                self.manager._git_remote(
+                    self.repo,
+                    "ls-remote",
+                    "https://github.com/owner/repo.git",
+                    "agent-team/issue-1",
+                )
+
+        message = str(caught.exception)
+        self.assertIn("Authorization: Bearer [redacted]", message)
+        self.assertIn("Authorization: Basic [redacted]", message)
+        self.assertNotIn(bearer_token, message)
+        self.assertNotIn(basic_secret, message)
+
     def test_push_pull_request_branch_runs_git_push_non_interactively_with_timeout(self) -> None:
         issue = self._issue(1, self.repo)
         info = self.manager.prepare(issue)

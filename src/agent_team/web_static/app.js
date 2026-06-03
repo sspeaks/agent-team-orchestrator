@@ -449,6 +449,69 @@
     return paragraph;
   }
 
+  function pullRequestMonitoringLabel(metadata) {
+    var number = metadata && (metadata.number || metadata.id);
+    return number ? "Pull request #" + number : "Pull request";
+  }
+
+  function pullRequestMonitoringValue(value) {
+    return value === null || value === undefined || value === "" ? "none" : String(value);
+  }
+
+  function renderPullRequestMonitoring(container, metadata) {
+    if (!container) {
+      return;
+    }
+    if (!metadata) {
+      container.replaceChildren();
+      container.hidden = true;
+      container.className = "";
+      container.removeAttribute("data-pull-request-monitoring-signature");
+      return;
+    }
+
+    var nextSignature = JSON.stringify(metadata);
+    if (container.getAttribute("data-pull-request-monitoring-signature") === nextSignature) {
+      return;
+    }
+
+    container.hidden = false;
+    container.className = "panel priority pull-request-monitoring-panel";
+    var label = pullRequestMonitoringLabel(metadata);
+    var linkParagraph = el("p");
+    if (isSafeHttpUrl(metadata.url)) {
+      var link = el("a", null, label);
+      link.href = metadata.url;
+      link.rel = "noreferrer";
+      linkParagraph.append(link);
+    } else {
+      linkParagraph.append(document.createTextNode(label));
+    }
+
+    var fields = [
+      ["Provider", metadata.provider],
+      ["Status", metadata.last_status || metadata.pr_status],
+      ["Merge state", metadata.last_merge_state],
+      ["Last checked", metadata.last_status_check_at],
+      ["Source branch", metadata.source_branch],
+      ["Target branch", metadata.target_branch],
+      ["Head commit", metadata.last_head_commit || metadata.head_commit],
+      ["Conflict detected", metadata.conflict_detected_at],
+      ["Conflict comment", metadata.conflict_comment_posted_at]
+    ];
+    var dl = el("dl", "metadata");
+    fields.forEach(function (field) {
+      dl.append(el("dt", null, field[0]), el("dd", null, pullRequestMonitoringValue(field[1])));
+    });
+
+    var nodes = [el("h2", null, "Pull request monitoring"), linkParagraph, dl];
+    if (metadata.conflict_comment_error) {
+      nodes.push(el("p", "blocked-reason-summary", "Conflict comment warning: " + metadata.conflict_comment_error));
+    }
+    container.replaceChildren.apply(container, nodes);
+    container.setAttribute("data-pull-request-monitoring-signature", nextSignature);
+  }
+
   function renderField(field) {
     var control;
     if (field.type === "textarea") {
@@ -644,6 +707,16 @@
       window.location.reload();
       return;
     }
+    if (nextPhase === "awaiting_pr_closure" && currentPhase !== "awaiting_pr_closure") {
+      setLiveStatus("Pull request monitoring is ready; refreshing page layout.", false);
+      window.location.reload();
+      return;
+    }
+    if (currentPhase === "awaiting_pr_closure" && nextPhase !== "awaiting_pr_closure") {
+      setLiveStatus("Pull request monitoring completed; refreshing page layout.", false);
+      window.location.reload();
+      return;
+    }
     setText("[data-issue-title]", data.issue.title);
     setText("[data-issue-phase]", nextPhase);
     setText("[data-issue-phase-label]", phaseLabel(nextPhase));
@@ -659,6 +732,7 @@
     setText("[data-next-action]", data.next_action);
     renderBlockedReason(document.querySelector("[data-blocked-reason]"), data.blocked_reason);
     renderClosedSynopsis(document.querySelector("[data-closed-synopsis]"), data.closed_synopsis);
+    renderPullRequestMonitoring(document.querySelector("[data-pull-request-monitoring]"), data.pull_request_monitoring);
     renderTimeline(document.querySelector("[data-phase-timeline]"), data.phase_timeline);
     var events = document.querySelector("[data-issue-events]");
     if (events) renderEvents(events, data.recent_events);

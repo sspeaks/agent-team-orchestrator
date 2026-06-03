@@ -78,11 +78,24 @@ class Orchestrator:
             )
             if issue is None:
                 continue
+            result: ProcessResult | None = None
             try:
-                results.append(self._monitor_pull_request_issue(issue, monitor_id))
+                with _PullRequestMonitorLease(
+                    self.store,
+                    issue.id,
+                    self.owner,
+                    monitor_id,
+                    self.config.lock_ttl_seconds,
+                ):
+                    result = self._monitor_pull_request_issue(issue, monitor_id)
+                results.append(result)
+            except _StalePullRequestMonitor as exc:
+                result = ProcessResult(issue.id, monitor_id, "pr_monitor", "stale", None, str(exc), None)
+                results.append(result)
             finally:
                 self.store.release_lock(issue.id, self.owner, monitor_id)
-                self.artifacts.write_issue_snapshot(self.store.get_issue(issue.id))
+                if result is None or result.status != "stale":
+                    self.artifacts.write_issue_snapshot(self.store.get_issue(issue.id))
         return results
 
     def recover_interrupted_runs(self) -> list[RecoveryResult]:
@@ -626,7 +639,7 @@ class Orchestrator:
         except PullRequestError as exc:
             return self._block_pull_request_monitor(issue, monitor_id, str(exc))
         status_changed = _pull_request_snapshot_changed(metadata, snapshot)
-        metadata = self._update_pull_request_status_metadata(issue, metadata, snapshot)
+        metadata = self._update_pull_request_status_metadata(issue, metadata, snapshot, monitor_id)
         if snapshot.is_closed:
             return self._close_issue_after_pull_request(issue, monitor_id, metadata, snapshot)
         if not snapshot.has_conflicts:
@@ -638,6 +651,7 @@ class Orchestrator:
         issue: Issue,
         metadata: dict[str, object],
         snapshot: PullRequestStatusSnapshot,
+        monitor_id: str,
     ) -> dict[str, object]:
         updates = snapshot.metadata_updates()
         if snapshot.is_closed:
@@ -646,6 +660,7 @@ class Orchestrator:
             updates["merged_at"] = snapshot.merged_at or snapshot.checked_at
         if snapshot.has_conflicts and not metadata.get("conflict_detected_at"):
             updates["conflict_detected_at"] = snapshot.checked_at
+        self._ensure_pull_request_monitor_current(issue.id, monitor_id)
         self.artifacts.update_pull_request_metadata(issue.id, updates)
         return {**metadata, **updates}
 
@@ -658,7 +673,9 @@ class Orchestrator:
     ) -> ProcessResult:
         final_status = "merged" if snapshot.is_merged else "closed"
         summary = f"Hosted pull request for issue {issue.id} is {final_status}; closing the local issue."
+        self._ensure_pull_request_monitor_current(issue.id, monitor_id)
         self.store.record_event(issue.id, "pull_request.closed", summary, monitor_id)
+        self._ensure_pull_request_monitor_current(issue.id, monitor_id)
         self.artifacts.append_history(
             issue.id,
             {
@@ -669,6 +686,7 @@ class Orchestrator:
                 "pull_request": _pull_request_history(metadata, snapshot),
             },
         )
+        self._ensure_pull_request_monitor_current(issue.id, monitor_id)
         self.store.transition_issue(issue.id, "done", monitor_id, summary)
         return ProcessResult(issue.id, monitor_id, "pr_monitor", "success", "done", summary, None)
 
@@ -685,7 +703,9 @@ class Orchestrator:
             f" with status {snapshot.status or 'unknown'}."
         )
         if status_changed:
+            self._ensure_pull_request_monitor_current(issue.id, monitor_id)
             self.store.record_event(issue.id, "pull_request.checked", summary, monitor_id)
+            self._ensure_pull_request_monitor_current(issue.id, monitor_id)
             self.artifacts.append_history(
                 issue.id,
                 {
@@ -707,6 +727,7 @@ class Orchestrator:
     ) -> ProcessResult:
         comment_updates: dict[str, object] = {}
         try:
+            self._ensure_pull_request_monitor_current(issue.id, monitor_id)
             comment = ensure_pull_request_conflict_comment(
                 metadata,
                 self._pull_request_conflict_comment_body(issue, metadata, snapshot),
@@ -715,6 +736,7 @@ class Orchestrator:
             comment_updates = {
                 "conflict_comment_error": str(exc),
             }
+            self._ensure_pull_request_monitor_current(issue.id, monitor_id)
             self.store.record_event(
                 issue.id,
                 "pull_request.conflict_comment_failed",
@@ -729,15 +751,18 @@ class Orchestrator:
                 "conflict_comment_url": comment.url,
                 "conflict_comment_marker": comment.marker,
             }
+            self._ensure_pull_request_monitor_current(issue.id, monitor_id)
             self.store.record_event(
                 issue.id,
                 "pull_request.conflict_comment_posted",
                 "Posted or updated pull request conflict ownership comment.",
                 monitor_id,
             )
+        self._ensure_pull_request_monitor_current(issue.id, monitor_id)
         self.artifacts.update_pull_request_metadata(issue.id, comment_updates)
         metadata = {**metadata, **comment_updates}
         try:
+            self._ensure_pull_request_monitor_current(issue.id, monitor_id)
             merge_result = self._workspace_manager().prepare_pull_request_conflict_workspace(
                 issue,
                 metadata,
@@ -750,8 +775,11 @@ class Orchestrator:
                 f"Hosted pull request conflict workspace preparation failed: {exc}",
             )
         next_phase = "ready_for_merge_conflict_resolution" if merge_result.status == "conflicts" else "ready_for_validation"
+        self._ensure_pull_request_monitor_current(issue.id, monitor_id)
         self.artifacts.archive_phase_artifact_before_run(issue.id, "merge", monitor_id)
+        self._ensure_pull_request_monitor_current(issue.id, monitor_id)
         artifact_path = self.artifacts.write_phase_artifact(issue.id, "merge", monitor_id, merge_result.artifact_markdown())
+        self._ensure_pull_request_monitor_current(issue.id, monitor_id)
         self.artifacts.append_history(
             issue.id,
             {
@@ -763,15 +791,20 @@ class Orchestrator:
                 "pull_request": _pull_request_history(metadata, snapshot),
             },
         )
+        self._ensure_pull_request_monitor_current(issue.id, monitor_id)
         self.store.record_event(issue.id, "pull_request.conflict_detected", merge_result.summary, monitor_id)
+        self._ensure_pull_request_monitor_current(issue.id, monitor_id)
         self.store.transition_issue(issue.id, next_phase, monitor_id, merge_result.summary)
         return ProcessResult(issue.id, monitor_id, "pr_monitor", "success", next_phase, merge_result.summary, artifact_path)
 
     def _block_pull_request_monitor(self, issue: Issue, monitor_id: str, message: str) -> ProcessResult:
         blocked_summary = summarize_blocked_reason(message)
         artifact = f"# Pull Request Monitoring Blocked\n\n{message}\n\nBlocked summary: {blocked_summary}\nRecommendation: `blocked`"
+        self._ensure_pull_request_monitor_current(issue.id, monitor_id)
         self.artifacts.archive_phase_artifact_before_run(issue.id, "merge", monitor_id)
+        self._ensure_pull_request_monitor_current(issue.id, monitor_id)
         artifact_path = self.artifacts.write_phase_artifact(issue.id, "merge", monitor_id, artifact)
+        self._ensure_pull_request_monitor_current(issue.id, monitor_id)
         self.artifacts.append_history(
             issue.id,
             {
@@ -783,8 +816,22 @@ class Orchestrator:
                 "blocked_summary": blocked_summary,
             },
         )
+        self._ensure_pull_request_monitor_current(issue.id, monitor_id)
         self.store.transition_issue(issue.id, "blocked", monitor_id, message, blocked_summary=blocked_summary)
         return ProcessResult(issue.id, monitor_id, "pr_monitor", "blocked", "blocked", message, artifact_path)
+
+    def _ensure_pull_request_monitor_current(self, issue_id: int, monitor_id: str) -> Issue:
+        issue = self.store.refresh_pr_monitor_issue(
+            issue_id,
+            self.owner,
+            self.config.lock_ttl_seconds,
+            monitor_id,
+        )
+        if issue is None:
+            raise _StalePullRequestMonitor(
+                f"Pull request monitor {monitor_id} is no longer current for issue {issue_id}; stopping stale monitor."
+            )
+        return issue
 
     @staticmethod
     def _pull_request_conflict_comment_body(
@@ -1003,6 +1050,30 @@ class _IssueLockHeartbeat:
             if refreshed is None:
                 self._stop.set()
                 return
+
+
+class _StalePullRequestMonitor(RuntimeError):
+    pass
+
+
+class _PullRequestMonitorLease(_IssueLockHeartbeat):
+    def __init__(
+        self,
+        store: IssueStore,
+        issue_id: int,
+        owner: str,
+        monitor_id: str,
+        ttl_seconds: int,
+    ) -> None:
+        super().__init__(
+            store,
+            issue_id,
+            owner,
+            monitor_id,
+            ttl_seconds,
+            expected_phase="awaiting_pr_closure",
+            thread_name=f"agent-team-pr-monitor-lease-{issue_id}",
+        )
 
 
 class _MergeRecoveryLease(_IssueLockHeartbeat):

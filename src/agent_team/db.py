@@ -645,9 +645,10 @@ class IssueStore:
                 """,
                 issue_scope,
             ).fetchall()
+            finalized_scope = [*issue_scope, *issue_scope]
             recently_merged = conn.execute(
                 f"""
-                WITH ranked_merges AS (
+                WITH finalizations AS (
                     SELECT
                         issues.id AS issue_id,
                         issues.title,
@@ -660,13 +661,7 @@ class IssueStore:
                         runs.started_at,
                         runs.completed_at,
                         runs.summary,
-                        runs.next_phase,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY issues.id
-                            ORDER BY COALESCE(runs.completed_at, runs.started_at) DESC,
-                                     runs.started_at DESC,
-                                     runs.id DESC
-                        ) AS row_num
+                        runs.next_phase
                     FROM runs
                     JOIN issues ON issues.id = runs.issue_id
                     WHERE issues.status = 'closed'
@@ -674,15 +669,59 @@ class IssueStore:
                       AND runs.phase = 'merge'
                       AND runs.status = 'success'
                       {joined_and}
+                    UNION ALL
+                    SELECT
+                        issues.id AS issue_id,
+                        issues.title,
+                        issues.repo_path,
+                        issues.updated_at,
+                        events.run_id AS run_id,
+                        'pr_monitor' AS phase,
+                        'pull-request-monitor' AS runner,
+                        'success' AS status,
+                        NULL AS started_at,
+                        events.created_at AS completed_at,
+                        events.message AS summary,
+                        'done' AS next_phase
+                    FROM events
+                    JOIN issues ON issues.id = events.issue_id
+                    WHERE issues.status = 'closed'
+                      AND issues.phase = 'done'
+                      AND events.event_type = 'pull_request.closed'
+                      {joined_and}
+                ),
+                ranked_finalizations AS (
+                    SELECT
+                        issue_id,
+                        title,
+                        repo_path,
+                        updated_at,
+                        run_id,
+                        phase,
+                        runner,
+                        status,
+                        started_at,
+                        completed_at,
+                        summary,
+                        next_phase,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY issue_id
+                            ORDER BY COALESCE(completed_at, started_at, updated_at) DESC,
+                                     COALESCE(started_at, completed_at, updated_at) DESC,
+                                     COALESCE(run_id, '') DESC
+                        ) AS row_num
+                    FROM finalizations
                 )
                 SELECT issue_id, title, repo_path, updated_at, run_id, phase, runner, status,
                        started_at, completed_at, summary, next_phase
-                FROM ranked_merges
+                FROM ranked_finalizations
                 WHERE row_num = 1
-                ORDER BY COALESCE(completed_at, started_at) DESC, started_at DESC, run_id DESC
+                ORDER BY COALESCE(completed_at, started_at, updated_at) DESC,
+                         COALESCE(started_at, completed_at, updated_at) DESC,
+                         COALESCE(run_id, '') DESC
                 LIMIT 10
                 """,
-                issue_scope,
+                finalized_scope,
             ).fetchall()
         approval_issues = awaiting_plan_approval + awaiting_merge_approval
         approval_count = int(awaiting_plan_approval_count["count"]) + int(awaiting_merge_approval_count["count"])
@@ -905,14 +944,20 @@ class IssueStore:
 
     def release_lock(self, issue_id: int, owner: str, run_id: str | None = None) -> None:
         now = utc_now_iso()
+        run_guard = ""
+        params: list[object] = [now, issue_id, owner]
+        if run_id is not None:
+            run_guard = "AND current_run_id = ?"
+            params.append(run_id)
         with self.connect() as conn:
             cur = conn.execute(
-                """
+                f"""
                 UPDATE issues
                 SET lock_owner = NULL, lock_expires_at = NULL, current_run_id = NULL, updated_at = ?
                 WHERE id = ? AND lock_owner = ?
+                  {run_guard}
                 """,
-                (now, issue_id, owner),
+                params,
             )
             if cur.rowcount == 1:
                 self._add_event(conn, issue_id, run_id, "lock.released", f"{owner} released lock")
@@ -928,6 +973,15 @@ class IssueStore:
         ):
             return None
         return self.get_issue(issue_id)
+
+    def refresh_pr_monitor_issue(self, issue_id: int, owner: str, ttl_seconds: int, monitor_id: str) -> Issue | None:
+        return self.refresh_issue_lock(
+            issue_id,
+            owner,
+            ttl_seconds,
+            expected_phase="awaiting_pr_closure",
+            expected_run_id=monitor_id,
+        )
 
     def record_event(self, issue_id: int, event_type: str, message: str, run_id: str | None = None) -> None:
         with self.connect() as conn:

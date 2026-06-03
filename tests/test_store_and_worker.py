@@ -3246,6 +3246,42 @@ class StoreAndWorkerTests(unittest.TestCase):
         self.assertEqual(metadata["merged_at"], "2026-01-02T00:00:00+00:00")
         self.assertEqual(metadata["pr_status"], "MERGED")
 
+    def test_pull_request_monitor_stops_after_losing_claim(self) -> None:
+        issue = self._issue_awaiting_pr_closure()
+        self._write_waiting_pr_metadata(issue.id)
+        snapshot = self._pr_snapshot(status="MERGED", is_closed=True, is_merged=True, merged_at="2026-01-02T00:00:00+00:00")
+
+        def steal_claim(metadata: dict[str, object]) -> PullRequestStatusSnapshot:
+            with self.store.connect() as conn:
+                conn.execute(
+                    "UPDATE issues SET lock_expires_at = ? WHERE id = ?",
+                    ("2000-01-01T00:00:00+00:00", issue.id),
+                )
+            stolen = self.store.claim_pr_monitor_issue(issue.id, "newer-worker", 60, "newer-monitor")
+            self.assertIsNotNone(stolen)
+            return snapshot
+
+        with patch("agent_team.orchestrator.get_pull_request_status", side_effect=steal_claim):
+            results = Orchestrator(self.store, self.artifacts, self.config).monitor_pull_requests()
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, "stale")
+        updated = self.store.get_issue(issue.id)
+        self.assertEqual(updated.phase, "awaiting_pr_closure")
+        self.assertEqual(updated.status, "open")
+        self.assertEqual(updated.lock_owner, "newer-worker")
+        self.assertEqual(updated.current_run_id, "newer-monitor")
+        metadata = self.artifacts.read_pull_request_metadata(issue.id)
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertEqual(metadata["pr_status"], "OPEN")
+        self.assertNotIn("last_status_check_at", metadata)
+        self.assertFalse(self.artifacts.phase_artifact_path(issue.id, "merge").exists())
+        self.assertNotIn(
+            "pull_request.closed",
+            {event["event_type"] for event in self.store.list_events(issue.id)},
+        )
+
     def test_pull_request_monitor_comments_and_routes_conflicts(self) -> None:
         issue = self._issue_awaiting_pr_closure()
         self._write_waiting_pr_metadata(issue.id)

@@ -173,11 +173,14 @@ class DashboardAndConcurrencyTests(unittest.TestCase):
         repo_b = "/tmp/repo-b"
         merged_a = self.store.create_issue("merged a", "desc", repo_path=repo_a, ready=True)
         merged_b = self.store.create_issue("merged b", "desc", repo_path=repo_b, ready=True)
+        pr_finalized = self.store.create_issue("pr finalized", "desc", repo_path=repo_a, ready=True)
         open_with_merge_run = self.store.create_issue("open stray merge", "desc", repo_path=repo_a, ready=True)
         self._close_with_merge(merged_a.id, "merge-a-old", "old merge summary")
         self._close_with_merge(merged_b.id, "merge-b", "repo b merge summary")
+        self._close_with_pr(pr_finalized.id, "pr-monitor-a", "Hosted pull request for issue is merged; closing.")
         self._set_run_times("merge-a-old", "2026-01-01T00:00:00+00:00", "2026-01-01T00:01:00+00:00")
         self._set_run_times("merge-b", "2026-01-02T00:00:00+00:00", "2026-01-02T00:01:00+00:00")
+        self._set_event_time(pr_finalized.id, "pull_request.closed", "2026-01-06T00:00:00+00:00")
         self._insert_run(
             "merge-a-failed-later",
             merged_a.id,
@@ -211,13 +214,17 @@ class DashboardAndConcurrencyTests(unittest.TestCase):
         summary_all = self.store.dashboard_summary()
         output = render_dashboard(self.store)
 
-        self.assertEqual([row["issue_id"] for row in summary_a["recently_merged"]], [merged_a.id])
-        self.assertEqual(summary_a["recently_merged"][0]["run_id"], "merge-a-newer")
-        self.assertEqual(summary_a["recently_merged"][0]["summary"], "newest successful merge")
+        self.assertEqual([row["issue_id"] for row in summary_a["recently_merged"]], [pr_finalized.id, merged_a.id])
+        self.assertEqual(summary_a["recently_merged"][0]["run_id"], "pr-monitor-a")
+        self.assertEqual(summary_a["recently_merged"][0]["phase"], "pr_monitor")
+        self.assertEqual(summary_a["recently_merged"][0]["completed_at"], "2026-01-06T00:00:00+00:00")
+        self.assertEqual(summary_a["recently_merged"][1]["run_id"], "merge-a-newer")
+        self.assertEqual(summary_a["recently_merged"][1]["summary"], "newest successful merge")
         self.assertEqual([row["issue_id"] for row in summary_b["recently_merged"]], [merged_b.id])
         self.assertNotIn(open_with_merge_run.id, {row["issue_id"] for row in summary_all["recently_merged"]})
         self.assertIn("Recently finalized", output)
         self.assertIn("newest successful merge", output)
+        self.assertIn("Hosted pull request for issue is merged", output)
         self.assertIn("merged a", output)
 
     def test_reset_issue_lands_in_draft_bucket_and_is_skipped_by_batch(self) -> None:
@@ -272,6 +279,33 @@ class DashboardAndConcurrencyTests(unittest.TestCase):
         self.store.complete_run(run_id, issue_id, "success", summary, None, next_phase="done")
         self.store.transition_issue(issue_id, "done", run_id)
         self.store.release_lock(issue_id, "worker", run_id)
+
+    def _close_with_pr(self, issue_id: int, monitor_id: str, summary: str) -> None:
+        self._move_to_merge_approval(issue_id)
+        self.store.transition_issue(issue_id, "ready_for_merge")
+        self.store.transition_issue(issue_id, "merging")
+        self.store.transition_issue(issue_id, "awaiting_pr_closure")
+        self.assertIsNotNone(self.store.claim_pr_monitor_issue(issue_id, "worker", 60, monitor_id))
+        self.store.record_event(issue_id, "pull_request.closed", summary, monitor_id)
+        self.store.transition_issue(issue_id, "done", monitor_id, summary)
+        self.store.release_lock(issue_id, "worker", monitor_id)
+
+    def _set_event_time(self, issue_id: int, event_type: str, created_at: str) -> None:
+        with self.store.connect() as conn:
+            conn.execute(
+                """
+                UPDATE events
+                SET created_at = ?
+                WHERE id = (
+                    SELECT id
+                    FROM events
+                    WHERE issue_id = ? AND event_type = ?
+                    ORDER BY id DESC
+                    LIMIT 1
+                )
+                """,
+                (created_at, issue_id, event_type),
+            )
 
     def _move_to_merge_approval(self, issue_id: int) -> None:
         if self.store.get_issue(issue_id).phase == "draft":

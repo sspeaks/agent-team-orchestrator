@@ -2487,16 +2487,20 @@ _CREDENTIAL_URL_RE = re.compile(
     r"\b([A-Za-z][A-Za-z0-9+.-]*://)([^/\s:@]+(?::[^/\s@]*)?@)",
     re.IGNORECASE,
 )
+_AUTH_HEADER_RE = re.compile(r"(?i)\b(authorization\s*[:=]\s*(?:bearer|basic|token)\s+)([^\s,;]+)")
 _SECRET_ASSIGNMENT_RE = re.compile(
     r"(?i)\b("
     r"access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd|pat|secret|sig|token"
     r")(\s*[:=]\s*)([^\s&#;,]+)"
 )
+_GH_TOKEN_RE = re.compile(r"\b(gh[pousr]_[A-Za-z0-9_]{20,})\b")
 
 
 def _redact_git_text(value: str) -> str:
     redacted = _CREDENTIAL_URL_RE.sub(r"\1[redacted]@", value)
-    return _SECRET_ASSIGNMENT_RE.sub(r"\1\2[redacted]", redacted)
+    redacted = _AUTH_HEADER_RE.sub(r"\1[redacted]", redacted)
+    redacted = _SECRET_ASSIGNMENT_RE.sub(r"\1\2[redacted]", redacted)
+    return _GH_TOKEN_RE.sub("[redacted]", redacted)
 
 
 def _truncate_snapshot_subject_detail(value: str) -> str:

@@ -1299,6 +1299,174 @@ class WebTests(unittest.TestCase):
         self.assertIn("Pull request #7", html)
         self.assertNotIn('href="javascript:alert(1)"', html)
 
+    def test_issue_live_updates_pull_request_monitoring_panel(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is required for the pull request monitoring JavaScript regression test")
+        script = self.get("/static/app.js")
+        base_issue = {
+            "title": "pr monitor live issue",
+            "phase": "awaiting_pr_closure",
+            "status": "open",
+            "current_run_id": None,
+            "lock_owner": None,
+            "lock_expires_at": None,
+        }
+        initial_payload = {
+            "generated_at": "first",
+            "issue": base_issue,
+            "active_job": None,
+            "closed_synopsis": None,
+            "blocked_reason": None,
+            "next_action": "Monitoring the hosted pull request.",
+            "csrf_token": "fresh-token",
+            "manager_controls": [],
+            "manager_controls_signature": "[]",
+            "phase_timeline": [],
+            "recent_events": [],
+            "recent_runs": [],
+            "artifacts": [],
+            "pull_request_monitoring": {
+                "provider": "github",
+                "source_branch": "agent-team/issue-1",
+                "target_branch": "main",
+                "head_commit": "a" * 40,
+                "last_head_commit": "b" * 40,
+                "url": "https://github.com/owner/repo/pull/7",
+                "number": 7,
+                "id": "7",
+                "pr_status": "OPEN",
+                "last_status": "OPEN",
+                "last_merge_state": "DIRTY",
+                "last_status_check_at": "2026-01-01T00:00:00+00:00",
+                "conflict_detected_at": "2026-01-01T00:00:00+00:00",
+                "conflict_comment_posted_at": None,
+                "conflict_comment_error": None,
+            },
+        }
+        updated_payload = {
+            **initial_payload,
+            "generated_at": "second",
+            "pull_request_monitoring": {
+                **initial_payload["pull_request_monitoring"],
+                "url": "javascript:alert(1)",
+                "last_status": "MERGED",
+                "last_merge_state": "CLEAN",
+                "last_status_check_at": "2026-01-02T00:00:00+00:00",
+                "conflict_comment_posted_at": "2026-01-02T00:01:00+00:00",
+                "conflict_comment_error": "provider <denied> comment",
+            },
+        }
+        test_script = f"""
+const assert = require("assert");
+const appScript = {json.dumps(script)};
+const issuePayloads = {json.dumps([initial_payload, updated_payload])};
+const logPayload = {{
+  generated_at: "now",
+  issue_id: 1,
+  log: {{ exists: false, relative_path: null, content: "", size_bytes: 0, truncated: false }}
+}};
+let issueFetches = 0;
+let issueTick = null;
+let reloadCount = 0;
+function fakeElement(tag) {{
+  return {{
+    tagName: tag,
+    className: "",
+    textContent: "",
+    children: [],
+    attrs: {{}},
+    hidden: false,
+    href: "",
+    rel: "",
+    classList: {{ toggle() {{}} }},
+    append() {{ this.children.push.apply(this.children, arguments); }},
+    replaceChildren() {{ this.children = Array.prototype.slice.call(arguments); }},
+    setAttribute(name, value) {{ this.attrs[name] = String(value); }},
+    getAttribute(name) {{ return Object.prototype.hasOwnProperty.call(this.attrs, name) ? this.attrs[name] : null; }},
+    removeAttribute(name) {{ delete this.attrs[name]; }},
+    querySelectorAll() {{ return []; }}
+  }};
+}}
+function collectText(node) {{
+  if (!node) return "";
+  if (typeof node === "string") return node;
+  return (node.textContent || "") + (node.children || []).map(collectText).join("");
+}}
+function collectLinks(node) {{
+  if (!node || typeof node === "string") return [];
+  const links = [];
+  if (node.href) links.push(node.href);
+  (node.children || []).forEach((child) => links.push.apply(links, collectLinks(child)));
+  return links;
+}}
+const monitoringPanel = fakeElement("div");
+const phaseNode = {{ textContent: "awaiting_pr_closure" }};
+const liveStatus = {{ textContent: "", classList: {{ toggle() {{}} }} }};
+global.document = {{
+  hidden: false,
+  getElementById(id) {{
+    return id === "agent-team-bootstrap"
+      ? {{ textContent: JSON.stringify({{ page: "issue", issue_id: 1, csrf_token: "stale-token" }}) }}
+      : null;
+  }},
+  querySelector(selector) {{
+    if (selector === "[data-issue-phase]") return phaseNode;
+    if (selector === "[data-pull-request-monitoring]") return monitoringPanel;
+    if (selector === "[data-live-status]") return liveStatus;
+    return null;
+  }},
+  createElement: fakeElement,
+  createTextNode(text) {{ return {{ textContent: String(text), children: [] }}; }}
+}};
+global.window = {{
+  setTimeout(fn, delay) {{
+    if (delay === 2500) issueTick = fn;
+  }},
+  location: {{ reload() {{ reloadCount += 1; }} }}
+}};
+global.fetch = function (path) {{
+  const payload = path.indexOf("/logs/current") === -1
+    ? issuePayloads[Math.min(issueFetches++, issuePayloads.length - 1)]
+    : logPayload;
+  return Promise.resolve({{
+    ok: true,
+    status: 200,
+    json() {{ return Promise.resolve(payload); }}
+  }});
+}};
+eval(appScript);
+setTimeout(() => {{
+  let text = collectText(monitoringPanel);
+  assert.strictEqual(reloadCount, 0);
+  assert.strictEqual(monitoringPanel.hidden, false);
+  assert(text.includes("Pull request monitoring"));
+  assert(text.includes("Pull request #7"));
+  assert(text.includes("OPEN"));
+  assert(text.includes("DIRTY"));
+  assert(text.includes("2026-01-01T00:00:00+00:00"));
+  assert(collectLinks(monitoringPanel).includes("https://github.com/owner/repo/pull/7"));
+  assert(issueTick, "Expected issue poll to schedule the next tick");
+  issueTick();
+  setTimeout(() => {{
+    text = collectText(monitoringPanel);
+    const links = collectLinks(monitoringPanel);
+    assert.strictEqual(reloadCount, 0);
+    assert(text.includes("MERGED"));
+    assert(text.includes("CLEAN"));
+    assert(text.includes("2026-01-02T00:00:00+00:00"));
+    assert(text.includes("2026-01-02T00:01:00+00:00"));
+    assert(text.includes("provider <denied> comment"));
+    assert(!text.includes("DIRTY"));
+    assert(!links.some((href) => href.indexOf("javascript:") === 0));
+    assert(!links.includes("https://github.com/owner/repo/pull/7"));
+    assert.strictEqual(monitoringPanel.attrs["data-pull-request-monitoring-signature"], JSON.stringify(issuePayloads[1].pull_request_monitoring));
+  }}, 0);
+}}, 0);
+"""
+        result = subprocess.run([node, "-e", test_script], capture_output=True, text=True, timeout=5, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_issue_live_transition_to_merge_approval_reloads_detail_layout(self) -> None:
         node = shutil.which("node")
         if not node:
