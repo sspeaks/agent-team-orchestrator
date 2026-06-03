@@ -239,7 +239,7 @@ class WebTests(unittest.TestCase):
 
         html = self.get(f"/issues/{issue.id}")
 
-        top = html[: html.index("Primary controls")]
+        top = html[html.index("Workflow progress") : html.index('<section class="panel-grid issue-grid issue-action-grid">')]
         artifact_section = html[html.index("Artifacts and logs") :]
         self.assertIn('<nav class="timeline" aria-label="Workflow progress" data-phase-timeline>', top)
         self.assertIn(
@@ -281,16 +281,35 @@ class WebTests(unittest.TestCase):
         self.assertIn(f'href="/artifacts/{issue.id}/logs/research-run-0.md"', artifact_section)
         self.assertIn(f'href="/artifacts/{issue.id}/logs/research-run-7.md"', artifact_section)
 
-    def test_issue_detail_places_current_log_before_primary_controls_and_issue_context(self) -> None:
-        issue = self.store.create_issue("current log layout issue", "desc", ready=True)
+    def test_issue_detail_places_primary_controls_near_top_before_long_sections(self) -> None:
+        issue = self.store.create_issue("top controls layout issue", "desc")
+        self._move_to_plan_approval(issue.id)
+        self.artifacts.write_phase_artifact(issue.id, "plan", "run-plan", "Plan content")
 
         html = self.get(f"/issues/{issue.id}")
 
-        self.assertLess(html.index("Current log"), html.index("Primary controls"))
-        self.assertLess(html.index("Current log"), html.index("Issue context"))
+        controls_index = html.index("Primary controls")
+        self.assertLess(html.index("Next action"), controls_index)
+        for label in (
+            "Workflow progress",
+            "Plan review",
+            "Current log",
+            "Issue context",
+            "Artifacts and logs",
+            "Diagnostics: recent events",
+        ):
+            self.assertLess(controls_index, html.index(label))
+        self.assertEqual(html.count("data-action-stack"), 1)
         self.assertIn("data-log-toggle", html)
         self.assertIn("data-log-meta", html)
         self.assertIn("data-log-output", html)
+
+        blocked_issue = self.store.create_issue("blocked top controls issue", "desc", ready=True)
+        self.store.transition_issue(blocked_issue.id, "blocked", message="Blocked before long details")
+        blocked_html = self.get(f"/issues/{blocked_issue.id}")
+
+        self.assertLess(blocked_html.index("Primary controls"), blocked_html.index("Blocked reason"))
+        self.assertEqual(blocked_html.count("data-action-stack"), 1)
 
     def test_issue_detail_links_existing_phase_artifacts_when_blocked(self) -> None:
         issue = self.store.create_issue("blocked artifact issue", "desc", ready=True)
@@ -299,7 +318,7 @@ class WebTests(unittest.TestCase):
 
         html = self.get(f"/issues/{issue.id}")
 
-        top = html[: html.index("Primary controls")]
+        top = html[html.index("Workflow progress") : html.index('<section class="panel-grid issue-grid issue-action-grid">')]
         self.assertIn('<span class="phase-step attention">Blocked</span>', top)
         self.assertIn(
             f'<a class="phase-step pending has-artifact" href="/artifacts/{issue.id}/research.md"',
@@ -324,7 +343,7 @@ class WebTests(unittest.TestCase):
         payload, _headers = self.get_json(f"/api/issues/{issue.id}")
         artifacts = {artifact["relative_path"]: artifact for artifact in payload["artifacts"]}
         artifact = artifacts["merge_conflict_resolution.md"]
-        top = html[: html.index("Primary controls")]
+        top = html[html.index("Workflow progress") : html.index('<section class="panel-grid issue-grid issue-action-grid">')]
         timeline_by_label = {step["label"]: step for step in payload["phase_timeline"]}
 
         self.assertIn("merge conflict resolution artifact", html)
@@ -370,7 +389,7 @@ class WebTests(unittest.TestCase):
 
         html = self.get(f"/issues/{issue.id}")
         payload, _headers = self.get_json(f"/api/issues/{issue.id}")
-        top = html[: html.index("Primary controls")]
+        top = html[html.index("Workflow progress") : html.index('<section class="panel-grid issue-grid issue-action-grid">')]
         timeline_by_label = {step["label"]: step for step in payload["phase_timeline"]}
 
         self.assertNotIn("Conflict resolution", timeline_by_label)
@@ -394,7 +413,10 @@ class WebTests(unittest.TestCase):
         self.assertIn("Open full plan artifact", html)
         self.assertIn(f"/issues/{issue.id}/actions/approve-plan", html)
         self.assertIn(f"/issues/{issue.id}/actions/reject-plan", html)
-        self.assertLess(html.index("Plan review"), html.index("Primary controls"))
+        self.assertLess(html.index("Primary controls"), html.index("Plan review"))
+        self.assertLess(html.index(f"/issues/{issue.id}/actions/approve-plan"), html.index("Plan review"))
+        self.assertLess(html.index(f"/issues/{issue.id}/actions/reject-plan"), html.index("Plan review"))
+        self.assertEqual(html.count("data-action-stack"), 1)
         self.assertLess(html.index("Plan review"), html.index("Artifacts and logs"))
 
     def test_issue_detail_shows_missing_plan_review_notice(self) -> None:
@@ -422,6 +444,10 @@ class WebTests(unittest.TestCase):
         self.assertIn("User controlled &lt;context&gt;", html)
         self.assertIn(f"/issues/{issue.id}/actions/answer-human-input", html)
         self.assertIn("Answer human input", html)
+        self.assertLess(html.index(f"/issues/{issue.id}/actions/answer-human-input"), html.index("data-human-input-panel"))
+        self.assertLess(html.index("Answer human input"), html.index("data-human-input-panel"))
+        self.assertLess(html.index(f"/issues/{issue.id}/actions/answer-human-input"), html.index("Which &amp; option &lt;now&gt;?"))
+        self.assertEqual(html.count("data-action-stack"), 1)
         self.assertIn(f"/issues/{issue.id}/actions/stop", html)
         self.assertIn("Stop issue", html)
         self.assertNotIn(f"/issues/{issue.id}/actions/transition", html)
@@ -772,7 +798,7 @@ class WebTests(unittest.TestCase):
 
         self.assertIn("Blocked reason", html)
         self.assertLess(html.index("Blocked reason"), html.index("Phase timeline"))
-        self.assertLess(html.index("Blocked reason"), html.index("Primary controls"))
+        self.assertLess(html.index("Primary controls"), html.index("Blocked reason"))
         self.assertIn("Need human &lt;triage&gt;", html)
         self.assertIn("Runner failed on &lt;unsafe&gt; output", html)
         self.assertNotIn("Need human <triage>", html)
@@ -800,7 +826,9 @@ class WebTests(unittest.TestCase):
         payload, _headers = self.get_json(f"/api/issues/{issue.id}")
         reason = payload["blocked_reason"]
         prominent_html = html[: html.index("Phase timeline")]
-        primary_html = prominent_html[: prominent_html.index("<details")]
+        primary_html = prominent_html[
+            prominent_html.index("Blocked reason") : prominent_html.index("<summary>Technical details</summary>")
+        ]
 
         self.assertEqual(payload["issue"]["blocked_summary"], "Credentials are missing. Add them and rerun research.")
         self.assertEqual(reason["summary"], "Credentials are missing. Add them and rerun research.")
@@ -1064,7 +1092,9 @@ class WebTests(unittest.TestCase):
         self.assertNotIn("FULL_BODY_SENTINEL", reason["summary"])
         self.assertNotIn("content", reason["artifact"])
         self.assertIn("deployment slot is missing &lt;prod&gt; credentials", prominent_html)
-        primary_html = prominent_html[: prominent_html.index("<details")]
+        primary_html = prominent_html[
+            prominent_html.index("Blocked reason") : prominent_html.index("<summary>Technical details</summary>")
+        ]
         self.assertNotIn("Copilot CLI research recommended blocked", primary_html)
 
     def test_issue_detail_uses_artifact_excerpt_for_legacy_recommendation_parse_block(self) -> None:
@@ -1096,7 +1126,9 @@ class WebTests(unittest.TestCase):
         self.assertEqual(reason["artifact"]["relative_path"], "research.md")
         self.assertEqual(reason["log"]["relative_path"], f"logs/{phase}-{run_id}.md")
         self.assertIn("source checkout needs &lt;manual&gt; repair", prominent_html)
-        primary_html = prominent_html[: prominent_html.index("<details")]
+        primary_html = prominent_html[
+            prominent_html.index("Blocked reason") : prominent_html.index("<summary>Technical details</summary>")
+        ]
         self.assertNotIn("Copilot CLI research did not provide a valid Recommendation", primary_html)
 
     def test_issue_detail_keeps_new_recommendation_diagnostic_detail(self) -> None:
@@ -1668,6 +1700,10 @@ setTimeout(() => {{
 
         self.assertIn(f'<a class="button" href="{expected_href}">Open in VS Code</a>', html)
         self.assertIn("/actions/approve-merge", html)
+        self.assertLess(html.index("Primary controls"), html.index("Workflow progress"))
+        self.assertLess(html.index("Open in VS Code"), html.index("Workflow progress"))
+        self.assertLess(html.index("/actions/approve-merge"), html.index("Workflow progress"))
+        self.assertEqual(html.count("data-action-stack"), 1)
         self.assertIn('value="main"', html)
         self.assertEqual(
             vscode_control,
@@ -2027,6 +2063,8 @@ setTimeout(() => {{
         self.assertIn('<option value="auto" selected>', html)
         self.assertIn("PR remote (optional)", html)
         self.assertIn("Approve merge", html)
+        self.assertLess(html.index("Primary controls"), html.index("Workflow progress"))
+        self.assertLess(html.index("/actions/approve-merge"), html.index("Workflow progress"))
 
     def test_issue_detail_approve_merge_form_defaults_to_configured_mode_and_remote(self) -> None:
         self.app.config = replace(self.app.config, merge_mode="local", pr_remote="upstream")
