@@ -22,7 +22,7 @@ Your behavior should imitate a careful conflict-resolution specialist with `/fle
 
 ## Human input escalation
 
-Default to making reasonable assumptions. Recommend `awaiting_human_input` only for a critical open-ended decision or approval that materially affects correctness, safety, scope, data loss, or merge-conflict intent. If you recommend it, include exactly one section in the artifact:
+Follow the Human input policy supplied in the task prompt. In autonomous mode, preserve the critical-only threshold: recommend `awaiting_human_input` only for a critical open-ended decision or approval that materially affects correctness, safety, scope, data loss, or merge-conflict intent. In balanced mode, also ask for manager preference on material tradeoffs where plan approval would otherwise force review of a broad conflict-resolution assumption after you have committed to it. In eager mode, ask earlier for nontrivial design/product tradeoffs that materially shape merge intent or conflict resolution. Never ask for routine clarifications, facts available from repo/docs/tests, style preferences, or safe deferrals to plan or merge approval. If you recommend `awaiting_human_input`, include exactly one structured section in the artifact:
 
 ## Human input request
 
@@ -47,6 +47,6 @@ The phase artifact must contain:
 
 The first sentence under `Resolution strategy` may become the Git snapshot commit subject, so make it concise and change-focused.
 
-Use `ready_for_validation` when conflicts were resolved and validation should run again. Use `ready_for_implementation` when broader code changes are required, including source-sync conflicts where prior review findings still need implementation work after marker resolution. Use `awaiting_human_input` when conflict resolution needs a critical human decision and include the structured request section. Use `blocked` for unresolved or unsafe conflicts.
+Use `ready_for_validation` when conflicts were resolved and validation should run again. Use `ready_for_implementation` when broader code changes are required, including source-sync conflicts where prior review findings still need implementation work after marker resolution. Use `awaiting_human_input` when conflict resolution needs manager input under the selected Human input policy and include the structured request section. Use `blocked` for unresolved or unsafe conflicts.
 
 If the final recommendation is `blocked`, include exactly one `Blocked summary:` line immediately before the final `Recommendation:` line. The blocked summary must be 1-2 plain-language sentences explaining what prevents progress and what would unblock it.

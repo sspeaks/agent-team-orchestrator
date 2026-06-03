@@ -2,6 +2,7 @@ import unittest
 import tempfile
 from pathlib import Path
 
+from agent_team.human_input_policy import human_input_policy_prompt
 from agent_team.config import AppConfig, CopilotModelSelection
 from agent_team.models import Issue
 from agent_team.orchestrator import build_runner
@@ -389,6 +390,32 @@ Recommendation: `awaiting_human_input`
         self.assertIn(str(artifacts_dir / "human_input.md"), prompt)
         self.assertIn(str(artifacts_dir / "human_input.jsonl"), prompt)
         self.assertIn("Answer: use option B", prompt)
+
+    def test_packaged_prompts_render_human_input_policy(self) -> None:
+        prompts_dir = Path(__file__).parent.parent / "src" / "agent_team" / "prompts"
+        policy = human_input_policy_prompt("balanced")
+        for phase in PHASE_AGENTS:
+            with self.subTest(phase=phase):
+                template = (prompts_dir / f"{phase}.md").read_text(encoding="utf-8")
+                prompt = CopilotCliRunner._build_prompt(
+                    phase,
+                    self.issue,
+                    {
+                        "prompt_template": template,
+                        "artifacts_dir": "/tmp/artifacts/1",
+                        "phase_artifact": f"/tmp/artifacts/1/{phase}.md",
+                        "human_input_mode": "balanced",
+                        "human_input_policy": policy,
+                        "workspace_repo_path": "/tmp/worktrees/issue-1/repo",
+                        "workspace_root": "/tmp/worktrees/issue-1",
+                    },
+                )
+
+                self.assertIn("Human input policy", prompt)
+                self.assertIn("Active mode: `balanced`.", prompt)
+                self.assertIn("two or more viable options materially affect architecture", prompt)
+                self.assertNotIn("{human_input_policy}", prompt)
+                self.assertNotIn("{human_input_mode}", prompt)
 
     def test_prompt_includes_unblock_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -919,6 +946,25 @@ Recommendation: `awaiting_human_input`
                 self.assertFalse(prompt.startswith("/"))
                 self.assertNotIn("{issue_id}", prompt)
                 self.assertNotIn("{phase_artifact}", prompt)
+                self.assertNotIn("{human_input_policy}", prompt)
+
+    def test_packaged_agents_include_policy_aware_human_input_guidance(self) -> None:
+        runner = CopilotCliRunner()
+        for phase, agent_name in PHASE_AGENTS.items():
+            with self.subTest(phase=phase):
+                agent_file = runner.plugin_dir / "agents" / f"{agent_name}.agent.md"
+                text = agent_file.read_text(encoding="utf-8")
+                lowered = text.lower()
+
+                self.assertIn("## human input escalation", lowered)
+                self.assertIn("human input policy", lowered)
+                self.assertIn("autonomous", lowered)
+                self.assertIn("balanced", lowered)
+                self.assertIn("eager", lowered)
+                self.assertIn("routine clarifications", lowered)
+                self.assertIn("facts available from", lowered)
+                self.assertIn("plan or merge approval", lowered)
+                self.assertIn("## Human input request", text)
 
     def test_research_and_plan_tolerate_missing_workspace(self) -> None:
         self.assertEqual(CopilotCliRunner._resolve_execution_repo_path("research", self.issue, {}), (None, None))

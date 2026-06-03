@@ -9,6 +9,7 @@ Agent Team Orchestrator keeps its state on your machine. It stores issue state i
 - Tracks local issues through a validated phase workflow with reviewable artifacts at each step.
 - Runs either deterministic dry-run phases or GitHub Copilot CLI custom agents for real work.
 - Requires human approval before implementation starts and before reviewed work is finalized.
+- Can pause agent phases for human input consultation when configured thresholds are met.
 - Reuses a persistent per-issue worktree from implementation through validation, review, merge, and merge-conflict resolution.
 - Provides a terminal dashboard plus a local web UI for manager decisions and queue control.
 
@@ -76,7 +77,7 @@ draft -> needs_research -> ready_for_plan -> awaiting_plan_approval
   -> ready_for_merge -> done
 ```
 
-Validation and review can loop back to implementation. Merge conflicts route through `ready_for_merge_conflict_resolution` before returning to validation and review. Any agent phase can pause at `awaiting_human_input` or stop at `blocked` when it cannot proceed safely.
+Validation and review can loop back to implementation. Merge conflicts route through `ready_for_merge_conflict_resolution` before returning to validation and review. Any agent phase can pause at `awaiting_human_input` for consultation or stop at `blocked` when it cannot proceed safely. Human input consultation is separate from plan approval and merge approval: approvals are fixed workflow gates, while `human_input.mode` controls how readily agents pause for manager decisions during a phase.
 
 ## Configuration
 
@@ -90,6 +91,8 @@ Config discovery order is:
 4. Built-in defaults
 
 Environment variables remain supported as compatibility overrides, and command flags such as `serve --host`, `serve --port`, `worker once --concurrency`, and `worker loop --concurrency` affect only that invocation.
+
+The `human_input.mode` setting controls consultation threshold: `balanced` is the default, `autonomous` keeps pauses to critical decisions, and `eager` asks earlier about nontrivial design or product tradeoffs. This does not replace plan approval or merge approval; those human gates still happen whenever the workflow reaches them.
 
 Copilot model and reasoning effort can be configured globally or per Copilot-backed phase in the example config. Defaults remain unset, model IDs depend on the local Copilot CLI/account, raw `extra_args` are appended last for advanced overrides, and custom-agent `model` frontmatter can override CLI model selection.
 
