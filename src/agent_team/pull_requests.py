@@ -4,10 +4,11 @@ import json
 import os
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol, Sequence
-from urllib.parse import unquote, urlparse, urlunparse
+from urllib.parse import quote, unquote, urlparse, urlunparse
 
 
 class PullRequestError(RuntimeError):
@@ -47,6 +48,65 @@ class PullRequestResult:
     status: str
     is_existing: bool
     raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class PullRequestStatusSnapshot:
+    provider: str
+    checked_at: str
+    status: str
+    merge_state: str | None
+    is_open: bool
+    is_closed: bool
+    is_merged: bool
+    has_conflicts: bool
+    head_sha: str | None
+    url: str
+    raw: dict[str, Any]
+    id: str | None = None
+    number: int | None = None
+    source_branch: str | None = None
+    target_branch: str | None = None
+    closed_at: str | None = None
+    merged_at: str | None = None
+
+    def metadata_updates(self) -> dict[str, Any]:
+        final_status = None
+        if self.is_merged:
+            final_status = "merged"
+        elif self.is_closed:
+            final_status = "closed"
+        updates: dict[str, Any] = {
+            "last_status_check_at": self.checked_at,
+            "last_status": self.status,
+            "last_merge_state": self.merge_state,
+            "last_head_commit": self.head_sha,
+            "last_is_open": self.is_open,
+            "last_is_closed": self.is_closed,
+            "last_is_merged": self.is_merged,
+            "last_has_conflicts": self.has_conflicts,
+            "pr_status": self.status,
+            "final_status": final_status,
+            "raw_status": self.raw,
+        }
+        if self.head_sha is not None:
+            updates["head_commit"] = self.head_sha
+        if self.closed_at is not None:
+            updates["closed_at"] = self.closed_at
+        if self.merged_at is not None:
+            updates["merged_at"] = self.merged_at
+        return updates
+
+
+@dataclass(frozen=True)
+class PullRequestCommentResult:
+    provider: str
+    id: str | None
+    url: str | None
+    marker: str
+    body: str
+    created: bool
+    raw: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -231,6 +291,84 @@ def create_or_get_pull_request(
     )
 
 
+def pull_request_remote_from_metadata(metadata: dict[str, Any]) -> PullRequestRemote:
+    provider = _clean_json_string(metadata.get("provider"))
+    remote_name = _clean_json_string(metadata.get("remote_name")) or "origin"
+    remote_url = _clean_json_string(metadata.get("remote_url"))
+    identity = _metadata_identity(metadata)
+    if identity is not None:
+        if identity[0] == "github" and len(identity) == 3:
+            return PullRequestRemote(
+                provider="github",
+                remote_name=remote_name,
+                url=remote_url or f"https://github.com/{identity[1]}/{identity[2]}.git",
+                owner=identity[1],
+                repo=identity[2],
+            )
+        if identity[0] == "azure-devops" and len(identity) == 4:
+            return PullRequestRemote(
+                provider="azure-devops",
+                remote_name=remote_name,
+                url=remote_url or f"https://dev.azure.com/{identity[1]}/{identity[2]}/_git/{identity[3]}",
+                org=identity[1],
+                project=identity[2],
+                repo=identity[3],
+            )
+    if remote_url:
+        remote = parse_pull_request_remote(remote_name, remote_url)
+        if remote is not None and (provider is None or provider == remote.provider):
+            return remote
+    raise PullRequestError("Pull request metadata does not contain a supported provider identity.")
+
+
+def get_pull_request_status(
+    metadata: dict[str, Any],
+    runner: CommandRunner | None = None,
+) -> PullRequestStatusSnapshot:
+    remote = pull_request_remote_from_metadata(metadata)
+    active_runner = runner or SubprocessCommandRunner()
+    if remote.provider == "github":
+        return _github_status_snapshot(remote, metadata, active_runner)
+    if remote.provider == "azure-devops":
+        return _ado_status_snapshot(remote, metadata, active_runner)
+    raise PullRequestError(
+        f"Unsupported pull request provider '{remote.provider}' for remote '{remote.remote_name}'. "
+        "Supported providers are GitHub and Azure DevOps Services."
+    )
+
+
+def pull_request_conflict_marker(metadata: dict[str, Any]) -> str:
+    stored = _clean_json_string(metadata.get("conflict_comment_marker"))
+    if stored:
+        return stored
+    key = _clean_json_string(metadata.get("conflict_comment_key"))
+    if key is None:
+        provider = _clean_json_string(metadata.get("provider")) or "provider"
+        source_branch = _clean_json_string(metadata.get("source_branch")) or "source"
+        pr_id = _clean_json_string(metadata.get("id")) or str(_as_int(metadata.get("number")) or "unknown")
+        key = f"{provider}:{pr_id}:{source_branch}"
+    return f"<!-- agent-team-orchestrator-conflict:{key} -->"
+
+
+def ensure_pull_request_conflict_comment(
+    metadata: dict[str, Any],
+    body: str,
+    runner: CommandRunner | None = None,
+) -> PullRequestCommentResult:
+    remote = pull_request_remote_from_metadata(metadata)
+    marker = pull_request_conflict_marker(metadata)
+    comment_body = body if marker in body else f"{marker}\n\n{body.strip()}"
+    active_runner = runner or SubprocessCommandRunner()
+    if remote.provider == "github":
+        return _github_conflict_comment(remote, metadata, marker, comment_body, active_runner)
+    if remote.provider == "azure-devops":
+        return _ado_conflict_comment(remote, metadata, marker, comment_body, active_runner)
+    raise PullRequestError(
+        f"Unsupported pull request provider '{remote.provider}' for remote '{remote.remote_name}'. "
+        "Supported providers are GitHub and Azure DevOps Services."
+    )
+
+
 def is_safe_pull_request_url(url: object) -> bool:
     text = "" if url is None else str(url).strip()
     if not text:
@@ -388,6 +526,215 @@ def _ado_create_or_get(
     )
     raw = _expect_mapping(_load_json(created.stdout, "az repos pr create"), "az repos pr create")
     return _ado_result(remote, request, raw, is_existing=False)
+
+
+def _github_status_snapshot(
+    remote: PullRequestRemote,
+    metadata: dict[str, Any],
+    runner: CommandRunner,
+) -> PullRequestStatusSnapshot:
+    repo = _github_repo(remote)
+    pr_ref = _github_pr_ref(metadata)
+    fields = "number,url,state,mergedAt,closedAt,isDraft,mergeable,mergeStateStatus,headRefName,baseRefName,headRefOid"
+    viewed = runner.run(["gh", "pr", "view", pr_ref, "--repo", repo, "--json", fields])
+    _ensure_success("gh pr view", viewed, "Run 'gh auth login' and verify the pull request is accessible.")
+    raw = _expect_mapping(_load_json(viewed.stdout, "gh pr view"), "gh pr view")
+    state = str(raw.get("state") or "").upper()
+    mergeable = str(raw.get("mergeable") or "").upper() or None
+    merge_state_status = str(raw.get("mergeStateStatus") or "").upper() or None
+    merged_at = _clean_json_string(raw.get("mergedAt"))
+    closed_at = _clean_json_string(raw.get("closedAt"))
+    is_merged = state == "MERGED" or merged_at is not None
+    is_open = state == "OPEN"
+    is_closed = is_merged or state == "CLOSED" or closed_at is not None
+    has_conflicts = mergeable == "CONFLICTING" or merge_state_status in {"DIRTY", "CONFLICTING", "HAS_CONFLICTS"}
+    url = _validated_github_result_url(remote, raw.get("url") or metadata.get("url"), "gh pr view")
+    return PullRequestStatusSnapshot(
+        provider=remote.provider,
+        checked_at=_utc_now_iso(),
+        status=state or str(raw.get("state") or ""),
+        merge_state=merge_state_status or mergeable,
+        is_open=is_open,
+        is_closed=is_closed,
+        is_merged=is_merged,
+        has_conflicts=has_conflicts,
+        head_sha=_clean_json_string(raw.get("headRefOid")),
+        url=url,
+        raw=dict(raw),
+        id=str(_as_int(raw.get("number"))) if _as_int(raw.get("number")) is not None else None,
+        number=_as_int(raw.get("number")),
+        source_branch=_clean_json_string(raw.get("headRefName")),
+        target_branch=_clean_json_string(raw.get("baseRefName")),
+        closed_at=closed_at,
+        merged_at=merged_at,
+    )
+
+
+def _ado_status_snapshot(
+    remote: PullRequestRemote,
+    metadata: dict[str, Any],
+    runner: CommandRunner,
+) -> PullRequestStatusSnapshot:
+    pr_id = _ado_pr_id(metadata)
+    shown = runner.run(
+        [
+            "az",
+            "repos",
+            "pr",
+            "show",
+            "--id",
+            pr_id,
+            "--org",
+            _ado_org_url(remote),
+            "--project",
+            _require(remote.project, "project", remote),
+            "--repository",
+            remote.repo,
+            "--output",
+            "json",
+        ]
+    )
+    _ensure_success(
+        "az repos pr show",
+        shown,
+        "Run 'az login' and verify the Azure DevOps pull request is accessible.",
+    )
+    raw = _expect_mapping(_load_json(shown.stdout, "az repos pr show"), "az repos pr show")
+    status = str(raw.get("status") or "").lower()
+    merge_status = str(raw.get("mergeStatus") or "").lower() or None
+    is_open = status == "active"
+    is_merged = status == "completed"
+    is_closed = status in {"completed", "abandoned"}
+    url = _validated_ado_result_url(remote, _ado_result_url(raw) or metadata.get("url"), "az repos pr show")
+    return PullRequestStatusSnapshot(
+        provider=remote.provider,
+        checked_at=_utc_now_iso(),
+        status=status,
+        merge_state=merge_status,
+        is_open=is_open,
+        is_closed=is_closed,
+        is_merged=is_merged,
+        has_conflicts=merge_status == "conflicts",
+        head_sha=_ado_commit_id(raw.get("lastMergeSourceCommit")) or _clean_json_string(raw.get("sourceCommitId")),
+        url=url,
+        raw=dict(raw),
+        id=str(_as_int(raw.get("pullRequestId"))) if _as_int(raw.get("pullRequestId")) is not None else pr_id,
+        number=_as_int(raw.get("pullRequestId")),
+        source_branch=_strip_heads(str(raw.get("sourceRefName") or "")) or None,
+        target_branch=_strip_heads(str(raw.get("targetRefName") or "")) or None,
+        closed_at=_clean_json_string(raw.get("closedDate")),
+        merged_at=_clean_json_string(raw.get("closedDate")) if is_merged else None,
+    )
+
+
+def _github_conflict_comment(
+    remote: PullRequestRemote,
+    metadata: dict[str, Any],
+    marker: str,
+    body: str,
+    runner: CommandRunner,
+) -> PullRequestCommentResult:
+    number = _github_pr_number(metadata)
+    repo = _github_repo(remote)
+    comments = runner.run(["gh", "api", f"repos/{repo}/issues/{number}/comments", "--paginate", "--slurp"])
+    _ensure_success("gh api issue comments", comments, "Verify GitHub CLI can read pull request comments.")
+    existing = _find_marked_github_comment(_load_json(comments.stdout, "gh api issue comments"), marker)
+    if existing is not None:
+        comment_id = str(existing["id"])
+        updated = runner.run(["gh", "api", f"repos/{repo}/issues/comments/{comment_id}", "-X", "PATCH", "-f", f"body={body}"])
+        _ensure_success("gh api update issue comment", updated, "Verify GitHub CLI can update pull request comments.")
+        raw = _expect_mapping(_load_json(updated.stdout, "gh api update issue comment"), "gh api update issue comment")
+        return PullRequestCommentResult(
+            provider=remote.provider,
+            id=str(raw.get("id") or comment_id),
+            url=_safe_url_or_none(raw.get("html_url")),
+            marker=marker,
+            body=body,
+            created=False,
+            raw=raw,
+        )
+    created = runner.run(["gh", "api", f"repos/{repo}/issues/{number}/comments", "-f", f"body={body}"])
+    _ensure_success("gh api create issue comment", created, "Verify GitHub CLI can create pull request comments.")
+    raw = _expect_mapping(_load_json(created.stdout, "gh api create issue comment"), "gh api create issue comment")
+    return PullRequestCommentResult(
+        provider=remote.provider,
+        id=str(raw.get("id")) if raw.get("id") is not None else None,
+        url=_safe_url_or_none(raw.get("html_url")),
+        marker=marker,
+        body=body,
+        created=True,
+        raw=raw,
+    )
+
+
+def _ado_conflict_comment(
+    remote: PullRequestRemote,
+    metadata: dict[str, Any],
+    marker: str,
+    body: str,
+    runner: CommandRunner,
+) -> PullRequestCommentResult:
+    pr_id = _ado_pr_id(metadata)
+    threads_url = _ado_threads_url(remote, pr_id)
+    listed = runner.run(["az", "rest", "--method", "get", "--url", threads_url])
+    _ensure_success("az rest pull request threads", listed, "Verify Azure CLI can read pull request threads.")
+    existing = _find_marked_ado_comment(_load_json(listed.stdout, "az rest pull request threads"), marker)
+    if existing is not None:
+        thread_id, comment_id = existing
+        update_url = _ado_thread_comment_url(remote, pr_id, thread_id, comment_id)
+        updated = runner.run(
+            [
+                "az",
+                "rest",
+                "--method",
+                "patch",
+                "--url",
+                update_url,
+                "--body",
+                json.dumps({"content": body}),
+            ]
+        )
+        _ensure_success("az rest update pull request comment", updated, "Verify Azure CLI can update pull request threads.")
+        raw = _expect_mapping(
+            _load_json(updated.stdout, "az rest update pull request comment"),
+            "az rest update pull request comment",
+        )
+        return PullRequestCommentResult(
+            provider=remote.provider,
+            id=str(raw.get("id") or comment_id),
+            url=None,
+            marker=marker,
+            body=body,
+            created=False,
+            raw=raw,
+        )
+    created = runner.run(
+        [
+            "az",
+            "rest",
+            "--method",
+            "post",
+            "--url",
+            threads_url,
+            "--body",
+            json.dumps({"comments": [{"parentCommentId": 0, "content": body}], "status": "active"}),
+        ]
+    )
+    _ensure_success("az rest create pull request thread", created, "Verify Azure CLI can create pull request threads.")
+    raw = _expect_mapping(
+        _load_json(created.stdout, "az rest create pull request thread"),
+        "az rest create pull request thread",
+    )
+    comment_id = _first_ado_comment_id(raw)
+    return PullRequestCommentResult(
+        provider=remote.provider,
+        id=str(comment_id) if comment_id is not None else (str(raw.get("id")) if raw.get("id") is not None else None),
+        url=None,
+        marker=marker,
+        body=body,
+        created=True,
+        raw=raw,
+    )
 
 
 def _github_result(
@@ -586,6 +933,128 @@ def _require(value: str | None, name: str, remote: PullRequestRemote) -> str:
 
 def _ado_branch(branch: str) -> str:
     return branch if branch.startswith("refs/") else f"refs/heads/{branch}"
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _metadata_identity(metadata: dict[str, Any]) -> tuple[str, ...] | None:
+    identity = metadata.get("remote_identity")
+    if not isinstance(identity, (list, tuple)):
+        return None
+    parts: list[str] = []
+    for part in identity:
+        cleaned = _clean_json_string(part)
+        if cleaned is None:
+            return None
+        parts.append(cleaned.casefold())
+    return tuple(parts) if parts else None
+
+
+def _github_pr_ref(metadata: dict[str, Any]) -> str:
+    number = _as_int(metadata.get("number"))
+    if number is not None:
+        return str(number)
+    url = _clean_json_string(metadata.get("url"))
+    if url:
+        return url
+    raise PullRequestError("GitHub pull request metadata is missing number and URL.")
+
+
+def _github_pr_number(metadata: dict[str, Any]) -> int:
+    number = _as_int(metadata.get("number"))
+    if number is None:
+        raise PullRequestError("GitHub pull request metadata is missing number.")
+    return number
+
+
+def _ado_pr_id(metadata: dict[str, Any]) -> str:
+    pr_id = _clean_json_string(metadata.get("id"))
+    if pr_id:
+        return pr_id
+    number = _as_int(metadata.get("number"))
+    if number is not None:
+        return str(number)
+    raise PullRequestError("Azure DevOps pull request metadata is missing id.")
+
+
+def _ado_commit_id(value: Any) -> str | None:
+    if isinstance(value, dict):
+        return _clean_json_string(value.get("commitId"))
+    return _clean_json_string(value)
+
+
+def _safe_url_or_none(value: Any) -> str | None:
+    text = _clean_json_string(value)
+    return text if is_safe_pull_request_url(text) else None
+
+
+def _find_marked_github_comment(value: Any, marker: str) -> dict[str, Any] | None:
+    for item in _flatten_github_comment_pages(value):
+        if marker in str(item.get("body") or "") and item.get("id") is not None:
+            return item
+    return None
+
+
+def _flatten_github_comment_pages(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, list) and all(isinstance(item, dict) for item in value):
+        return [dict(item) for item in value]
+    flattened: list[dict[str, Any]] = []
+    if isinstance(value, list):
+        for page in value:
+            if isinstance(page, list):
+                flattened.extend(dict(item) for item in page if isinstance(item, dict))
+    return flattened
+
+
+def _ado_threads_url(remote: PullRequestRemote, pr_id: str) -> str:
+    return (
+        f"{_ado_project_url(remote)}/_apis/git/repositories/{_ado_url_part(remote.repo)}"
+        f"/pullRequests/{_ado_url_part(pr_id)}/threads?api-version=7.1"
+    )
+
+
+def _ado_thread_comment_url(remote: PullRequestRemote, pr_id: str, thread_id: object, comment_id: object) -> str:
+    return (
+        f"{_ado_project_url(remote)}/_apis/git/repositories/{_ado_url_part(remote.repo)}"
+        f"/pullRequests/{_ado_url_part(pr_id)}/threads/{_ado_url_part(thread_id)}"
+        f"/comments/{_ado_url_part(comment_id)}?api-version=7.1"
+    )
+
+
+def _ado_project_url(remote: PullRequestRemote) -> str:
+    return f"{_ado_org_url(remote)}/{_ado_url_part(_require(remote.project, 'project', remote))}"
+
+
+def _ado_url_part(value: object) -> str:
+    return quote(str(value), safe="")
+
+
+def _find_marked_ado_comment(value: Any, marker: str) -> tuple[object, object] | None:
+    threads = value.get("value") if isinstance(value, dict) else value
+    if not isinstance(threads, list):
+        return None
+    for thread in threads:
+        if not isinstance(thread, dict):
+            continue
+        thread_id = thread.get("id")
+        comments = thread.get("comments")
+        if thread_id is None or not isinstance(comments, list):
+            continue
+        for comment in comments:
+            if isinstance(comment, dict) and marker in str(comment.get("content") or "") and comment.get("id") is not None:
+                return thread_id, comment["id"]
+    return None
+
+
+def _first_ado_comment_id(raw: dict[str, Any]) -> object | None:
+    comments = raw.get("comments")
+    if isinstance(comments, list):
+        for comment in comments:
+            if isinstance(comment, dict) and comment.get("id") is not None:
+                return comment["id"]
+    return None
 
 
 def _strip_heads(branch: str) -> str:

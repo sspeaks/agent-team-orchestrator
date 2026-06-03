@@ -27,10 +27,10 @@ from agent_team.lifecycle import delete_issue, reset_issue_to_draft, stop_issue
 from agent_team.locks import make_lock_owner
 from agent_team.models import AgentResult, HumanInputRequestDraft, Issue
 from agent_team.orchestrator import Orchestrator, ProcessResult
-from agent_team.pull_requests import PullRequestResult
+from agent_team.pull_requests import PullRequestCommentResult, PullRequestResult, PullRequestStatusSnapshot
 from agent_team.runners.base import AgentRunner
 from agent_team.worker import process_batch, run_worker_loop
-from agent_team.workspaces import WorkspaceManager, WorkspaceMergeRecovery
+from agent_team.workspaces import WorkspaceManager, WorkspaceMergeRecovery, WorkspaceMergeResult
 
 
 class RawOutputRunner(AgentRunner):
@@ -1594,6 +1594,48 @@ class StoreAndWorkerTests(unittest.TestCase):
         self.assertEqual(starts, [first.id, second.id])
         self.assertEqual([result.issue_id for result in results], [second.id])
 
+    def test_process_batch_monitors_pull_requests_once_per_batch(self) -> None:
+        pr_issue = self._issue_awaiting_pr_closure()
+        ready_issue = self.store.create_issue("ready", "desc", ready=True)
+        monitor_calls = 0
+
+        class FakeOrchestrator:
+            def __init__(self, store: IssueStore, artifacts: ArtifactStore, config: AppConfig) -> None:
+                self.store = store
+
+            def monitor_pull_requests(self) -> list[ProcessResult]:
+                nonlocal monitor_calls
+                monitor_calls += 1
+                return [
+                    ProcessResult(
+                        issue_id=pr_issue.id,
+                        run_id=f"monitor-{monitor_calls}",
+                        phase="pr_monitor",
+                        status="waiting",
+                        next_phase="awaiting_pr_closure",
+                        summary="waiting",
+                        artifact_path=None,
+                    )
+                ]
+
+            def process_issue(self, issue_id: int, phase: str | None = None) -> ProcessResult:
+                self.store.transition_issue(issue_id, "researching")
+                return ProcessResult(
+                    issue_id=issue_id,
+                    run_id=f"run-{issue_id}",
+                    phase="research",
+                    status="success",
+                    next_phase="researching",
+                    summary="done",
+                    artifact_path=None,
+                )
+
+        with patch.object(worker_module, "Orchestrator", FakeOrchestrator):
+            results = process_batch(self.store, self.artifacts, self.config, concurrency=1)
+
+        self.assertEqual(monitor_calls, 1)
+        self.assertEqual([result.issue_id for result in results], [pr_issue.id, ready_issue.id])
+
     def test_process_batch_drains_until_idle(self) -> None:
         issues = [self.store.create_issue(f"issue {index}", "desc", ready=True) for index in range(3)]
 
@@ -3056,7 +3098,7 @@ class StoreAndWorkerTests(unittest.TestCase):
         self.assertEqual(runs[-1]["runner"], "workspace-merge")
 
     @unittest.skipUnless(shutil.which("git"), "git is required for workspace tests")
-    def test_merge_phase_pull_request_mode_opens_pr_and_closes_issue(self) -> None:
+    def test_merge_phase_pull_request_mode_opens_pr_and_waits_for_closure(self) -> None:
         repo = self._create_repo("source")
         self._git(repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
         target_branch = self._git(repo, "rev-parse", "--abbrev-ref", "HEAD")
@@ -3094,12 +3136,14 @@ class StoreAndWorkerTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result.phase, "merge")
         self.assertEqual(result.status, "success")
-        self.assertEqual(result.next_phase, "done")
+        self.assertEqual(result.next_phase, "awaiting_pr_closure")
         self.assertEqual(
             result.summary,
             f"Opened pull request for issue {issue.id} into {target_branch}: https://github.com/owner/repo/pull/7",
         )
-        self.assertEqual(self.store.get_issue(issue.id).phase, "done")
+        updated_issue = self.store.get_issue(issue.id)
+        self.assertEqual(updated_issue.phase, "awaiting_pr_closure")
+        self.assertEqual(updated_issue.status, "open")
         self.assertEqual(self._git(repo, "rev-parse", "HEAD"), source_head)
         self.assertFalse((repo / "feature.txt").exists())
         self.assertFalse(info.worktree_root.exists())
@@ -3115,6 +3159,8 @@ class StoreAndWorkerTests(unittest.TestCase):
         self.assertTrue(pr_metadata["cleanup_removed"])
         self.assertEqual(pr_metadata["url"], "https://github.com/owner/repo/pull/7")
         self.assertEqual(pr_metadata["provider"], "github")
+        self.assertTrue(pr_metadata["monitoring_enabled"])
+        self.assertIsNone(pr_metadata["final_status"])
         self.assertEqual(pr_metadata["remote_name"], "origin")
         self.assertEqual(pr_metadata["source_branch"], f"agent-team/issue-{issue.id}")
         self.assertIsNone(self.artifacts.read_workspace_metadata(issue.id))
@@ -3122,9 +3168,146 @@ class StoreAndWorkerTests(unittest.TestCase):
         merge_artifact = (self.config.artifacts_dir / str(issue.id) / "merge.md").read_text(encoding="utf-8")
         self.assertIn("- Status: `pull_request`", merge_artifact)
         self.assertIn("Pull request URL: https://github.com/owner/repo/pull/7", merge_artifact)
+        self.assertIn("Recommendation: `awaiting_pr_closure`", merge_artifact)
         runs = self.store.list_runs(issue.id)
         self.assertEqual(runs[-1]["runner"], "workspace-merge")
         self.assertEqual(runs[-1]["status"], "success")
+
+    def test_pull_request_monitor_keeps_open_pr_waiting(self) -> None:
+        issue = self._issue_awaiting_pr_closure()
+        self._write_waiting_pr_metadata(issue.id)
+        snapshot = self._pr_snapshot(status="OPEN", is_open=True)
+
+        with patch("agent_team.orchestrator.get_pull_request_status", return_value=snapshot):
+            results = Orchestrator(self.store, self.artifacts, self.config).monitor_pull_requests()
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, "waiting")
+        self.assertEqual(results[0].next_phase, "awaiting_pr_closure")
+        updated = self.store.get_issue(issue.id)
+        self.assertEqual(updated.phase, "awaiting_pr_closure")
+        self.assertEqual(updated.status, "open")
+        metadata = self.artifacts.read_pull_request_metadata(issue.id)
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertEqual(metadata["last_status"], "OPEN")
+        self.assertTrue(metadata["last_is_open"])
+        self.assertNotIn(issue.id, {ready.id for ready in self.store.list_next_ready_issues(10)})
+
+    def test_pull_request_monitor_skips_history_when_open_status_is_unchanged(self) -> None:
+        issue = self._issue_awaiting_pr_closure()
+        self._write_waiting_pr_metadata(issue.id)
+        self.artifacts.update_pull_request_metadata(
+            issue.id,
+            {
+                "last_status_check_at": "2026-01-01T00:00:00+00:00",
+                "last_status": "OPEN",
+                "last_merge_state": None,
+                "last_head_commit": "a" * 40,
+                "last_is_open": True,
+                "last_is_closed": False,
+                "last_is_merged": False,
+                "last_has_conflicts": False,
+            },
+        )
+        snapshot = self._pr_snapshot(status="OPEN", is_open=True)
+        history_path = self.artifacts.issue_dir(issue.id) / "history.jsonl"
+
+        with patch("agent_team.orchestrator.get_pull_request_status", return_value=snapshot):
+            results = Orchestrator(self.store, self.artifacts, self.config).monitor_pull_requests()
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, "waiting")
+        event_types = [event["event_type"] for event in self.store.list_events(issue.id)]
+        self.assertNotIn("pull_request.checked", event_types)
+        self.assertFalse(history_path.exists())
+        metadata = self.artifacts.read_pull_request_metadata(issue.id)
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertEqual(metadata["last_status_check_at"], snapshot.checked_at)
+
+    def test_pull_request_monitor_closes_local_issue_when_pr_closes(self) -> None:
+        issue = self._issue_awaiting_pr_closure()
+        self._write_waiting_pr_metadata(issue.id)
+        snapshot = self._pr_snapshot(status="MERGED", is_closed=True, is_merged=True, merged_at="2026-01-02T00:00:00+00:00")
+
+        with patch("agent_team.orchestrator.get_pull_request_status", return_value=snapshot):
+            results = Orchestrator(self.store, self.artifacts, self.config).monitor_pull_requests()
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].next_phase, "done")
+        updated = self.store.get_issue(issue.id)
+        self.assertEqual(updated.phase, "done")
+        self.assertEqual(updated.status, "closed")
+        metadata = self.artifacts.read_pull_request_metadata(issue.id)
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertEqual(metadata["final_status"], "merged")
+        self.assertEqual(metadata["merged_at"], "2026-01-02T00:00:00+00:00")
+        self.assertEqual(metadata["pr_status"], "MERGED")
+
+    def test_pull_request_monitor_comments_and_routes_conflicts(self) -> None:
+        issue = self._issue_awaiting_pr_closure()
+        self._write_waiting_pr_metadata(issue.id)
+        snapshot = self._pr_snapshot(
+            status="OPEN",
+            merge_state="DIRTY",
+            is_open=True,
+            has_conflicts=True,
+        )
+        result = WorkspaceMergeResult(
+            status="conflicts",
+            summary="Hosted PR conflicts require repair.",
+            target_branch="main",
+            worktree_head="a" * 40,
+            merge_commit=None,
+            conflict_files=("feature.txt",),
+            pr_provider="github",
+            pr_url="https://github.com/owner/repo/pull/7",
+            pr_number=7,
+            pr_status="OPEN",
+        )
+
+        class FakeWorkspaceManager:
+            def prepare_pull_request_conflict_workspace(
+                self,
+                merge_issue: Issue,
+                metadata: dict[str, object],
+                status_snapshot: PullRequestStatusSnapshot,
+            ) -> WorkspaceMergeResult:
+                self.issue = merge_issue
+                self.metadata = metadata
+                self.status_snapshot = status_snapshot
+                return result
+
+        fake_manager = FakeWorkspaceManager()
+        comment = PullRequestCommentResult(
+            provider="github",
+            id="99",
+            url="https://github.com/owner/repo/issues/7#issuecomment-99",
+            marker="<!-- marker -->",
+            body="body",
+            created=True,
+        )
+
+        with patch("agent_team.orchestrator.get_pull_request_status", return_value=snapshot):
+            with patch("agent_team.orchestrator.ensure_pull_request_conflict_comment", return_value=comment) as comment_call:
+                with patch.object(Orchestrator, "_workspace_manager", return_value=fake_manager):
+                    results = Orchestrator(self.store, self.artifacts, self.config).monitor_pull_requests()
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].next_phase, "ready_for_merge_conflict_resolution")
+        updated = self.store.get_issue(issue.id)
+        self.assertEqual(updated.phase, "ready_for_merge_conflict_resolution")
+        comment_call.assert_called_once()
+        metadata = self.artifacts.read_pull_request_metadata(issue.id)
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertEqual(metadata["conflict_comment_id"], "99")
+        self.assertEqual(metadata["conflict_detected_at"], snapshot.checked_at)
+        merge_artifact = self.artifacts.phase_artifact_path(issue.id, "merge").read_text(encoding="utf-8")
+        self.assertIn("Hosted pull request conflict", merge_artifact)
+        self.assertIn("Recommendation: `ready_for_merge_conflict_resolution`", merge_artifact)
 
     @unittest.skipUnless(shutil.which("git"), "git is required for workspace tests")
     def test_merge_phase_commits_uncommitted_workspace_changes(self) -> None:
@@ -3635,6 +3818,68 @@ print(artifact)
         self.store.transition_issue(issue_id, "ready_for_review")
         self.store.transition_issue(issue_id, "reviewing")
         self.store.transition_issue(issue_id, "awaiting_merge_approval")
+
+    def _issue_awaiting_pr_closure(self) -> Issue:
+        issue = self.store.create_issue("pr monitor", "desc", ready=True)
+        self._move_to_merge_approval(issue.id)
+        self.store.transition_issue(issue.id, "ready_for_merge")
+        self.store.transition_issue(issue.id, "merging")
+        return self.store.transition_issue(issue.id, "awaiting_pr_closure")
+
+    def _write_waiting_pr_metadata(self, issue_id: int) -> None:
+        self.artifacts.write_pull_request_metadata(
+            issue_id,
+            {
+                "issue_id": issue_id,
+                "provider": "github",
+                "remote_name": "origin",
+                "remote_url": "https://github.com/owner/repo.git",
+                "remote_identity": ["github", "owner", "repo"],
+                "source_branch": f"agent-team/issue-{issue_id}",
+                "target_branch": "main",
+                "head_commit": "a" * 40,
+                "worktree_head": "a" * 40,
+                "url": "https://github.com/owner/repo/pull/7",
+                "id": "7",
+                "number": 7,
+                "pr_status": "OPEN",
+                "is_existing": False,
+                "monitoring_enabled": True,
+                "conflict_comment_key": f"issue-{issue_id}:github:7",
+                "conflict_comment_marker": f"<!-- agent-team-orchestrator-conflict:issue-{issue_id}:github:7 -->",
+            },
+        )
+
+    def _pr_snapshot(
+        self,
+        *,
+        status: str,
+        merge_state: str | None = None,
+        is_open: bool = False,
+        is_closed: bool = False,
+        is_merged: bool = False,
+        has_conflicts: bool = False,
+        merged_at: str | None = None,
+    ) -> PullRequestStatusSnapshot:
+        return PullRequestStatusSnapshot(
+            provider="github",
+            checked_at="2026-01-02T00:00:00+00:00",
+            status=status,
+            merge_state=merge_state,
+            is_open=is_open,
+            is_closed=is_closed,
+            is_merged=is_merged,
+            has_conflicts=has_conflicts,
+            head_sha="a" * 40,
+            url="https://github.com/owner/repo/pull/7",
+            raw={"state": status},
+            id="7",
+            number=7,
+            source_branch="agent-team/issue-1",
+            target_branch="main",
+            closed_at="2026-01-02T00:00:00+00:00" if is_closed else None,
+            merged_at=merged_at,
+        )
 
     def _insert_pending_human_input(self, issue_id: int, request_id: str) -> None:
         with self.store.connect() as conn:

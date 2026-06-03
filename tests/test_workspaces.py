@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from agent_team.artifacts import ArtifactStore
 from agent_team.models import Issue
-from agent_team.pull_requests import PullRequestError, PullRequestRemote, PullRequestResult
+from agent_team.pull_requests import PullRequestError, PullRequestRemote, PullRequestResult, PullRequestStatusSnapshot
 from agent_team.workspaces import (
     WorkspaceError,
     WorkspaceManager,
@@ -1227,7 +1227,7 @@ class WorkspaceManagerTests(unittest.TestCase):
 
         recovery = self.manager.recover_interrupted_merge(issue)
 
-        self.assertEqual(recovery.next_phase, "done")
+        self.assertEqual(recovery.next_phase, "awaiting_pr_closure")
         self.assertEqual(recovery.run_status, "success")
         self.assertFalse(info.worktree_root.exists())
         self.assertIsNone(self.artifacts.read_workspace_metadata(issue.id))
@@ -1351,6 +1351,39 @@ class WorkspaceManagerTests(unittest.TestCase):
         (info.worktree_root / "dirty.txt").write_text("dirty\n", encoding="utf-8")
         with self.assertRaisesRegex(WorkspaceError, "Issue worktree has uncommitted"):
             self.manager.sync_source_into_workspace(issue, info)
+
+    def test_prepare_pull_request_conflict_workspace_rehydrates_conflicts(self) -> None:
+        issue, metadata, snapshot, bare_remote = self._hosted_pull_request_repair_fixture(conflict=True)
+
+        with patch.object(self.manager, "_git_remote", side_effect=self._fetch_from_bare_remote(bare_remote)):
+            result = self.manager.prepare_pull_request_conflict_workspace(issue, metadata, snapshot)
+
+        self.assertEqual(result.status, "conflicts")
+        self.assertEqual(result.conflict_files, ("README.md",))
+        self.assertIn("Hosted pull request", result.artifact_markdown())
+        info = self.manager.existing(issue)
+        self.assertIn("<<<<<<<", (info.worktree_root / "README.md").read_text(encoding="utf-8"))
+        repair_metadata = self.artifacts.read_workspace_metadata(issue.id)
+        self.assertIsNotNone(repair_metadata)
+        self.assertTrue(repair_metadata["hosted_pull_request_conflict"])
+        self.assertEqual(repair_metadata["hosted_pull_request_target_sync_status"], "conflicts")
+        self.assertEqual(repair_metadata["hosted_pull_request_conflict_files"], ["README.md"])
+
+    def test_prepare_pull_request_conflict_workspace_merges_clean_target_update(self) -> None:
+        issue, metadata, snapshot, bare_remote = self._hosted_pull_request_repair_fixture(conflict=False)
+
+        with patch.object(self.manager, "_git_remote", side_effect=self._fetch_from_bare_remote(bare_remote)):
+            result = self.manager.prepare_pull_request_conflict_workspace(issue, metadata, snapshot)
+
+        self.assertEqual(result.status, "target_synced")
+        self.assertEqual(result.conflict_files, ())
+        info = self.manager.existing(issue)
+        self.assertEqual(self._git(info.worktree_root, "status", "--porcelain"), "")
+        self.assertTrue(self._git_check(info.worktree_root, "merge-base", "--is-ancestor", "HEAD^2", "HEAD"))
+        repair_metadata = self.artifacts.read_workspace_metadata(issue.id)
+        self.assertIsNotNone(repair_metadata)
+        self.assertEqual(repair_metadata["hosted_pull_request_target_sync_status"], "synced")
+        self.assertEqual(repair_metadata["hosted_pull_request_target_sync_commit"], result.worktree_head)
 
     def test_merge_recovery_routes_existing_conflicts_to_resolution(self) -> None:
         issue = self._issue(1, self.repo)
@@ -1556,6 +1589,71 @@ class WorkspaceManagerTests(unittest.TestCase):
         (repo / filename).write_text(content, encoding="utf-8")
         self._git(repo, "add", filename)
         self._git(repo, "commit", "-m", f"add {filename}")
+
+    def _hosted_pull_request_repair_fixture(
+        self, *, conflict: bool
+    ) -> tuple[Issue, dict[str, object], PullRequestStatusSnapshot, Path]:
+        issue = self._issue(1, self.repo)
+        self._git(self.repo, "branch", "-M", "main")
+        bare_remote = self.home / "origin.git"
+        self._git(self.home, "init", "--bare", str(bare_remote))
+        self._git(self.repo, "remote", "add", "origin", "https://github.com/Owner/Repo.git")
+        self._git(self.repo, "push", str(bare_remote), "main:main")
+
+        self._git(self.repo, "checkout", "-b", "agent-team/issue-1")
+        if conflict:
+            (self.repo / "README.md").write_text("feature change\n", encoding="utf-8")
+            self._git(self.repo, "add", "README.md")
+            self._git(self.repo, "commit", "-m", "feature readme")
+        else:
+            self._commit_file(self.repo, "feature.txt", "feature\n")
+        head_sha = self._git(self.repo, "rev-parse", "HEAD")
+        self._git(self.repo, "push", str(bare_remote), "HEAD:agent-team/issue-1")
+
+        self._git(self.repo, "checkout", "main")
+        (self.repo / "README.md").write_text("target change\n", encoding="utf-8")
+        self._git(self.repo, "add", "README.md")
+        self._git(self.repo, "commit", "-m", "target readme")
+        self._git(self.repo, "push", str(bare_remote), "main:main")
+
+        info = self.manager.prepare(issue)
+        metadata: dict[str, object] = {
+            **info.to_metadata(),
+            "provider": "github",
+            "remote_name": "origin",
+            "remote_identity": ["github", "owner", "repo"],
+            "source_branch": "agent-team/issue-1",
+            "target_branch": "main",
+            "head_commit": head_sha,
+            "url": "https://github.com/Owner/Repo/pull/7",
+            "number": 7,
+            "id": "7",
+        }
+        snapshot = PullRequestStatusSnapshot(
+            provider="github",
+            checked_at="2026-01-01T00:00:00+00:00",
+            status="OPEN",
+            merge_state="DIRTY" if conflict else "UNKNOWN",
+            is_open=True,
+            is_closed=False,
+            is_merged=False,
+            has_conflicts=conflict,
+            head_sha=head_sha,
+            url="https://github.com/Owner/Repo/pull/7",
+            raw={},
+            number=7,
+            source_branch="agent-team/issue-1",
+            target_branch="main",
+        )
+        return issue, metadata, snapshot, bare_remote
+
+    def _fetch_from_bare_remote(self, bare_remote: Path):
+        def _fetch(source_root: Path, *args: str) -> str:
+            self.assertGreaterEqual(len(args), 4)
+            self.assertEqual(args[:3], ("fetch", "--no-tags", "origin"))
+            return self.manager._git(source_root, "fetch", "--no-tags", str(bare_remote), *args[3:])
+
+        return _fetch
 
     @staticmethod
     def _issue(issue_id: int, repo_path: Path | None) -> Issue:

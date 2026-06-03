@@ -604,7 +604,11 @@ class AgentTeamWebApp:
         blocked_reason = _blocked_reason_payload(issue, runs, events, artifacts, self._blocked_artifact_excerpt)
         manager_controls = self._manager_controls_payload(issue, repo_context, blocked_reason)
         merged_metadata = self.artifacts.read_merged_workspace_metadata(issue.id) if issue.status == "closed" else None
-        pull_request_metadata = self.artifacts.read_pull_request_metadata(issue.id) if issue.status == "closed" else None
+        pull_request_metadata = (
+            self.artifacts.read_pull_request_metadata(issue.id)
+            if issue.status == "closed" or issue.phase == "awaiting_pr_closure"
+            else None
+        )
         return {
             "generated_at": utc_now_iso(),
             "issue": _issue_payload(issue),
@@ -620,6 +624,11 @@ class AgentTeamWebApp:
                 merged_metadata,
                 pull_request_metadata,
                 self._synopsis_artifact_excerpt,
+            ),
+            "pull_request_monitoring": (
+                _pull_request_monitoring_payload(pull_request_metadata)
+                if issue.phase == "awaiting_pr_closure"
+                else None
             ),
             "human_input": {
                 "pending": _human_input_request_payload(pending_human_input) if pending_human_input else None,
@@ -1755,9 +1764,38 @@ def _pull_request_synopsis_payload(metadata: dict[str, Any] | None) -> dict[str,
         "url": metadata.get("url"),
         "number": metadata.get("number"),
         "id": metadata.get("id"),
-        "status": metadata.get("pr_status"),
+        "status": metadata.get("final_status") or metadata.get("last_status") or metadata.get("pr_status"),
         "finalized_at": metadata.get("finalized_at"),
     }
+
+
+def _pull_request_monitoring_payload(metadata: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not metadata:
+        return None
+    keys = (
+        "provider",
+        "remote_name",
+        "source_branch",
+        "target_branch",
+        "head_commit",
+        "last_head_commit",
+        "url",
+        "number",
+        "id",
+        "pr_status",
+        "last_status",
+        "last_merge_state",
+        "last_status_check_at",
+        "last_is_open",
+        "last_is_closed",
+        "last_is_merged",
+        "last_has_conflicts",
+        "conflict_detected_at",
+        "conflict_comment_posted_at",
+        "conflict_comment_error",
+        "conflict_comment_url",
+    )
+    return {key: metadata.get(key) for key in keys}
 
 
 def _latest_successful_merge_run(runs: list[Any]) -> Any | None:
@@ -1825,6 +1863,8 @@ def _next_manager_action(
         return "Answer the pending human-input request so agents can resume."
     if issue.phase == "awaiting_merge_approval":
         return "Review the worktree merge request, then approve or send it back."
+    if issue.phase == "awaiting_pr_closure":
+        return "Monitoring the hosted pull request; the local issue will close after the PR closes, or resume conflict repair if conflicts appear."
     if issue.phase == "blocked":
         suggested_transition = _blocked_suggested_transition(blocked_reason)
         if suggested_transition is not None:
@@ -1852,7 +1892,7 @@ def _phase_timeline(current_phase: str, artifacts: list[dict[str, Any]] | None =
         ("Implementation", "implementation", ("ready_for_implementation", "implementing")),
         ("Validation", "validation", ("ready_for_validation", "validating")),
         ("Review", "review", ("ready_for_review", "reviewing", "awaiting_merge_approval")),
-        ("Merge", "merge", ("ready_for_merge", "merging")),
+        ("Merge", "merge", ("ready_for_merge", "merging", "awaiting_pr_closure")),
         (
             "Conflict resolution",
             conflict_artifact_key,

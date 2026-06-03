@@ -15,10 +15,13 @@ from agent_team.pull_requests import (
     PullRequestRequest,
     SubprocessCommandRunner,
     create_or_get_pull_request,
+    ensure_pull_request_conflict_comment,
+    get_pull_request_status,
     is_safe_pull_request_url,
     parse_azure_devops_remote,
     parse_github_remote,
     parse_pull_request_remote,
+    pull_request_remote_from_metadata,
 )
 
 
@@ -879,6 +882,196 @@ class PullRequestProviderTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(PullRequestError, "timed out after 1 seconds.*non-interactively"):
                 SubprocessCommandRunner(timeout_seconds=1).run(["gh", "pr", "list"])
+
+    def test_github_status_snapshot_detects_conflicts(self) -> None:
+        metadata = {
+            "provider": "github",
+            "remote_name": "origin",
+            "remote_identity": ["github", "owner", "repo"],
+            "number": 7,
+        }
+        runner = FakeRunner(
+            [
+                command_result(
+                    {
+                        "number": 7,
+                        "url": "https://github.com/owner/repo/pull/7",
+                        "state": "OPEN",
+                        "mergeable": "CONFLICTING",
+                        "mergeStateStatus": "DIRTY",
+                        "headRefName": "feature",
+                        "baseRefName": "main",
+                        "headRefOid": "a" * 40,
+                    }
+                )
+            ]
+        )
+
+        snapshot = get_pull_request_status(metadata, runner)
+
+        self.assertTrue(snapshot.is_open)
+        self.assertTrue(snapshot.has_conflicts)
+        self.assertFalse(snapshot.is_closed)
+        self.assertEqual(snapshot.merge_state, "DIRTY")
+        self.assertEqual(snapshot.head_sha, "a" * 40)
+        self.assertEqual(
+            runner.calls[0],
+            (
+                "gh",
+                "pr",
+                "view",
+                "7",
+                "--repo",
+                "owner/repo",
+                "--json",
+                "number,url,state,mergedAt,closedAt,isDraft,mergeable,mergeStateStatus,headRefName,baseRefName,headRefOid",
+            ),
+        )
+
+    def test_github_status_snapshot_closes_merged_pr(self) -> None:
+        metadata = {
+            "provider": "github",
+            "remote_name": "origin",
+            "remote_identity": ["github", "owner", "repo"],
+            "url": "https://github.com/owner/repo/pull/7",
+        }
+        runner = FakeRunner(
+            [
+                command_result(
+                    {
+                        "number": 7,
+                        "url": "https://github.com/owner/repo/pull/7",
+                        "state": "MERGED",
+                        "mergedAt": "2026-01-01T00:00:00Z",
+                        "closedAt": "2026-01-01T00:00:00Z",
+                        "mergeable": "MERGEABLE",
+                        "headRefName": "feature",
+                        "baseRefName": "main",
+                    }
+                )
+            ]
+        )
+
+        snapshot = get_pull_request_status(metadata, runner)
+
+        self.assertTrue(snapshot.is_closed)
+        self.assertTrue(snapshot.is_merged)
+        self.assertFalse(snapshot.has_conflicts)
+        self.assertEqual(snapshot.merged_at, "2026-01-01T00:00:00Z")
+
+    def test_azure_devops_status_snapshot_distinguishes_policy_failure_from_conflict(self) -> None:
+        metadata = {
+            "provider": "azure-devops",
+            "remote_name": "origin",
+            "remote_identity": ["azure-devops", "org", "project", "repo"],
+            "id": "17",
+        }
+        runner = FakeRunner(
+            [
+                command_result(
+                    {
+                        "pullRequestId": 17,
+                        "status": "active",
+                        "mergeStatus": "rejectedByPolicy",
+                        "sourceRefName": "refs/heads/feature",
+                        "targetRefName": "refs/heads/main",
+                        "lastMergeSourceCommit": {"commitId": "b" * 40},
+                        "webUrl": "https://dev.azure.com/org/project/_git/repo/pullrequest/17",
+                    }
+                )
+            ]
+        )
+
+        snapshot = get_pull_request_status(metadata, runner)
+
+        self.assertTrue(snapshot.is_open)
+        self.assertFalse(snapshot.has_conflicts)
+        self.assertEqual(snapshot.merge_state, "rejectedbypolicy")
+        self.assertEqual(snapshot.head_sha, "b" * 40)
+        self.assertEqual(runner.calls[0][:4], ("az", "repos", "pr", "show"))
+
+    def test_azure_devops_status_snapshot_detects_conflict(self) -> None:
+        metadata = {
+            "provider": "azure-devops",
+            "remote_name": "origin",
+            "remote_identity": ["azure-devops", "org", "project", "repo"],
+            "id": "17",
+        }
+        runner = FakeRunner(
+            [
+                command_result(
+                    {
+                        "pullRequestId": 17,
+                        "status": "active",
+                        "mergeStatus": "conflicts",
+                        "sourceRefName": "refs/heads/feature",
+                        "targetRefName": "refs/heads/main",
+                        "webUrl": "https://dev.azure.com/org/project/_git/repo/pullrequest/17",
+                    }
+                )
+            ]
+        )
+
+        snapshot = get_pull_request_status(metadata, runner)
+
+        self.assertTrue(snapshot.has_conflicts)
+        self.assertTrue(snapshot.is_open)
+
+    def test_github_conflict_comment_updates_existing_marker(self) -> None:
+        metadata = {
+            "provider": "github",
+            "remote_name": "origin",
+            "remote_identity": ["github", "owner", "repo"],
+            "number": 7,
+            "conflict_comment_marker": "<!-- marker -->",
+        }
+        runner = FakeRunner(
+            [
+                command_result([[{"id": 99, "body": "prior\n<!-- marker -->"}]]),
+                command_result({"id": 99, "html_url": "https://github.com/owner/repo/issues/7#issuecomment-99"}),
+            ]
+        )
+
+        result = ensure_pull_request_conflict_comment(metadata, "<!-- marker -->\nupdated", runner)
+
+        self.assertFalse(result.created)
+        self.assertEqual(result.id, "99")
+        self.assertEqual(runner.calls[1][:5], ("gh", "api", "repos/owner/repo/issues/comments/99", "-X", "PATCH"))
+
+    def test_azure_devops_conflict_comment_creates_thread_when_marker_missing(self) -> None:
+        metadata = {
+            "provider": "azure-devops",
+            "remote_name": "origin",
+            "remote_identity": ["azure-devops", "org", "project", "repo"],
+            "id": "17",
+            "conflict_comment_marker": "<!-- marker -->",
+        }
+        runner = FakeRunner(
+            [
+                command_result({"value": []}),
+                command_result({"id": 123, "comments": [{"id": 1, "content": "<!-- marker -->\nbody"}]}),
+            ]
+        )
+
+        result = ensure_pull_request_conflict_comment(metadata, "<!-- marker -->\nbody", runner)
+
+        self.assertTrue(result.created)
+        self.assertEqual(result.id, "1")
+        self.assertEqual(runner.calls[0][:4], ("az", "rest", "--method", "get"))
+        self.assertEqual(runner.calls[1][:4], ("az", "rest", "--method", "post"))
+
+    def test_pull_request_remote_from_metadata_reconstructs_identity_without_remote_url(self) -> None:
+        remote = pull_request_remote_from_metadata(
+            {
+                "provider": "github",
+                "remote_name": "origin",
+                "remote_identity": ["github", "Owner", "Repo"],
+            }
+        )
+
+        self.assertEqual(remote.provider, "github")
+        self.assertEqual(remote.owner, "owner")
+        self.assertEqual(remote.repo, "repo")
 
     def test_unsupported_provider_is_explicit(self) -> None:
         remote = PullRequestRemote(provider="unsupported", remote_name="origin", url="local://repo", repo="repo")

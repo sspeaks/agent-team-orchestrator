@@ -21,6 +21,7 @@ from .web_html import (
     _render_blocked_reason,
     _render_closed_synopsis,
     _render_human_input_panel,
+    _render_pull_request_monitoring_panel,
     _runtime_summary,
     _summary_card,
     phase_label,
@@ -131,6 +132,7 @@ def render_issue_detail_body(
     csrf_token: str,
 ) -> str:
     human_input_panel = _render_human_input_panel(payload["human_input"])
+    pull_request_monitoring_panel = _render_pull_request_monitoring_panel(payload.get("pull_request_monitoring"))
     controls = _manager_controls_html(payload["manager_controls"], csrf_token)
     current_log_panel = f"""
               <div class="panel current-log-panel">
@@ -157,12 +159,12 @@ def render_issue_detail_body(
     if issue.phase == "awaiting_merge_approval":
         action_panels = (
             f"{plan_review}{human_input_panel}{review_artifact}"
-            f"{current_log_panel}{issue_context_panel}"
+            f"{pull_request_monitoring_panel}{current_log_panel}{issue_context_panel}"
         )
     else:
         action_panels = (
-            f"{plan_review}{human_input_panel}{current_log_panel}"
-            f"{issue_context_panel}"
+            f"{plan_review}{human_input_panel}{pull_request_monitoring_panel}"
+            f"{current_log_panel}{issue_context_panel}"
         )
     return f"""
             <section class="hero issue-hero">

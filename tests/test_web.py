@@ -1230,6 +1230,44 @@ class WebTests(unittest.TestCase):
         self.assertEqual(reject_control["fields"][0]["name"], "feedback")
         self.assertTrue(reject_control["fields"][0]["required"])
 
+    def test_issue_detail_shows_pull_request_monitoring_panel(self) -> None:
+        issue = self.store.create_issue("pr monitor issue", "desc", ready=True)
+        self._move_to_merge_approval(issue.id)
+        self.store.transition_issue(issue.id, "ready_for_merge")
+        self.store.transition_issue(issue.id, "merging")
+        self.store.transition_issue(issue.id, "awaiting_pr_closure")
+        self.artifacts.write_pull_request_metadata(
+            issue.id,
+            {
+                "provider": "github",
+                "remote_name": "origin",
+                "source_branch": "agent-team/issue-1",
+                "target_branch": "main",
+                "head_commit": "a" * 40,
+                "last_head_commit": "b" * 40,
+                "url": "javascript:alert(1)",
+                "number": 7,
+                "id": "7",
+                "pr_status": "OPEN",
+                "last_status": "OPEN",
+                "last_merge_state": "DIRTY",
+                "last_status_check_at": "2026-01-01T00:00:00+00:00",
+                "conflict_detected_at": "2026-01-01T00:00:00+00:00",
+                "conflict_comment_error": "provider denied comment",
+            },
+        )
+
+        payload, _headers = self.get_json(f"/api/issues/{issue.id}")
+        html = self.get(f"/issues/{issue.id}")
+
+        self.assertEqual(payload["issue"]["phase"], "awaiting_pr_closure")
+        self.assertIn("Monitoring the hosted pull request", payload["next_action"])
+        self.assertEqual(payload["pull_request_monitoring"]["last_merge_state"], "DIRTY")
+        self.assertIn("Pull request monitoring", html)
+        self.assertIn("provider denied comment", html)
+        self.assertIn("Pull request #7", html)
+        self.assertNotIn('href="javascript:alert(1)"', html)
+
     def test_issue_live_transition_to_merge_approval_reloads_detail_layout(self) -> None:
         node = shutil.which("node")
         if not node:

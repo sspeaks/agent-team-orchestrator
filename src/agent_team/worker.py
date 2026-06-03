@@ -25,6 +25,7 @@ def process_batch(
     results: list[ProcessResult] = []
     active_issue_ids: set[int] = set()
     futures: dict[Future[ProcessResult], int] = {}
+    monitored_pull_requests = False
     if not _stop_requested(stop_event):
         _recover_interrupted_runs(store, artifacts, config)
 
@@ -32,6 +33,9 @@ def process_batch(
         while True:
             if not futures and not _stop_requested(stop_event):
                 _recover_interrupted_runs(store, artifacts, config)
+                if not monitored_pull_requests:
+                    results.extend(_monitor_pull_requests(store, artifacts, config))
+                    monitored_pull_requests = True
             if not _stop_requested(stop_event):
                 _refill_slots(executor, store, artifacts, config, concurrency, futures, active_issue_ids, stop_event)
             if not futures:
@@ -129,6 +133,13 @@ def _recover_interrupted_runs(store: IssueStore, artifacts: ArtifactStore, confi
     recover = getattr(Orchestrator(store, artifacts, config), "recover_interrupted_runs", None)
     if recover is not None:
         recover()
+
+
+def _monitor_pull_requests(store: IssueStore, artifacts: ArtifactStore, config: AppConfig) -> list[ProcessResult]:
+    monitor = getattr(Orchestrator(store, artifacts, config), "monitor_pull_requests", None)
+    if monitor is None:
+        return []
+    return monitor()
 
 
 def _stop_requested(stop_event: threading.Event | None) -> bool:

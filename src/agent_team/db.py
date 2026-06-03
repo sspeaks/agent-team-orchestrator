@@ -393,6 +393,43 @@ class IssueStore:
             ).fetchall()
         return [Issue.from_row(row) for row in rows]
 
+    def list_issues_awaiting_pr_closure(
+        self,
+        limit: int = 100,
+        *,
+        repo_path: str | None = None,
+        exclude_issue_ids: set[int] | None = None,
+    ) -> list[Issue]:
+        if limit <= 0:
+            return []
+        excluded = sorted(exclude_issue_ids or set())
+        exclude_clause = ""
+        repo_clause = ""
+        params: list[object] = [utc_now_iso()]
+        if repo_path is not None:
+            repo_clause = "AND repo_path = ?"
+            params.append(repo_path)
+        if excluded:
+            exclude_placeholders = ",".join("?" for _ in excluded)
+            exclude_clause = f"AND id NOT IN ({exclude_placeholders})"
+            params.extend(excluded)
+        params.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM issues
+                WHERE status = 'open'
+                  AND phase = 'awaiting_pr_closure'
+                  AND (lock_expires_at IS NULL OR lock_expires_at < ?)
+                  {repo_clause}
+                  {exclude_clause}
+                ORDER BY priority ASC, COALESCE(last_scheduled_at, created_at) ASC, id ASC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [Issue.from_row(row) for row in rows]
+
     def dashboard_summary(self, repo_path: str | None = None) -> dict[str, object]:
         now = utc_now_iso()
         issue_where = "WHERE repo_path = ?" if repo_path is not None else ""
@@ -879,6 +916,22 @@ class IssueStore:
             )
             if cur.rowcount == 1:
                 self._add_event(conn, issue_id, run_id, "lock.released", f"{owner} released lock")
+
+    def claim_pr_monitor_issue(self, issue_id: int, owner: str, ttl_seconds: int, monitor_id: str) -> Issue | None:
+        if not self.acquire_lock(
+            issue_id,
+            owner,
+            ttl_seconds,
+            monitor_id,
+            expected_phase="awaiting_pr_closure",
+            mark_scheduled=True,
+        ):
+            return None
+        return self.get_issue(issue_id)
+
+    def record_event(self, issue_id: int, event_type: str, message: str, run_id: str | None = None) -> None:
+        with self.connect() as conn:
+            self._add_event(conn, issue_id, run_id, event_type, message)
 
     def transition_issue(
         self,
