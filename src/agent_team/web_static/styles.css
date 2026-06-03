@@ -49,11 +49,17 @@ legend { font-weight: 800; margin-bottom: 0.45rem; }
 .activity-grid { grid-template-columns: minmax(18rem, 1fr) minmax(18rem, 1fr); }
 .plan-review-panel, .review-artifact-panel { grid-column: 1 / -1; }
 .phase-artifact-preview-content { max-height: 32rem; min-height: 12rem; overflow: auto; }
+.issue-focus-layout { align-items: start; display: grid; gap: 1rem; grid-template-columns: minmax(18rem, 24rem) minmax(0, 1fr); margin-bottom: 2rem; }
+.issue-action-rail { max-height: calc(100vh - 2rem); overflow: auto; position: sticky; top: 1rem; }
+.issue-focus-layout > .issue-action-rail { margin-bottom: 0; }
+.issue-focus-content { display: grid; gap: 1rem; min-width: 0; }
+.issue-focus-content > .panel, .issue-focus-content > section { margin-bottom: 0; }
 .blocked-reason-panel { border-left: 6px solid var(--attention); }
 .blocked-reason-summary { font-size: 1.05rem; font-weight: 800; }
-.blocked-reason-error { max-height: 14rem; }
+.blocked-reason-error { max-height: 14rem; overflow-y: auto; }
 .blocked-reason-links .button { margin-right: 0.5rem; }
 .blocked-reason-technical { margin-top: 0.75rem; }
+.blocked-reason-technical p, .blocked-reason-technical pre { overflow-wrap: anywhere; }
 .blocked-reason-technical summary { cursor: pointer; font-weight: 800; }
 .blocked-summary-inline { display: inline-block; margin-top: 0.2rem; }
 .closed-synopsis-panel { border-left: 6px solid var(--ok); }
@@ -92,4 +98,5 @@ a.phase-step.has-artifact:focus-visible { outline: 2px solid #2563eb; outline-of
 .item-list { display: grid; gap: 0.6rem; list-style: none; margin: 0; padding: 0; }
 .item-list li { border-bottom: 1px solid var(--border); padding-bottom: 0.55rem; }
 .item-list strong { display: block; }
+@media (max-width: 900px) { .issue-focus-layout { grid-template-columns: 1fr; } .issue-action-rail { max-height: none; overflow: visible; position: static; } }
 @media (max-width: 760px) { .hero { align-items: stretch; flex-direction: column; } .hero-action { flex: auto; } .panel-grid, .issue-grid { grid-template-columns: 1fr; } }

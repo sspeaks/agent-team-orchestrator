@@ -303,6 +303,12 @@
       container.replaceChildren();
       container.hidden = true;
       container.className = "";
+      container.removeAttribute("data-blocked-reason-signature");
+      return;
+    }
+
+    var nextSignature = JSON.stringify(reason);
+    if (container.getAttribute("data-blocked-reason-signature") === nextSignature) {
       return;
     }
 
@@ -319,6 +325,7 @@
     }
     nodes.push(blockedReasonTechnicalDetails(reason, summary));
     container.replaceChildren.apply(container, nodes);
+    container.setAttribute("data-blocked-reason-signature", nextSignature);
   }
 
   function blockedReasonTechnicalDetails(reason, summary) {
@@ -333,6 +340,7 @@
     }
 
     var details = el("details", "blocked-reason-technical");
+    details.open = true;
     details.append(el("summary", null, "Technical details"));
     details.append(el("p", "muted", metaParts.join(" - ")));
     if (reason.technical_summary && reason.technical_summary !== summary) {

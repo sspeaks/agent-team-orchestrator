@@ -25,7 +25,7 @@ from agent_team.config import AppConfig
 from agent_team.models import HumanInputRequestDraft, utc_now_iso
 from agent_team.orchestrator import Orchestrator
 from agent_team.web import AgentTeamWebApp, LOG_TAIL_BYTES, WebJob, serve_web, serve_web_and_worker
-from agent_team.web_html import _render_closed_synopsis
+from agent_team.web_html import _render_blocked_reason, _render_closed_synopsis
 
 
 class WebRenderingTests(unittest.TestCase):
@@ -96,6 +96,26 @@ class WebRenderingTests(unittest.TestCase):
 
         self.assertIn("!parsed.search", script)
         self.assertIn("!parsed.hash", script)
+
+    def test_server_blocked_reason_defaults_technical_details_open(self) -> None:
+        rendered = _render_blocked_reason(
+            {
+                "source": "run",
+                "summary": "Credentials are missing. Add them and rerun research.",
+                "technical_summary": "Full blocked details should be immediately readable.",
+                "error": "Raw runner error",
+            }
+        )
+
+        self.assertIn('data-blocked-reason-signature=', rendered)
+        self.assertIn("Credentials are missing. Add them and rerun research.", rendered)
+        self.assertIn('<details class="blocked-reason-technical" open>', rendered)
+        self.assertLess(
+            rendered.index("Credentials are missing. Add them and rerun research."),
+            rendered.index('<details class="blocked-reason-technical" open>'),
+        )
+        self.assertIn("Full blocked details should be immediately readable.", rendered)
+        self.assertIn("Raw runner error", rendered)
 
 
 class WebTests(unittest.TestCase):
@@ -289,6 +309,11 @@ class WebTests(unittest.TestCase):
         html = self.get(f"/issues/{issue.id}")
 
         controls_index = html.index("Primary controls")
+        focus_index = html.index('class="issue-focus-layout"')
+        focus_html = html[focus_index : html.index("Workflow progress")]
+        self.assertIn("issue-action-rail", focus_html)
+        self.assertIn("issue-focus-content", focus_html)
+        self.assertIn("Plan review", focus_html)
         self.assertLess(html.index("Next action"), controls_index)
         for label in (
             "Workflow progress",
@@ -307,8 +332,12 @@ class WebTests(unittest.TestCase):
         blocked_issue = self.store.create_issue("blocked top controls issue", "desc", ready=True)
         self.store.transition_issue(blocked_issue.id, "blocked", message="Blocked before long details")
         blocked_html = self.get(f"/issues/{blocked_issue.id}")
+        blocked_focus = blocked_html[blocked_html.index('class="issue-focus-layout"') : blocked_html.index("Workflow progress")]
 
         self.assertLess(blocked_html.index("Primary controls"), blocked_html.index("Blocked reason"))
+        self.assertIn("issue-action-rail", blocked_focus)
+        self.assertIn("issue-focus-content", blocked_focus)
+        self.assertIn("Blocked reason", blocked_focus)
         self.assertEqual(blocked_html.count("data-action-stack"), 1)
 
     def test_issue_detail_places_review_artifact_and_merge_controls_before_current_log(self) -> None:
@@ -867,6 +896,8 @@ class WebTests(unittest.TestCase):
         self.assertEqual(reason["technical_summary"], "Verbose runner output includes stack traces and internal retry metadata.")
         self.assertIn("Credentials are missing. Add them and rerun research.", primary_html)
         self.assertNotIn("Runner failed", primary_html)
+        self.assertIn('data-blocked-reason-signature=', prominent_html)
+        self.assertIn('<details class="blocked-reason-technical" open>', prominent_html)
         self.assertIn("<summary>Technical details</summary>", prominent_html)
         self.assertIn("Runner failed on &lt;unsafe&gt; output", prominent_html)
 
@@ -1389,9 +1420,12 @@ function fakeElement(tag) {{
     className: "",
     textContent: "",
     children: [],
+    attrs: {{}},
     classList: {{ toggle() {{}} }},
     append() {{ this.children.push.apply(this.children, arguments); }},
-    setAttribute(name, value) {{ this[name] = String(value); }},
+    getAttribute(name) {{ return Object.prototype.hasOwnProperty.call(this.attrs, name) ? this.attrs[name] : null; }},
+    setAttribute(name, value) {{ this.attrs[name] = String(value); }},
+    removeAttribute(name) {{ delete this.attrs[name]; }},
     replaceChildren() {{ this.children = Array.prototype.slice.call(arguments); }},
     querySelectorAll() {{ return []; }}
   }};
@@ -1441,6 +1475,149 @@ setTimeout(() => {{
   assert(blockedText.includes("Blocked <summary>"));
   assert(blockedText.includes("Detailed <error>"));
   assert(collectLinks(blockedReason).includes("/artifacts/{issue.id}/research.md"));
+}}, 0);
+"""
+        result = subprocess.run([node, "-e", test_script], capture_output=True, text=True, timeout=5, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_issue_live_blocked_reason_preserves_open_details_when_unchanged(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is required for the blocked reason JavaScript regression test")
+        script = self.get("/static/app.js")
+        issue_payload = {
+            "generated_at": "now",
+            "issue": {
+                "title": "blocked live issue",
+                "phase": "blocked",
+                "status": "open",
+                "current_run_id": None,
+                "lock_owner": None,
+                "lock_expires_at": None,
+            },
+            "active_job": None,
+            "next_action": "Blocked.",
+            "csrf_token": "fresh-token",
+            "manager_controls": [],
+            "manager_controls_signature": "[]",
+            "phase_timeline": [],
+            "recent_events": [],
+            "recent_runs": [],
+            "artifacts": [],
+            "blocked_reason": {
+                "source": "run",
+                "summary": "Credentials are missing. Add them and rerun research.",
+                "technical_summary": "Full blocked reason with enough detail to read.",
+                "error": "Detailed error output",
+                "run_id": "run-js",
+                "phase": "research",
+                "status": "blocked",
+                "started_at": None,
+                "completed_at": "later",
+                "artifact": {"label": "Open blocked artifact", "url": "/artifacts/1/research.md"},
+                "log": None,
+            },
+        }
+        test_script = f"""
+const assert = require("assert");
+const appScript = {json.dumps(script)};
+const issuePayload = {json.dumps(issue_payload)};
+const logPayload = {{
+  generated_at: "now",
+  issue_id: 1,
+  log: {{ exists: false, relative_path: null, content: "", size_bytes: 0, truncated: false }}
+}};
+let issueTick = null;
+const liveStatus = {{
+  textContent: "",
+  classList: {{ toggle() {{}} }}
+}};
+const actionStack = {{
+  attrs: {{ "data-controls-signature": issuePayload.manager_controls_signature }},
+  getAttribute(name) {{ return Object.prototype.hasOwnProperty.call(this.attrs, name) ? this.attrs[name] : null; }},
+  setAttribute(name, value) {{ this.attrs[name] = String(value); }},
+  querySelectorAll() {{ return []; }},
+  replaceChildren() {{}}
+}};
+function fakeElement(tag) {{
+  return {{
+    tagName: tag,
+    className: "",
+    textContent: "",
+    children: [],
+    attrs: {{}},
+    open: false,
+    classList: {{ toggle() {{}} }},
+    append() {{ this.children.push.apply(this.children, arguments); }},
+    getAttribute(name) {{ return Object.prototype.hasOwnProperty.call(this.attrs, name) ? this.attrs[name] : null; }},
+    setAttribute(name, value) {{ this.attrs[name] = String(value); }},
+    removeAttribute(name) {{ delete this.attrs[name]; }},
+    replaceChildren() {{ this.children = Array.prototype.slice.call(arguments); }},
+    querySelectorAll() {{ return []; }}
+  }};
+}}
+const blockedReason = fakeElement("section");
+let blockedReasonReplaceCount = 0;
+blockedReason.replaceChildren = function () {{
+  blockedReasonReplaceCount += 1;
+  this.children = Array.prototype.slice.call(arguments);
+}};
+function findDetails(node) {{
+  for (const child of node.children || []) {{
+    if (child && String(child.tagName || "").toLowerCase() === "details") {{
+      return child;
+    }}
+    const nested = findDetails(child || {{}});
+    if (nested) return nested;
+  }}
+  return null;
+}}
+global.document = {{
+  hidden: false,
+  getElementById(id) {{
+    return id === "agent-team-bootstrap"
+      ? {{ textContent: JSON.stringify({{ page: "issue", issue_id: 1, csrf_token: "stale-token" }}) }}
+      : null;
+  }},
+  querySelector(selector) {{
+    if (selector === "[data-action-stack]") return actionStack;
+    if (selector === "[data-live-status]") return liveStatus;
+    if (selector === "[data-blocked-reason]") return blockedReason;
+    return null;
+  }},
+  createElement: fakeElement,
+  createTextNode(text) {{ return {{ textContent: String(text) }}; }}
+}};
+global.window = {{
+  setTimeout(fn, delay) {{
+    if (delay === 2500) {{
+      issueTick = fn;
+    }}
+  }}
+}};
+global.fetch = function (path) {{
+  const payload = path.indexOf("/logs/current") === -1 ? issuePayload : logPayload;
+  return Promise.resolve({{
+    ok: true,
+    status: 200,
+    json() {{ return Promise.resolve(payload); }}
+  }});
+}};
+eval(appScript);
+setTimeout(() => {{
+  assert.strictEqual(blockedReason.hidden, false);
+  assert.strictEqual(blockedReasonReplaceCount, 1);
+  const details = findDetails(blockedReason);
+  assert(details, "Expected technical details element");
+  assert.strictEqual(details.open, true);
+  details.open = true;
+  assert(issueTick, "Expected issue poll to schedule the next tick");
+  issueTick();
+  setTimeout(() => {{
+    assert.strictEqual(blockedReasonReplaceCount, 1);
+    assert.strictEqual(findDetails(blockedReason), details);
+    assert.strictEqual(details.open, true);
+  }}, 0);
 }}, 0);
 """
         result = subprocess.run([node, "-e", test_script], capture_output=True, text=True, timeout=5, check=False)

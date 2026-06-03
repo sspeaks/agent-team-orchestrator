@@ -132,6 +132,8 @@ def render_issue_detail_body(
 ) -> str:
     human_input_panel = _render_human_input_panel(payload["human_input"])
     controls = _manager_controls_html(payload["manager_controls"], csrf_token)
+    blocked_reason = _render_blocked_reason(payload["blocked_reason"])
+    closed_synopsis = _render_closed_synopsis(payload["closed_synopsis"])
     current_log_panel = f"""
               <div class="panel current-log-panel">
                 <div class="section-header">
@@ -154,16 +156,41 @@ def render_issue_detail_body(
                 </dl>
               </div>
     """
-    if issue.phase == "awaiting_merge_approval":
-        action_panels = (
-            f"{plan_review}{human_input_panel}{review_artifact}"
-            f"{current_log_panel}{issue_context_panel}"
-        )
+    action_panel = f"""
+              <section class="panel priority next-action-panel top-primary-controls-panel issue-action-rail">
+                <h2>Next action</h2>
+                <p class="next-action" data-next-action>{_esc(payload["next_action"])}</p>
+                <div class="top-primary-controls">
+                  <h3>Primary controls</h3>
+                  <div class="action-stack" data-action-stack data-controls-signature="{_esc(payload["manager_controls_signature"])}">{controls}</div>
+                </div>
+              </section>
+    """
+    focus_panels = (
+        f"{blocked_reason if payload['blocked_reason'] else ''}"
+        f"{closed_synopsis if payload['closed_synopsis'] else ''}"
+        f"{plan_review}{human_input_panel}{review_artifact}"
+    )
+    hidden_status_panels = (
+        f"{blocked_reason if not payload['blocked_reason'] else ''}"
+        f"{closed_synopsis if not payload['closed_synopsis'] else ''}"
+    )
+    if focus_panels:
+        action_and_focus = f"""
+            <section class="issue-focus-layout" aria-label="Issue action and review context">
+              {action_panel}
+              <div class="issue-focus-content">
+                {focus_panels}
+              </div>
+            </section>
+            {hidden_status_panels}
+        """
     else:
-        action_panels = (
-            f"{plan_review}{human_input_panel}{current_log_panel}"
-            f"{issue_context_panel}"
-        )
+        action_and_focus = f"""
+            {action_panel}
+            {hidden_status_panels}
+        """
+    action_panels = f"{current_log_panel}{issue_context_panel}"
     return f"""
             <section class="hero issue-hero">
               <div>
@@ -182,16 +209,7 @@ def render_issue_detail_body(
                 <dt>Queued browser action</dt><dd data-active-job>{_esc(_active_job_text(payload["active_job"]))}</dd>
               </dl>
             </section>
-            <section class="panel priority next-action-panel top-primary-controls-panel">
-              <h2>Next action</h2>
-              <p class="next-action" data-next-action>{_esc(payload["next_action"])}</p>
-              <div class="top-primary-controls">
-                <h3>Primary controls</h3>
-                <div class="action-stack" data-action-stack data-controls-signature="{_esc(payload["manager_controls_signature"])}">{controls}</div>
-              </div>
-            </section>
-            {_render_blocked_reason(payload["blocked_reason"])}
-            {_render_closed_synopsis(payload["closed_synopsis"])}
+            {action_and_focus}
             <section>
               <h2>Workflow progress <span class="muted">(Phase timeline)</span></h2>
               <nav class="timeline" aria-label="Workflow progress" data-phase-timeline>{_phase_timeline_html(payload["phase_timeline"])}</nav>

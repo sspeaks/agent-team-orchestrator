@@ -126,19 +126,24 @@ def _render_blocked_reason(reason: dict[str, Any] | None) -> str:
         return '<section data-blocked-reason hidden></section>'
 
     summary = reason.get("summary") or reason.get("headline")
+    signature = _blocked_reason_signature(reason)
     suggested_transition = reason.get("suggested_transition")
     retry = ""
     if isinstance(suggested_transition, dict) and suggested_transition.get("label"):
         retry = f'<p class="muted">Suggested retry: {_esc(suggested_transition["label"])}</p>'
     technical_details = _blocked_reason_technical_details(reason, summary)
     return f"""
-            <section class="panel attention blocked-reason-panel" data-blocked-reason>
+            <section class="panel attention blocked-reason-panel" data-blocked-reason data-blocked-reason-signature="{_esc(signature)}">
               <h2>Blocked reason</h2>
               <p class="blocked-reason-summary">{_esc(summary)}</p>
               {retry}
               {technical_details}
             </section>
     """
+
+
+def _blocked_reason_signature(reason: dict[str, Any]) -> str:
+    return json.dumps(reason, ensure_ascii=False, separators=(",", ":"))
 
 
 def _render_closed_synopsis(synopsis: dict[str, Any] | None) -> str:
@@ -298,7 +303,7 @@ def _blocked_reason_technical_details(reason: dict[str, Any], summary: object) -
     if links:
         blocks.append(links)
     return (
-        '<details class="blocked-reason-technical">'
+        '<details class="blocked-reason-technical" open>'
         '<summary>Technical details</summary>'
         f'{"".join(blocks)}'
         '</details>'
