@@ -3,7 +3,9 @@ import tempfile
 from pathlib import Path
 
 from agent_team.human_input_policy import human_input_policy_prompt
+from agent_team.config import AppConfig, CopilotModelSelection
 from agent_team.models import Issue
+from agent_team.orchestrator import build_runner
 from agent_team.runners.copilot_cli import PHASE_AGENTS, PHASE_PERMISSION_POLICIES, CopilotCliRunner
 
 
@@ -127,6 +129,12 @@ class CopilotCliRunnerTests(unittest.TestCase):
     def test_invalid_permission_mode_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "permission_mode"):
             CopilotCliRunner(permission_mode="open")
+
+    def test_invalid_phase_model_override_is_rejected(self) -> None:
+        for phase in ("merge", "unknown"):
+            with self.subTest(phase=phase):
+                with self.assertRaisesRegex(ValueError, "unsupported phase"):
+                    CopilotCliRunner(phase_overrides={phase: CopilotModelSelection(model="gpt-5-mini")})
 
     def test_blocked_recommendation_blocks_next_phase(self) -> None:
         recommended = CopilotCliRunner._recommended_next_phase(
@@ -562,6 +570,74 @@ Recommendation: `awaiting_human_input`
         self.assertNotIn("--allow-all", command)
         self.assertNotIn("--allow-all-tools", command)
         self.assertEqual(command[-1], "--allow-tool=read")
+
+    def test_default_commands_do_not_emit_model_selection_args(self) -> None:
+        runner = CopilotCliRunner()
+        for phase in PHASE_AGENTS:
+            with self.subTest(phase=phase):
+                command = runner._build_command(phase, "prompt", Path("/tmp/repo"))
+                self.assertNotIn("--model", command)
+                self.assertNotIn("--reasoning-effort", command)
+
+    def test_phase_model_overrides_change_effective_command_args(self) -> None:
+        runner = CopilotCliRunner(
+            model="gpt-5.4-mini",
+            reasoning_effort="low",
+            phase_overrides={
+                "plan": CopilotModelSelection(model="gpt-5.5", reasoning_effort="xhigh"),
+                "validation": CopilotModelSelection(model="gpt-5-mini", reasoning_effort="none"),
+                "review": CopilotModelSelection(reasoning_effort="high"),
+            },
+        )
+
+        plan = runner._build_command("plan", "prompt", Path("/tmp/repo"))
+        validation = runner._build_command("validation", "prompt", Path("/tmp/repo"))
+        implementation = runner._build_command("implementation", "prompt", Path("/tmp/repo"))
+        review = runner._build_command("review", "prompt", Path("/tmp/repo"))
+
+        self.assertEqual(self._arg_value(plan, "--model"), "gpt-5.5")
+        self.assertEqual(self._arg_value(plan, "--reasoning-effort"), "xhigh")
+        self.assertEqual(self._arg_value(validation, "--model"), "gpt-5-mini")
+        self.assertEqual(self._arg_value(validation, "--reasoning-effort"), "none")
+        self.assertEqual(self._arg_value(implementation, "--model"), "gpt-5.4-mini")
+        self.assertEqual(self._arg_value(implementation, "--reasoning-effort"), "low")
+        self.assertEqual(self._arg_value(review, "--model"), "gpt-5.4-mini")
+        self.assertEqual(self._arg_value(review, "--reasoning-effort"), "high")
+
+    def test_extra_args_are_appended_after_structured_model_args(self) -> None:
+        runner = CopilotCliRunner(
+            model="structured-model",
+            reasoning_effort="medium",
+            extra_args=("--model", "raw-model", "--reasoning-effort", "max"),
+        )
+
+        command = runner._build_command("research", "prompt", Path("/tmp/repo"))
+
+        self.assertEqual(command[-4:], ["--model", "raw-model", "--reasoning-effort", "max"])
+        self.assertEqual(command[command.index("--model") + 1], "structured-model")
+        self.assertEqual(command[command.index("--reasoning-effort") + 1], "medium")
+
+    def test_build_runner_passes_model_selection_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            runner = build_runner(
+                AppConfig(
+                    home=home,
+                    db_path=home / "state.db",
+                    artifacts_dir=home / "issues",
+                    worktrees_dir=home / "worktrees",
+                    copilot_model="global-model",
+                    copilot_reasoning_effort="low",
+                    copilot_phase_overrides={
+                        "validation": CopilotModelSelection(model="fast-model", reasoning_effort="none")
+                    },
+                )
+            )
+
+        self.assertIsInstance(runner, CopilotCliRunner)
+        command = runner._build_command("validation", "prompt", Path("/tmp/repo"))
+        self.assertEqual(self._arg_value(command, "--model"), "fast-model")
+        self.assertEqual(self._arg_value(command, "--reasoning-effort"), "none")
 
     def test_default_commands_use_least_privilege_phase_policies(self) -> None:
         runner = CopilotCliRunner()
@@ -1222,6 +1298,15 @@ print("1. Result\\n\\nRecommendation: `ready_for_implementation`")
             if arg.startswith(prefix):
                 values.extend(arg[len(prefix) :].split(","))
         return values
+
+    @staticmethod
+    def _arg_value(command, flag: str):
+        if flag not in command:
+            return None
+        index = command.index(flag)
+        if index + 1 >= len(command):
+            return None
+        return command[index + 1]
 
     @staticmethod
     def _git(repo: Path, *args: str) -> str:

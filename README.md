@@ -94,6 +94,8 @@ Environment variables remain supported as compatibility overrides, and command f
 
 The `human_input.mode` setting controls consultation threshold: `balanced` is the default, `autonomous` keeps pauses to critical decisions, and `eager` asks earlier about nontrivial design or product tradeoffs. This does not replace plan approval or merge approval; those human gates still happen whenever the workflow reaches them.
 
+Copilot model and reasoning effort can be configured globally or per Copilot-backed phase in the example config. Defaults remain unset, model IDs depend on the local Copilot CLI/account, raw `extra_args` are appended last for advanced overrides, and custom-agent `model` frontmatter can override CLI model selection.
+
 ## Safety highlights
 
 - The default runner is `copilot-cli`; dry-run mode is deterministic and does not invoke Copilot.

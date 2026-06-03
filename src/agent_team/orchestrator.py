@@ -662,6 +662,9 @@ def build_runner(config: AppConfig) -> AgentRunner:
             extra_args=config.copilot_args,
             plugin_dir=config.copilot_plugin_dir,
             permission_mode=config.copilot_permission_mode,
+            model=config.copilot_model,
+            reasoning_effort=config.copilot_reasoning_effort,
+            phase_overrides=config.copilot_phase_overrides,
         )
     raise ValueError(f"Unknown runner: {config.runner}")
 
