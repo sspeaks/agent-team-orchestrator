@@ -47,8 +47,8 @@ legend { font-weight: 800; margin-bottom: 0.45rem; }
 .panel.attention { border-top: 4px solid var(--attention); }
 .manager-buckets .panel { min-height: 11rem; }
 .activity-grid { grid-template-columns: minmax(18rem, 1fr) minmax(18rem, 1fr); }
-.plan-review-panel { grid-column: 1 / -1; }
-.plan-review-content { max-height: 32rem; min-height: 12rem; overflow: auto; }
+.plan-review-panel, .review-artifact-panel { grid-column: 1 / -1; }
+.phase-artifact-preview-content { max-height: 32rem; min-height: 12rem; overflow: auto; }
 .blocked-reason-panel { border-left: 6px solid var(--attention); }
 .blocked-reason-summary { font-size: 1.05rem; font-weight: 800; }
 .blocked-reason-error { max-height: 14rem; }

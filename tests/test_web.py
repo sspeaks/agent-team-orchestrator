@@ -311,6 +311,38 @@ class WebTests(unittest.TestCase):
         self.assertLess(blocked_html.index("Primary controls"), blocked_html.index("Blocked reason"))
         self.assertEqual(blocked_html.count("data-action-stack"), 1)
 
+    def test_issue_detail_places_review_artifact_and_merge_controls_before_current_log(self) -> None:
+        issue = self.store.create_issue("merge review layout issue", "desc")
+        self._move_to_merge_approval(issue.id)
+        self.artifacts.write_workspace_metadata(issue.id, {"source_branch": "main"})
+        review_content = "Review says merge is ready\n<script>alert('review')</script>"
+        self.artifacts.write_phase_artifact(issue.id, "review", "run-1", review_content)
+
+        html = self.get(f"/issues/{issue.id}")
+
+        self.assertIn("Review artifact", html)
+        self.assertIn("Review says merge is ready", html)
+        self.assertIn("&lt;script&gt;alert(&#x27;review&#x27;)&lt;/script&gt;", html)
+        self.assertNotIn("<script>alert('review')</script>", html)
+        self.assertIn(f'href="/artifacts/{issue.id}/review.md"', html)
+        self.assertIn("Open full review artifact", html)
+        self.assertLess(html.index("Review artifact"), html.index("Current log"))
+        self.assertLess(html.index("Primary controls"), html.index("Current log"))
+        self.assertLess(html.index("/actions/approve-merge"), html.index("Current log"))
+
+    def test_issue_detail_shows_missing_review_artifact_notice_before_current_log(self) -> None:
+        issue = self.store.create_issue("missing review artifact issue", "desc")
+        self._move_to_merge_approval(issue.id)
+        self.artifacts.write_workspace_metadata(issue.id, {"source_branch": "main"})
+
+        html = self.get(f"/issues/{issue.id}")
+
+        self.assertIn("Review artifact", html)
+        self.assertIn("the review artifact is not available yet", html)
+        self.assertIn(f"/issues/{issue.id}/actions/approve-merge", html)
+        self.assertLess(html.index("the review artifact is not available yet"), html.index("Current log"))
+        self.assertLess(html.index("Primary controls"), html.index("Current log"))
+
     def test_issue_detail_links_existing_phase_artifacts_when_blocked(self) -> None:
         issue = self.store.create_issue("blocked artifact issue", "desc", ready=True)
         self.artifacts.write_phase_artifact(issue.id, "research", "run-1", "Blocked issue research")
@@ -1197,6 +1229,93 @@ class WebTests(unittest.TestCase):
         self.assertIn(f"/issues/{issue.id}/actions/reject-plan", actions)
         self.assertEqual(reject_control["fields"][0]["name"], "feedback")
         self.assertTrue(reject_control["fields"][0]["required"])
+
+    def test_issue_live_transition_to_merge_approval_reloads_detail_layout(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is required for the live-layout JavaScript regression test")
+        script = self.get("/static/app.js")
+        issue_payload = {
+            "generated_at": "now",
+            "issue": {
+                "title": "merge approval live layout issue",
+                "phase": "awaiting_merge_approval",
+                "status": "open",
+                "current_run_id": None,
+                "lock_owner": None,
+                "lock_expires_at": None,
+            },
+            "active_job": None,
+            "closed_synopsis": None,
+            "blocked_reason": None,
+            "next_action": "Review the completed work, then approve merge or send it back.",
+            "csrf_token": "fresh-token",
+            "manager_controls": [],
+            "manager_controls_signature": "[]",
+            "phase_timeline": [],
+            "recent_events": [],
+            "recent_runs": [],
+            "artifacts": [],
+        }
+        test_script = f"""
+const assert = require("assert");
+const appScript = {json.dumps(script)};
+const issuePayload = {json.dumps(issue_payload)};
+const logPayload = {{
+  generated_at: "now",
+  issue_id: 1,
+  log: {{ exists: false, relative_path: null, content: "", size_bytes: 0, truncated: false }}
+}};
+const phaseNode = {{ textContent: "reviewing" }};
+const liveStatus = {{
+  textContent: "",
+  classList: {{ toggle() {{}} }}
+}};
+const actionStack = {{
+  replaceCount: 0,
+  getAttribute() {{ return "old-controls"; }},
+  querySelectorAll() {{ return []; }},
+  replaceChildren() {{ this.replaceCount += 1; }}
+}};
+let reloadCount = 0;
+global.document = {{
+  hidden: false,
+  getElementById(id) {{
+    return id === "agent-team-bootstrap"
+      ? {{ textContent: JSON.stringify({{ page: "issue", issue_id: 1, csrf_token: "stale-token" }}) }}
+      : null;
+  }},
+  querySelector(selector) {{
+    if (selector === "[data-issue-phase]") return phaseNode;
+    if (selector === "[data-live-status]") return liveStatus;
+    if (selector === "[data-action-stack]") return actionStack;
+    return null;
+  }},
+  createElement(tag) {{ return {{ tagName: tag, classList: {{ toggle() {{}} }} }}; }},
+  createTextNode(text) {{ return {{ textContent: String(text) }}; }}
+}};
+global.window = {{
+  setTimeout() {{}},
+  location: {{ reload() {{ reloadCount += 1; }} }}
+}};
+global.fetch = function (path) {{
+  const payload = path.indexOf("/logs/current") === -1 ? issuePayload : logPayload;
+  return Promise.resolve({{
+    ok: true,
+    status: 200,
+    json() {{ return Promise.resolve(payload); }}
+  }});
+}};
+eval(appScript);
+setTimeout(() => {{
+  assert.strictEqual(reloadCount, 1);
+  assert.strictEqual(actionStack.replaceCount, 0);
+  assert.strictEqual(phaseNode.textContent, "reviewing");
+  assert.strictEqual(liveStatus.textContent, "Merge approval is ready; refreshing page layout.");
+}}, 0);
+"""
+        result = subprocess.run([node, "-e", test_script], capture_output=True, text=True, timeout=5, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_issue_live_controls_preserve_dirty_form_fields_when_unchanged(self) -> None:
         node = shutil.which("node")
