@@ -1017,6 +1017,90 @@ class PullRequestProviderTests(unittest.TestCase):
         self.assertTrue(snapshot.has_conflicts)
         self.assertTrue(snapshot.is_open)
 
+    def test_azure_devops_status_snapshot_closes_completed_pr_as_merged(self) -> None:
+        metadata = {
+            "provider": "azure-devops",
+            "remote_name": "origin",
+            "remote_identity": ["azure-devops", "org", "project", "repo"],
+            "id": "17",
+        }
+        runner = FakeRunner(
+            [
+                command_result(
+                    {
+                        "pullRequestId": 17,
+                        "status": "completed",
+                        "mergeStatus": "succeeded",
+                        "closedDate": "2026-01-01T00:00:00Z",
+                        "sourceRefName": "refs/heads/feature",
+                        "targetRefName": "refs/heads/main",
+                        "lastMergeSourceCommit": {"commitId": "c" * 40},
+                        "webUrl": "https://dev.azure.com/org/project/_git/repo/pullrequest/17",
+                    }
+                )
+            ]
+        )
+
+        snapshot = get_pull_request_status(metadata, runner)
+        updates = snapshot.metadata_updates()
+
+        self.assertFalse(snapshot.is_open)
+        self.assertTrue(snapshot.is_closed)
+        self.assertTrue(snapshot.is_merged)
+        self.assertFalse(snapshot.has_conflicts)
+        self.assertEqual(snapshot.status, "completed")
+        self.assertEqual(snapshot.merge_state, "succeeded")
+        self.assertEqual(snapshot.closed_at, "2026-01-01T00:00:00Z")
+        self.assertEqual(snapshot.head_sha, "c" * 40)
+        self.assertEqual(snapshot.source_branch, "feature")
+        self.assertEqual(snapshot.target_branch, "main")
+        self.assertEqual(updates["final_status"], "merged")
+        self.assertEqual(updates["last_is_closed"], True)
+        self.assertEqual(updates["last_is_merged"], True)
+        self.assertEqual(updates["closed_at"], "2026-01-01T00:00:00Z")
+
+    def test_azure_devops_status_snapshot_closes_abandoned_pr_without_merge(self) -> None:
+        metadata = {
+            "provider": "azure-devops",
+            "remote_name": "origin",
+            "remote_identity": ["azure-devops", "org", "project", "repo"],
+            "id": "17",
+        }
+        runner = FakeRunner(
+            [
+                command_result(
+                    {
+                        "pullRequestId": 17,
+                        "status": "abandoned",
+                        "mergeStatus": "notSet",
+                        "closedDate": "2026-01-01T00:00:00Z",
+                        "sourceRefName": "refs/heads/feature",
+                        "targetRefName": "refs/heads/main",
+                        "sourceCommitId": "d" * 40,
+                        "webUrl": "https://dev.azure.com/org/project/_git/repo/pullrequest/17",
+                    }
+                )
+            ]
+        )
+
+        snapshot = get_pull_request_status(metadata, runner)
+        updates = snapshot.metadata_updates()
+
+        self.assertFalse(snapshot.is_open)
+        self.assertTrue(snapshot.is_closed)
+        self.assertFalse(snapshot.is_merged)
+        self.assertFalse(snapshot.has_conflicts)
+        self.assertEqual(snapshot.status, "abandoned")
+        self.assertEqual(snapshot.merge_state, "notset")
+        self.assertEqual(snapshot.closed_at, "2026-01-01T00:00:00Z")
+        self.assertEqual(snapshot.head_sha, "d" * 40)
+        self.assertEqual(snapshot.source_branch, "feature")
+        self.assertEqual(snapshot.target_branch, "main")
+        self.assertEqual(updates["final_status"], "closed")
+        self.assertEqual(updates["last_is_closed"], True)
+        self.assertEqual(updates["last_is_merged"], False)
+        self.assertEqual(updates["closed_at"], "2026-01-01T00:00:00Z")
+
     def test_github_conflict_comment_updates_existing_marker(self) -> None:
         metadata = {
             "provider": "github",
