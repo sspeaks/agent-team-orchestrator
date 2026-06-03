@@ -1930,6 +1930,11 @@ setTimeout(() => {{
         self.assertIn(".diagnostics [data-dashboard-list] { max-width: 100%; overflow-x: auto; }", styles)
         self.assertIn(".diagnostics table { table-layout: fixed; }", styles)
         self.assertIn(".artifact-list-viewer { max-height: 18rem; overflow: auto; }", styles)
+        self.assertRegex(
+            styles,
+            r"\.issue-focus-layout\s*>\s*\.issue-action-rail\s*\{[^}]*position:\s*sticky",
+        )
+        self.assertNotRegex(styles, r"(?:^|})\s*\.issue-action-rail\s*\{[^}]*position:\s*sticky")
         self.assertIn(
             ".diagnostics th, .diagnostics td, .diagnostics code, .diagnostics .muted { overflow-wrap: anywhere; }",
             styles,

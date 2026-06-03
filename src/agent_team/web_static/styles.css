@@ -50,8 +50,7 @@ legend { font-weight: 800; margin-bottom: 0.45rem; }
 .plan-review-panel, .review-artifact-panel { grid-column: 1 / -1; }
 .phase-artifact-preview-content { max-height: 32rem; min-height: 12rem; overflow: auto; }
 .issue-focus-layout { align-items: start; display: grid; gap: 1rem; grid-template-columns: minmax(18rem, 24rem) minmax(0, 1fr); margin-bottom: 2rem; }
-.issue-action-rail { max-height: calc(100vh - 2rem); overflow: auto; position: sticky; top: 1rem; }
-.issue-focus-layout > .issue-action-rail { margin-bottom: 0; }
+.issue-focus-layout > .issue-action-rail { margin-bottom: 0; max-height: calc(100vh - 2rem); overflow: auto; position: sticky; top: 1rem; }
 .issue-focus-content { display: grid; gap: 1rem; min-width: 0; }
 .issue-focus-content > .panel, .issue-focus-content > section { margin-bottom: 0; }
 .blocked-reason-panel { border-left: 6px solid var(--attention); }
