@@ -75,6 +75,8 @@ legend { font-weight: 800; margin-bottom: 0.45rem; }
 .diagnostics th, .diagnostics td, .diagnostics code, .diagnostics .muted { overflow-wrap: anywhere; }
 .diagnostics code { white-space: normal; }
 .next-action-panel { border-left: 6px solid var(--brand); }
+.top-primary-controls { border-top: 1px solid var(--border); margin-top: 1rem; padding-top: 1rem; }
+.top-primary-controls h3 { margin-top: 0; }
 .phase-line { display: grid; gap: 0.25rem; margin-bottom: 0; }
 .timeline { display: flex; flex-wrap: wrap; gap: 0.5rem; }
 .phase-step { background: #e2e8f0; border: 1px solid #cbd5e1; border-radius: 999px; color: #334155; padding: 0.4rem 0.7rem; }

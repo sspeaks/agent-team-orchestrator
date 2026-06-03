@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
+from typing import Mapping
 
 from agent_team.blocked_summary import extract_blocked_summary, summarize_blocked_reason
 from agent_team.artifacts import (
@@ -19,6 +20,7 @@ from agent_team.artifacts import (
     PLAN_PRIOR_ARTIFACT,
     UNBLOCK_CONTEXT_ARTIFACT,
 )
+from agent_team.config import CopilotModelSelection
 from agent_team.models import AgentResult, HumanInputRequestDraft, Issue
 from agent_team.runners.base import AgentRunner
 from agent_team.state_machine import default_next_phase, validate_human_input_resume_phase
@@ -164,13 +166,27 @@ class CopilotCliRunner(AgentRunner):
         extra_args: tuple[str, ...] = (),
         plugin_dir: Path | None = None,
         permission_mode: str = "phase",
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+        phase_overrides: Mapping[str, CopilotModelSelection] | None = None,
     ) -> None:
         if permission_mode not in {"phase", "yolo"}:
             raise ValueError("permission_mode must be one of: phase, yolo")
+        normalized_phase_overrides = dict(phase_overrides or {})
+        invalid_phases = sorted(set(normalized_phase_overrides) - set(PHASE_AGENTS))
+        if invalid_phases:
+            valid_phases = ", ".join(sorted(PHASE_AGENTS))
+            raise ValueError(
+                "copilot.phase_overrides contains unsupported phase(s): "
+                f"{', '.join(invalid_phases)}; expected one of: {valid_phases}"
+            )
         self.command = command
         self.timeout_seconds = timeout_seconds
         self.extra_args = extra_args
         self.permission_mode = permission_mode
+        self.model = model
+        self.reasoning_effort = reasoning_effort
+        self.phase_overrides = normalized_phase_overrides
         self.plugin_dir = (plugin_dir or self._default_plugin_dir()).expanduser()
         self.plugin_name = self._plugin_name(self.plugin_dir)
 
@@ -368,8 +384,24 @@ class CopilotCliRunner(AgentRunner):
         command.extend(self._permission_args(phase))
         for add_dir in self._add_dirs(repo_path, artifact_dir):
             command.extend(["--add-dir", str(add_dir)])
+        command.extend(self._model_args(phase))
         command.extend(self.extra_args)
         return command
+
+    def _model_args(self, phase: str) -> list[str]:
+        override = self.phase_overrides.get(phase)
+        model = override.model if override is not None and override.model is not None else self.model
+        reasoning_effort = (
+            override.reasoning_effort
+            if override is not None and override.reasoning_effort is not None
+            else self.reasoning_effort
+        )
+        args: list[str] = []
+        if model is not None:
+            args.extend(["--model", model])
+        if reasoning_effort is not None:
+            args.extend(["--reasoning-effort", reasoning_effort])
+        return args
 
     def _permission_args(self, phase: str) -> list[str]:
         if self.permission_mode == "yolo":
@@ -885,6 +917,8 @@ class CopilotCliRunner(AgentRunner):
             phase=phase,
             artifacts_dir=artifacts_dir,
             phase_artifact=phase_artifact,
+            human_input_mode=context.get("human_input_mode", ""),
+            human_input_policy=context.get("human_input_policy", ""),
             research_artifact=f"{artifacts_dir}/research.md" if artifacts_dir else "",
             plan_artifact=f"{artifacts_dir}/plan.md" if artifacts_dir else "",
             plan_feedback_artifact=plan_feedback_artifact,

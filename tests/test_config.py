@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Iterator
 from unittest.mock import patch
 
-from agent_team.config import AppConfig, DEFAULT_CONFIG_FILENAME, ensure_home, load_config
+from agent_team.config import AppConfig, CopilotModelSelection, DEFAULT_CONFIG_FILENAME, ensure_home, load_config
 
 
 class ConfigTests(unittest.TestCase):
@@ -47,6 +47,9 @@ class ConfigTests(unittest.TestCase):
                   "runner": "dry-run",
                   "runner_timeout_seconds": 2400,
                   "lock_ttl_seconds": 120,
+                  "human_input": {
+                    "mode": "eager"
+                  },
                   "copilot": {
                     "command": "copilot-dev",
                     "permission_mode": "yolo",
@@ -84,6 +87,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.runner, "dry-run")
         self.assertEqual(config.runner_timeout_seconds, 2400)
         self.assertEqual(config.lock_ttl_seconds, 120)
+        self.assertEqual(config.human_input_mode, "eager")
         self.assertEqual(config.copilot_command, "copilot-dev")
         self.assertEqual(config.copilot_permission_mode, "yolo")
         self.assertEqual(config.copilot_plugin_dir, Path("~/agent-team-jsonc-plugin").expanduser())
@@ -129,6 +133,41 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(config.runner, "dry-run")
         self.assertEqual(config.copilot_args, ("--flag",))
+
+    def test_copilot_model_selection_config_loads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_config(
+                tmp,
+                """
+                {
+                  "copilot": {
+                    "model": " gpt-5.4-mini ",
+                    "reasoning_effort": "Medium",
+                    "phase_overrides": {
+                      "validation": {
+                        "model": "gpt-5-mini",
+                        "reasoning_effort": "none"
+                      },
+                      "review": {
+                        "reasoning_effort": "XHIGH"
+                      }
+                    }
+                  }
+                }
+                """,
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                config = load_config(path)
+
+        self.assertEqual(config.copilot_model, "gpt-5.4-mini")
+        self.assertEqual(config.copilot_reasoning_effort, "medium")
+        self.assertEqual(
+            config.copilot_phase_overrides,
+            {
+                "validation": CopilotModelSelection(model="gpt-5-mini", reasoning_effort="none"),
+                "review": CopilotModelSelection(reasoning_effort="xhigh"),
+            },
+        )
 
     def test_default_config_file_is_discovered_in_current_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -177,10 +216,48 @@ class ConfigTests(unittest.TestCase):
             ("array.jsonc", "[]", "must contain a JSON object"),
             ("unknown.jsonc", '{"unknown": true}', "Unknown config key 'unknown'"),
             ("unknown-nested.jsonc", '{"copilot": {"unknown": true}}', "Unknown config key 'copilot.unknown'"),
+            (
+                "unknown-human-input.jsonc",
+                '{"human_input": {"unknown": true}}',
+                "Unknown config key 'human_input.unknown'",
+            ),
             ("bad-section.jsonc", '{"web": []}', "web must be an object"),
+            ("bad-human-input-section.jsonc", '{"human_input": []}', "human_input must be an object"),
             ("bad-int.jsonc", '{"runner_timeout_seconds": 0}', "runner_timeout_seconds must be at least 1"),
             ("bad-bool.jsonc", '{"web": {"unsafe_allow_remote": "yes"}}', "unsafe_allow_remote must be a boolean"),
             ("bad-extra.jsonc", '{"copilot": {"extra_args": [1]}}', "copilot.extra_args"),
+            ("bad-model.jsonc", '{"copilot": {"model": 5}}', "copilot.model must be a string or null"),
+            ("empty-model.jsonc", '{"copilot": {"model": "  "}}', "copilot.model must be a non-empty string"),
+            (
+                "bad-effort.jsonc",
+                '{"copilot": {"reasoning_effort": "extreme"}}',
+                "copilot.reasoning_effort must be one of",
+            ),
+            (
+                "bad-phase-overrides.jsonc",
+                '{"copilot": {"phase_overrides": []}}',
+                "copilot.phase_overrides must be an object",
+            ),
+            (
+                "bad-phase-override.jsonc",
+                '{"copilot": {"phase_overrides": {"validation": []}}}',
+                "copilot.phase_overrides.validation must be an object",
+            ),
+            (
+                "bad-phase-model.jsonc",
+                '{"copilot": {"phase_overrides": {"validation": {"model": 5}}}}',
+                "copilot.phase_overrides.validation.model must be a string or null",
+            ),
+            (
+                "bad-phase-effort.jsonc",
+                '{"copilot": {"phase_overrides": {"validation": {"reasoning_effort": "extreme"}}}}',
+                "copilot.phase_overrides.validation.reasoning_effort must be one of",
+            ),
+            (
+                "bad-phase-key.jsonc",
+                '{"copilot": {"phase_overrides": {"validation": {"effort": "low"}}}}',
+                "Unknown config key 'copilot.phase_overrides.validation.effort'",
+            ),
             ("bad-comment.jsonc", '{"runner": "dry-run" /* unterminated', "Unterminated block comment"),
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -209,6 +286,7 @@ class ConfigTests(unittest.TestCase):
                   "home": "/tmp/file-home",
                   "runner": "copilot-cli",
                   "runner_timeout_seconds": 1200,
+                  "human_input": {"mode": "autonomous"},
                   "copilot": {
                     "allow_tool": "shell(file-test)",
                     "allow_all_tools": true,
@@ -223,6 +301,7 @@ class ConfigTests(unittest.TestCase):
                 "AGENT_TEAM_HOME": "/tmp/env-home",
                 "AGENT_TEAM_RUNNER": "dry-run",
                 "AGENT_TEAM_RUNNER_TIMEOUT_SECONDS": "2400",
+                "AGENT_TEAM_HUMAN_INPUT_MODE": "eager",
                 "AGENT_TEAM_COPILOT_ALLOW_TOOL": "shell(env-test)",
                 "AGENT_TEAM_COPILOT_ALLOW_ALL_TOOLS": "false",
                 "AGENT_TEAM_COPILOT_ARGS": "--model env-model",
@@ -237,6 +316,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.runner, "dry-run")
         self.assertEqual(config.runner_timeout_seconds, 2400)
         self.assertEqual(config.lock_ttl_seconds, 2400)
+        self.assertEqual(config.human_input_mode, "eager")
         self.assertEqual(config.web_workers, 5)
         self.assertEqual(config.worker_concurrency, 6)
         self.assertEqual(config.worker_interval_seconds, 7)
@@ -341,6 +421,7 @@ class ConfigTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             config = load_config(example_path)
         self.assertEqual(config.runner, "copilot-cli")
+        self.assertEqual(config.human_input_mode, "balanced")
 
     def test_example_config_allows_uncommenting_single_top_level_default(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
@@ -369,6 +450,20 @@ class ConfigTests(unittest.TestCase):
                 config = load_config(path)
 
         self.assertEqual(config.web_port, 9876)
+
+    def test_example_config_allows_uncommenting_human_input_mode(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        example_path = repo_root / "agent-team.config.example.jsonc"
+        text = example_path.read_text(encoding="utf-8")
+        text = text.replace('  // "human_input": {', '  "human_input": {')
+        text = text.replace('    // "mode": "balanced"', '    "mode": "autonomous"')
+        text = text.replace('  // },\n\n  // "web": {', '  },\n\n  // "web": {')
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_config(tmp, text)
+            with patch.dict(os.environ, {}, clear=True):
+                config = load_config(path)
+
+        self.assertEqual(config.human_input_mode, "autonomous")
 
     def test_default_config_tests_are_not_affected_by_repo_local_config(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
@@ -410,6 +505,38 @@ class ConfigTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             config = load_config()
         self.assertEqual(config.runner, "copilot-cli")
+
+    def test_human_input_mode_defaults_to_balanced(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            config = load_config()
+        self.assertEqual(config.human_input_mode, "balanced")
+
+    def test_human_input_mode_can_be_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_config(tmp, '{"human_input": {"mode": "autonomous"}}')
+            with patch.dict(os.environ, {}, clear=True):
+                config = load_config(path)
+
+        self.assertEqual(config.human_input_mode, "autonomous")
+
+    def test_human_input_mode_environment_override_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_config(tmp, '{"human_input": {"mode": "autonomous"}}')
+            with patch.dict(os.environ, {"AGENT_TEAM_HUMAN_INPUT_MODE": "EAGER"}, clear=True):
+                config = load_config(path)
+
+        self.assertEqual(config.human_input_mode, "eager")
+
+    def test_human_input_mode_rejects_invalid_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_config(tmp, '{"human_input": {"mode": "often"}}')
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(ValueError, "human_input.mode/AGENT_TEAM_HUMAN_INPUT_MODE"):
+                    load_config(path)
+
+        with patch.dict(os.environ, {"AGENT_TEAM_HUMAN_INPUT_MODE": "often"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "human_input.mode/AGENT_TEAM_HUMAN_INPUT_MODE"):
+                load_config()
 
     def test_lock_ttl_defaults_to_runner_timeout(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
@@ -522,6 +649,9 @@ class ConfigTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             config = load_config()
         self.assertEqual(config.copilot_permission_mode, "phase")
+        self.assertIsNone(config.copilot_model)
+        self.assertIsNone(config.copilot_reasoning_effort)
+        self.assertEqual(config.copilot_phase_overrides, {})
         self.assertNotIn("--yolo", config.copilot_args)
 
     def test_copilot_permission_mode_can_use_yolo_escape_hatch(self) -> None:

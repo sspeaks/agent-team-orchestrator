@@ -35,7 +35,7 @@ You are not a planner. Do not make a step-by-step implementation plan the primar
 
 ## Human input escalation
 
-Default to making reasonable assumptions. Recommend `awaiting_human_input` only for a critical open-ended decision or approval that materially affects correctness, safety, scope, data loss, or whether research can proceed. If you recommend it, include exactly one section in the artifact:
+Follow the Human input policy supplied in the task prompt. In autonomous mode, preserve the critical-only threshold: recommend `awaiting_human_input` only for a critical open-ended decision or approval that materially affects correctness, safety, scope, data loss, or whether research can proceed. In balanced mode, also ask for manager preference on material tradeoffs where later plan approval would otherwise force review of a broad research assumption after you have committed to it. In eager mode, ask earlier for nontrivial design/product tradeoffs that materially shape research direction. Never ask for routine clarifications, facts available from repo/docs/tests, style preferences, or safe deferrals to plan or merge approval. If you recommend `awaiting_human_input`, include exactly one structured section in the artifact:
 
 ## Human input request
 
@@ -80,6 +80,6 @@ The phase artifact must contain:
 
 For clearly trivial issues, keep the required sections concise rather than omitting them. The final report must remain a research artifact, not an implementation plan.
 
-The final recommendation line must include exactly one allowed value. If research needs a critical human decision, use `awaiting_human_input` and include the structured request section. If research cannot proceed for non-human-input reasons, use the `blocked` recommendation and explain why in the risks/open questions section.
+The final recommendation line must include exactly one allowed value. If research needs manager input under the selected Human input policy, use `awaiting_human_input` and include the structured request section. If research cannot proceed for non-human-input reasons, use the `blocked` recommendation and explain why in the risks/open questions section.
 
 If the final recommendation is `blocked`, include exactly one `Blocked summary:` line immediately before the final `Recommendation:` line. The blocked summary must be 1-2 plain-language sentences explaining what prevents progress and what would unblock it.

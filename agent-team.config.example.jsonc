@@ -42,6 +42,19 @@
   // Legacy env: AGENT_TEAM_LOCK_TTL_SECONDS.
   // "lock_ttl_seconds": 1800,
 
+  // Human input consultation policy.
+  // Default: { "mode": "balanced" }.
+  // Modes:
+  // - "autonomous": pause only for critical decisions that cannot be made safely.
+  // - "balanced": pause for material tradeoffs while avoiding routine clarifications.
+  // - "eager": ask earlier for nontrivial design or product tradeoffs.
+  // Safety: consultation pauses are separate from mandatory plan and merge
+  // approvals; they only control when agent phases request manager input.
+  // Environment override: AGENT_TEAM_HUMAN_INPUT_MODE.
+  // "human_input": {
+    // "mode": "balanced"
+  // },
+
   // "copilot": {
     // Copilot CLI executable to invoke.
     // Default: "copilot".
@@ -119,10 +132,30 @@
     // Legacy env: AGENT_TEAM_COPILOT_ALLOW_ALL_URLS.
     // "allow_all_urls": false,
 
+    // Select a default Copilot model and reasoning effort for Copilot-backed
+    // phases. Defaults: unset; Copilot CLI/user settings decide. Model IDs are
+    // environment/account/version dependent, so choose values available in your
+    // Copilot CLI. Custom-agent model frontmatter can override CLI selection.
+    // "model": "gpt-5.4-mini",
+    // "reasoning_effort": "medium",
+
+    // Override model/effort for individual Copilot-backed phases. Omitted
+    // fields inherit the defaults above. Valid phases: research, plan,
+    // implementation, validation, review, merge_conflict_resolution.
+    // Deterministic merge is not Copilot-backed and cannot be configured here.
+    // "phase_overrides": {
+      // "research": {"model": "gpt-5.5", "reasoning_effort": "xhigh"},
+      // "plan": {"model": "gpt-5.5", "reasoning_effort": "xhigh"},
+      // "review": {"model": "gpt-5.5", "reasoning_effort": "high"},
+      // "validation": {"model": "gpt-5-mini", "reasoning_effort": "none"},
+      // "merge_conflict_resolution": {"model": "gpt-5.5", "reasoning_effort": "xhigh"}
+    // },
+
     // Extra raw Copilot CLI arguments appended last.
     // Default: [].
-    // Safety: appended last so advanced flags can override or weaken defaults;
-    // review carefully before using in unattended runs.
+    // Safety: appended after structured model settings, so advanced flags can
+    // override or weaken defaults; review carefully before using in unattended
+    // runs.
     // Legacy env: AGENT_TEAM_COPILOT_ARGS.
     // "extra_args": ["--model", "claude-sonnet-4.6"]
   // },

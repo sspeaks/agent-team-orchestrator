@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import os
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
+
+from .human_input_policy import DEFAULT_HUMAN_INPUT_MODE, normalize_human_input_mode
 
 
 DEFAULT_CONFIG_FILENAME = "agent-team.config.jsonc"
@@ -17,6 +19,7 @@ _TOP_LEVEL_KEYS = {
     "runner_timeout_seconds",
     "lock_ttl_seconds",
     "copilot",
+    "human_input",
     "web",
     "worker",
 }
@@ -24,6 +27,9 @@ _COPILOT_KEYS = {
     "command",
     "permission_mode",
     "plugin_dir",
+    "model",
+    "reasoning_effort",
+    "phase_overrides",
     "available_tools",
     "excluded_tools",
     "allow_tool",
@@ -34,6 +40,8 @@ _COPILOT_KEYS = {
     "allow_all_urls",
     "extra_args",
 }
+_COPILOT_MODEL_OVERRIDE_KEYS = {"model", "reasoning_effort"}
+_COPILOT_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 _COPILOT_PASSTHROUGH_FLAGS = (
     ("available_tools", "--available-tools", "AGENT_TEAM_COPILOT_AVAILABLE_TOOLS"),
     ("excluded_tools", "--excluded-tools", "AGENT_TEAM_COPILOT_EXCLUDED_TOOLS"),
@@ -53,6 +61,15 @@ _WORKER_KEYS = {
     "worker_concurrency",
     "worker_interval_seconds",
 }
+_HUMAN_INPUT_KEYS = {
+    "mode",
+}
+
+
+@dataclass(frozen=True)
+class CopilotModelSelection:
+    model: str | None = None
+    reasoning_effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -67,6 +84,9 @@ class AppConfig:
     copilot_args: tuple[str, ...] = ()
     copilot_permission_mode: str = "phase"
     copilot_plugin_dir: Path | None = None
+    copilot_model: str | None = None
+    copilot_reasoning_effort: str | None = None
+    copilot_phase_overrides: Mapping[str, CopilotModelSelection] = field(default_factory=dict)
     runner_timeout_seconds: int = 1800
     lock_ttl_seconds: int = 1800
     web_host: str = "127.0.0.1"
@@ -75,6 +95,7 @@ class AppConfig:
     web_unsafe_allow_remote: bool = False
     worker_concurrency: int = 1
     worker_interval_seconds: int = 60
+    human_input_mode: str = DEFAULT_HUMAN_INPUT_MODE
     vscode_wsl_distro: str | None = None
     merge_mode: str = "auto"
     pr_remote: str | None = None
@@ -84,6 +105,7 @@ class AppConfig:
 def load_config(config_path: str | Path | None = None) -> AppConfig:
     file_config = _load_config_file(config_path)
     copilot_config = _section(file_config, "copilot")
+    human_input_config = _section(file_config, "human_input")
     web_config = _section(file_config, "web")
     worker_config = _section(file_config, "worker")
 
@@ -101,6 +123,13 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
     )
     runner = _env_string("AGENT_TEAM_RUNNER", _config_string(file_config, "runner", "copilot-cli"))
     copilot_args = _build_copilot_args(copilot_config)
+    copilot_model = _config_optional_non_empty_string(copilot_config, "model", "copilot.model")
+    copilot_reasoning_effort = _config_reasoning_effort(
+        copilot_config,
+        "reasoning_effort",
+        "copilot.reasoning_effort",
+    )
+    copilot_phase_overrides = _copilot_phase_overrides(copilot_config)
     copilot_permission_mode = _copilot_permission_mode(
         _env_string(
             "AGENT_TEAM_COPILOT_PERMISSION_MODE",
@@ -128,6 +157,13 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
         "AGENT_TEAM_WORKER_INTERVAL_SECONDS",
         _config_non_negative_int(worker_config, "worker_interval_seconds", 60),
     )
+    human_input_mode = normalize_human_input_mode(
+        _env_string(
+            "AGENT_TEAM_HUMAN_INPUT_MODE",
+            _config_string(human_input_config, "mode", DEFAULT_HUMAN_INPUT_MODE),
+        ),
+        "human_input.mode/AGENT_TEAM_HUMAN_INPUT_MODE",
+    )
     vscode_wsl_distro = _vscode_wsl_distro(web_config)
     merge_mode = _merge_mode()
     pr_remote = _env_optional_string("AGENT_TEAM_PR_REMOTE")
@@ -143,6 +179,9 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
         copilot_args=tuple(copilot_args),
         copilot_permission_mode=copilot_permission_mode,
         copilot_plugin_dir=copilot_plugin_dir,
+        copilot_model=copilot_model,
+        copilot_reasoning_effort=copilot_reasoning_effort,
+        copilot_phase_overrides=copilot_phase_overrides,
         runner_timeout_seconds=runner_timeout_seconds,
         lock_ttl_seconds=lock_ttl_seconds,
         web_host=web_host,
@@ -151,6 +190,7 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
         web_unsafe_allow_remote=web_unsafe_allow_remote,
         worker_concurrency=worker_concurrency,
         worker_interval_seconds=worker_interval_seconds,
+        human_input_mode=human_input_mode,
         vscode_wsl_distro=vscode_wsl_distro,
         merge_mode=merge_mode,
         pr_remote=pr_remote,
@@ -285,11 +325,32 @@ def _strip_jsonc_trailing_commas(source: str) -> str:
 def _validate_config_keys(config: Mapping[str, Any], path: Path) -> None:
     _reject_unknown_keys(config, _TOP_LEVEL_KEYS, path)
     if "copilot" in config:
-        _reject_unknown_keys(_section(config, "copilot"), _COPILOT_KEYS, path, "copilot")
+        copilot_config = _section(config, "copilot")
+        _reject_unknown_keys(copilot_config, _COPILOT_KEYS, path, "copilot")
+        _validate_copilot_phase_override_keys(copilot_config, path)
+    if "human_input" in config:
+        _reject_unknown_keys(_section(config, "human_input"), _HUMAN_INPUT_KEYS, path, "human_input")
     if "web" in config:
         _reject_unknown_keys(_section(config, "web"), _WEB_KEYS, path, "web")
     if "worker" in config:
         _reject_unknown_keys(_section(config, "worker"), _WORKER_KEYS, path, "worker")
+
+
+def _validate_copilot_phase_override_keys(config: Mapping[str, Any], path: Path) -> None:
+    if "phase_overrides" not in config or config["phase_overrides"] is None:
+        return
+    phase_overrides = config["phase_overrides"]
+    if not isinstance(phase_overrides, dict):
+        raise ValueError("copilot.phase_overrides must be an object")
+    for phase, override in phase_overrides.items():
+        if not isinstance(override, dict):
+            raise ValueError(f"copilot.phase_overrides.{phase} must be an object")
+        _reject_unknown_keys(
+            override,
+            _COPILOT_MODEL_OVERRIDE_KEYS,
+            path,
+            f"copilot.phase_overrides.{phase}",
+        )
 
 
 def _reject_unknown_keys(
@@ -321,6 +382,33 @@ def _build_copilot_args(copilot_config: Mapping[str, Any]) -> list[str]:
         args.append("--allow-all-urls")
     args.extend(_copilot_extra_args(copilot_config))
     return args
+
+
+def _copilot_phase_overrides(config: Mapping[str, Any]) -> dict[str, CopilotModelSelection]:
+    if "phase_overrides" not in config:
+        return {}
+    value = config["phase_overrides"]
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("copilot.phase_overrides must be an object")
+    overrides: dict[str, CopilotModelSelection] = {}
+    for phase, raw_override in value.items():
+        if not isinstance(raw_override, dict):
+            raise ValueError(f"copilot.phase_overrides.{phase} must be an object")
+        overrides[phase] = CopilotModelSelection(
+            model=_config_optional_non_empty_string(
+                raw_override,
+                "model",
+                f"copilot.phase_overrides.{phase}.model",
+            ),
+            reasoning_effort=_config_reasoning_effort(
+                raw_override,
+                "reasoning_effort",
+                f"copilot.phase_overrides.{phase}.reasoning_effort",
+            ),
+        )
+    return overrides
 
 
 def _append_copilot_value(
@@ -456,6 +544,31 @@ def _config_string(config: Mapping[str, Any], key: str, default: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{key} must be a string")
     return value
+
+
+def _config_optional_non_empty_string(config: Mapping[str, Any], key: str, label: str) -> str | None:
+    if key not in config:
+        return None
+    value = config[key]
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string or null")
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError(f"{label} must be a non-empty string or null")
+    return stripped
+
+
+def _config_reasoning_effort(config: Mapping[str, Any], key: str, label: str) -> str | None:
+    value = _config_optional_non_empty_string(config, key, label)
+    if value is None:
+        return None
+    normalized = value.lower()
+    if normalized not in _COPILOT_REASONING_EFFORTS:
+        allowed = ", ".join(_COPILOT_REASONING_EFFORTS)
+        raise ValueError(f"{label} must be one of: {allowed}")
+    return normalized
 
 
 def _config_path(config: Mapping[str, Any], key: str, default: Path) -> Path:

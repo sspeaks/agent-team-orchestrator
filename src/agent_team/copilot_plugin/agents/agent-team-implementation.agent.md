@@ -21,7 +21,7 @@ Your behavior should roughly imitate the useful parts of Copilot CLI `/fleet` fo
 
 ## Human input escalation
 
-Default to making reasonable assumptions. Recommend `awaiting_human_input` only for a critical open-ended decision or approval that materially affects correctness, safety, scope, data loss, or implementation intent. If you recommend it, include exactly one section in the artifact:
+Follow the Human input policy supplied in the task prompt. In autonomous mode, preserve the critical-only threshold: recommend `awaiting_human_input` only for a critical open-ended decision or approval that materially affects correctness, safety, scope, data loss, or implementation intent. In balanced mode, also ask for manager preference on material tradeoffs where plan approval would otherwise force review of a broad implementation assumption after you have committed to it. In eager mode, ask earlier for nontrivial design/product tradeoffs that materially shape implementation behavior. Never ask for routine clarifications, facts available from repo/docs/tests, style preferences, or safe deferrals to plan or merge approval. If you recommend `awaiting_human_input`, include exactly one structured section in the artifact:
 
 ## Human input request
 
@@ -47,6 +47,6 @@ The phase artifact must contain:
 
 The first sentence under `Summary of changes` may become the Git snapshot commit subject, so make it concise and change-focused.
 
-The final recommendation line must include exactly one allowed value. If implementation needs a critical human decision, use `awaiting_human_input` and include the structured request section. If implementation cannot proceed for non-human-input reasons, use the `blocked` recommendation and explain the blocker and any partial changes.
+The final recommendation line must include exactly one allowed value. If implementation needs manager input under the selected Human input policy, use `awaiting_human_input` and include the structured request section. If implementation cannot proceed for non-human-input reasons, use the `blocked` recommendation and explain the blocker and any partial changes.
 
 If the final recommendation is `blocked`, include exactly one `Blocked summary:` line immediately before the final `Recommendation:` line. The blocked summary must be 1-2 plain-language sentences explaining what prevents progress and what would unblock it.

@@ -9,6 +9,7 @@ from .artifacts import ArtifactStore
 from .blocked_summary import summarize_blocked_reason
 from .config import AppConfig
 from .db import IssueStore, RecoveryResult
+from .human_input_policy import human_input_policy_prompt
 from .locks import is_definitely_dead_same_host_owner, make_lock_owner
 from .models import AgentResult, Issue
 from .runners.base import AgentRunner
@@ -527,6 +528,8 @@ class Orchestrator:
             "workspace_repo_path": "",
             "workspace_root": "",
             "source_repo_path": issue.repo_path or "",
+            "human_input_mode": self.config.human_input_mode,
+            "human_input_policy": human_input_policy_prompt(self.config.human_input_mode),
         }
         if workspace_info is not None:
             context.update(
@@ -659,6 +662,9 @@ def build_runner(config: AppConfig) -> AgentRunner:
             extra_args=config.copilot_args,
             plugin_dir=config.copilot_plugin_dir,
             permission_mode=config.copilot_permission_mode,
+            model=config.copilot_model,
+            reasoning_effort=config.copilot_reasoning_effort,
+            phase_overrides=config.copilot_phase_overrides,
         )
     raise ValueError(f"Unknown runner: {config.runner}")
 

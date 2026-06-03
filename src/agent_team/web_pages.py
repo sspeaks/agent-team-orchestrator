@@ -142,12 +142,6 @@ def render_issue_detail_body(
                 <pre class="log-viewer" data-log-output>{_esc(log_payload.get("content") or "")}</pre>
               </div>
     """
-    primary_controls_panel = f"""
-              <div class="panel primary-controls-panel">
-                <h2>Primary controls</h2>
-                <div class="action-stack" data-action-stack data-controls-signature="{_esc(payload["manager_controls_signature"])}">{controls}</div>
-              </div>
-    """
     issue_context_panel = f"""
               <div class="panel">
                 <h2>Issue context</h2>
@@ -163,12 +157,12 @@ def render_issue_detail_body(
     if issue.phase == "awaiting_merge_approval":
         action_panels = (
             f"{plan_review}{human_input_panel}{review_artifact}"
-            f"{primary_controls_panel}{issue_context_panel}{current_log_panel}"
+            f"{current_log_panel}{issue_context_panel}"
         )
     else:
         action_panels = (
             f"{plan_review}{human_input_panel}{current_log_panel}"
-            f"{primary_controls_panel}{issue_context_panel}"
+            f"{issue_context_panel}"
         )
     return f"""
             <section class="hero issue-hero">
@@ -188,12 +182,16 @@ def render_issue_detail_body(
                 <dt>Queued browser action</dt><dd data-active-job>{_esc(_active_job_text(payload["active_job"]))}</dd>
               </dl>
             </section>
-            {_render_blocked_reason(payload["blocked_reason"])}
-            {_render_closed_synopsis(payload["closed_synopsis"])}
-            <section class="panel priority next-action-panel">
+            <section class="panel priority next-action-panel top-primary-controls-panel">
               <h2>Next action</h2>
               <p class="next-action" data-next-action>{_esc(payload["next_action"])}</p>
+              <div class="top-primary-controls">
+                <h3>Primary controls</h3>
+                <div class="action-stack" data-action-stack data-controls-signature="{_esc(payload["manager_controls_signature"])}">{controls}</div>
+              </div>
             </section>
+            {_render_blocked_reason(payload["blocked_reason"])}
+            {_render_closed_synopsis(payload["closed_synopsis"])}
             <section>
               <h2>Workflow progress <span class="muted">(Phase timeline)</span></h2>
               <nav class="timeline" aria-label="Workflow progress" data-phase-timeline>{_phase_timeline_html(payload["phase_timeline"])}</nav>
