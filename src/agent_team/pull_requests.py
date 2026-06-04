@@ -575,34 +575,19 @@ def _ado_status_snapshot(
     runner: CommandRunner,
 ) -> PullRequestStatusSnapshot:
     pr_id = _ado_pr_id(metadata)
-    shown = runner.run(
-        [
-            "az",
-            "repos",
-            "pr",
-            "show",
-            "--id",
-            pr_id,
-            "--org",
-            _ado_org_url(remote),
-            "--project",
-            _require(remote.project, "project", remote),
-            "--output",
-            "json",
-        ]
-    )
+    shown = runner.run(_ado_rest_args("get", _ado_pull_request_url(remote, pr_id)))
     _ensure_success(
-        "az repos pr show",
+        "az rest pull request",
         shown,
         "Run 'az login' and verify the Azure DevOps pull request is accessible.",
     )
-    raw = _expect_mapping(_load_json(shown.stdout, "az repos pr show"), "az repos pr show")
+    raw = _expect_mapping(_load_json(shown.stdout, "az rest pull request"), "az rest pull request")
     status = str(raw.get("status") or "").lower()
     merge_status = str(raw.get("mergeStatus") or "").lower() or None
     is_open = status == "active"
     is_merged = status == "completed"
     is_closed = status in {"completed", "abandoned"}
-    url = _validated_ado_result_url(remote, _ado_result_url(raw) or metadata.get("url"), "az repos pr show")
+    url = _validated_ado_result_url(remote, _ado_result_url(raw) or metadata.get("url"), "az rest pull request")
     return PullRequestStatusSnapshot(
         provider=remote.provider,
         checked_at=_utc_now_iso(),
@@ -999,6 +984,13 @@ def _ado_threads_url(remote: PullRequestRemote, pr_id: str) -> str:
     return (
         f"{_ado_project_url(remote)}/_apis/git/repositories/{_ado_url_part(remote.repo)}"
         f"/pullRequests/{_ado_url_part(pr_id)}/threads?api-version=7.1"
+    )
+
+
+def _ado_pull_request_url(remote: PullRequestRemote, pr_id: str) -> str:
+    return (
+        f"{_ado_project_url(remote)}/_apis/git/repositories/{_ado_url_part(remote.repo)}"
+        f"/pullRequests/{_ado_url_part(pr_id)}?api-version=7.1"
     )
 
 

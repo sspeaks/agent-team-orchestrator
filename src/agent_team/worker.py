@@ -12,6 +12,7 @@ from .orchestrator import Orchestrator, ProcessResult
 
 
 SLOT_REFILL_POLL_SECONDS = 1.0
+PULL_REQUEST_MONITOR_SWEEP_LIMIT = 1
 
 
 def process_batch(
@@ -33,12 +34,20 @@ def process_batch(
         while True:
             if not futures and not _stop_requested(stop_event):
                 _recover_interrupted_runs(store, artifacts, config)
-                if not monitored_pull_requests:
-                    results.extend(_monitor_pull_requests(store, artifacts, config))
-                    monitored_pull_requests = True
             if not _stop_requested(stop_event):
                 _refill_slots(executor, store, artifacts, config, concurrency, futures, active_issue_ids, stop_event)
             if not futures:
+                if not monitored_pull_requests and not _stop_requested(stop_event):
+                    results.extend(
+                        _monitor_pull_requests(
+                            store,
+                            artifacts,
+                            config,
+                            limit=PULL_REQUEST_MONITOR_SWEEP_LIMIT,
+                        )
+                    )
+                    monitored_pull_requests = True
+                    continue
                 return results
 
             refill_timeout = SLOT_REFILL_POLL_SECONDS if len(futures) < concurrency else None
@@ -135,11 +144,17 @@ def _recover_interrupted_runs(store: IssueStore, artifacts: ArtifactStore, confi
         recover()
 
 
-def _monitor_pull_requests(store: IssueStore, artifacts: ArtifactStore, config: AppConfig) -> list[ProcessResult]:
+def _monitor_pull_requests(
+    store: IssueStore,
+    artifacts: ArtifactStore,
+    config: AppConfig,
+    *,
+    limit: int,
+) -> list[ProcessResult]:
     monitor = getattr(Orchestrator(store, artifacts, config), "monitor_pull_requests", None)
     if monitor is None:
         return []
-    return monitor()
+    return monitor(limit=limit)
 
 
 def _stop_requested(stop_event: threading.Event | None) -> bool:

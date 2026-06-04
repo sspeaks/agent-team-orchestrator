@@ -1598,14 +1598,16 @@ class StoreAndWorkerTests(unittest.TestCase):
         pr_issue = self._issue_awaiting_pr_closure()
         ready_issue = self.store.create_issue("ready", "desc", ready=True)
         monitor_calls = 0
+        call_order: list[str] = []
 
         class FakeOrchestrator:
             def __init__(self, store: IssueStore, artifacts: ArtifactStore, config: AppConfig) -> None:
                 self.store = store
 
-            def monitor_pull_requests(self) -> list[ProcessResult]:
+            def monitor_pull_requests(self, *, limit: int = 1) -> list[ProcessResult]:
                 nonlocal monitor_calls
                 monitor_calls += 1
+                call_order.append(f"monitor:{limit}")
                 return [
                     ProcessResult(
                         issue_id=pr_issue.id,
@@ -1619,6 +1621,7 @@ class StoreAndWorkerTests(unittest.TestCase):
                 ]
 
             def process_issue(self, issue_id: int, phase: str | None = None) -> ProcessResult:
+                call_order.append(f"process:{issue_id}")
                 self.store.transition_issue(issue_id, "researching")
                 return ProcessResult(
                     issue_id=issue_id,
@@ -1634,7 +1637,55 @@ class StoreAndWorkerTests(unittest.TestCase):
             results = process_batch(self.store, self.artifacts, self.config, concurrency=1)
 
         self.assertEqual(monitor_calls, 1)
-        self.assertEqual([result.issue_id for result in results], [pr_issue.id, ready_issue.id])
+        self.assertEqual(call_order, [f"process:{ready_issue.id}", "monitor:1"])
+        self.assertEqual([result.issue_id for result in results], [ready_issue.id, pr_issue.id])
+
+    def test_process_batch_caps_pull_request_monitoring_after_ready_work(self) -> None:
+        pr_issues = [self._issue_awaiting_pr_closure(), self._issue_awaiting_pr_closure()]
+        ready_issue = self.store.create_issue("ready", "desc", ready=True)
+        monitored_issue_ids: list[int] = []
+        processed_issue_ids: list[int] = []
+        case = self
+
+        class FakeOrchestrator:
+            def __init__(self, store: IssueStore, artifacts: ArtifactStore, config: AppConfig) -> None:
+                self.store = store
+
+            def monitor_pull_requests(self, *, limit: int = 1) -> list[ProcessResult]:
+                case.assertEqual(limit, 1)
+                monitored_issue_ids.extend(issue.id for issue in pr_issues[:limit])
+                return [
+                    ProcessResult(
+                        issue_id=issue.id,
+                        run_id=f"monitor-{issue.id}",
+                        phase="pr_monitor",
+                        status="waiting",
+                        next_phase="awaiting_pr_closure",
+                        summary="waiting",
+                        artifact_path=None,
+                    )
+                    for issue in pr_issues[:limit]
+                ]
+
+            def process_issue(self, issue_id: int, phase: str | None = None) -> ProcessResult:
+                processed_issue_ids.append(issue_id)
+                self.store.transition_issue(issue_id, "researching")
+                return ProcessResult(
+                    issue_id=issue_id,
+                    run_id=f"run-{issue_id}",
+                    phase="research",
+                    status="success",
+                    next_phase="researching",
+                    summary="done",
+                    artifact_path=None,
+                )
+
+        with patch.object(worker_module, "Orchestrator", FakeOrchestrator):
+            results = process_batch(self.store, self.artifacts, self.config, concurrency=4)
+
+        self.assertEqual(processed_issue_ids, [ready_issue.id])
+        self.assertEqual(monitored_issue_ids, [pr_issues[0].id])
+        self.assertEqual([result.issue_id for result in results], [ready_issue.id, pr_issues[0].id])
 
     def test_process_batch_drains_until_idle(self) -> None:
         issues = [self.store.create_issue(f"issue {index}", "desc", ready=True) for index in range(3)]
@@ -3197,6 +3248,24 @@ class StoreAndWorkerTests(unittest.TestCase):
         self.assertEqual(metadata["last_head_commit"], observed_head)
         self.assertTrue(metadata["last_is_open"])
         self.assertNotIn(issue.id, {ready.id for ready in self.store.list_next_ready_issues(10)})
+
+    def test_pull_request_monitor_limits_default_sweep(self) -> None:
+        first = self._issue_awaiting_pr_closure()
+        second = self._issue_awaiting_pr_closure()
+        self._write_waiting_pr_metadata(first.id)
+        self._write_waiting_pr_metadata(second.id)
+        snapshot = self._pr_snapshot(status="OPEN", is_open=True)
+
+        with patch("agent_team.orchestrator.get_pull_request_status", return_value=snapshot) as status_call:
+            results = Orchestrator(self.store, self.artifacts, self.config).monitor_pull_requests()
+
+        self.assertEqual([result.issue_id for result in results], [first.id])
+        status_call.assert_called_once()
+        self.assertEqual(self.store.get_issue(second.id).phase, "awaiting_pr_closure")
+        second_metadata = self.artifacts.read_pull_request_metadata(second.id)
+        self.assertIsNotNone(second_metadata)
+        assert second_metadata is not None
+        self.assertNotIn("last_status_check_at", second_metadata)
 
     def test_pull_request_monitor_skips_history_when_open_status_is_unchanged(self) -> None:
         issue = self._issue_awaiting_pr_closure()

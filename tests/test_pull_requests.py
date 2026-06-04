@@ -44,6 +44,25 @@ def command_result(stdout: object, returncode: int = 0, stderr: str = "") -> Com
     return CommandResult(args=(), returncode=returncode, stdout=rendered, stderr=stderr)
 
 
+def ado_pull_request_status_call(
+    *,
+    org: str = "org",
+    project: str = "project",
+    repo: str = "repo",
+    pr_id: str = "17",
+) -> tuple[str, ...]:
+    return (
+        "az",
+        "rest",
+        "--method",
+        "get",
+        "--url",
+        f"https://dev.azure.com/{org}/{project}/_apis/git/repositories/{repo}/pullRequests/{pr_id}?api-version=7.1",
+        "--resource",
+        "499b84ac-1321-427f-aa17-267ca6975798",
+    )
+
+
 class PullRequestRemoteParsingTests(unittest.TestCase):
     def test_parse_github_remote_forms(self) -> None:
         cases = (
@@ -1027,23 +1046,7 @@ class PullRequestProviderTests(unittest.TestCase):
         self.assertFalse(snapshot.has_conflicts)
         self.assertEqual(snapshot.merge_state, "rejectedbypolicy")
         self.assertEqual(snapshot.head_sha, "b" * 40)
-        self.assertEqual(
-            runner.calls[0],
-            (
-                "az",
-                "repos",
-                "pr",
-                "show",
-                "--id",
-                "17",
-                "--org",
-                "https://dev.azure.com/org",
-                "--project",
-                "project",
-                "--output",
-                "json",
-            ),
-        )
+        self.assertEqual(runner.calls[0], ado_pull_request_status_call())
 
     def test_azure_devops_status_snapshot_detects_conflict(self) -> None:
         metadata = {
@@ -1113,6 +1116,7 @@ class PullRequestProviderTests(unittest.TestCase):
         self.assertEqual(updates["last_is_closed"], True)
         self.assertEqual(updates["last_is_merged"], True)
         self.assertEqual(updates["closed_at"], "2026-01-01T00:00:00Z")
+        self.assertEqual(runner.calls[0], ado_pull_request_status_call())
 
     def test_azure_devops_status_snapshot_closes_abandoned_pr_without_merge(self) -> None:
         metadata = {
@@ -1155,6 +1159,7 @@ class PullRequestProviderTests(unittest.TestCase):
         self.assertEqual(updates["last_is_closed"], True)
         self.assertEqual(updates["last_is_merged"], False)
         self.assertEqual(updates["closed_at"], "2026-01-01T00:00:00Z")
+        self.assertEqual(runner.calls[0], ado_pull_request_status_call())
 
     def test_github_conflict_comment_updates_existing_marker(self) -> None:
         metadata = {

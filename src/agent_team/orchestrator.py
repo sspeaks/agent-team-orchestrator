@@ -26,6 +26,9 @@ from .state_machine import default_next_phase, runnable_phase_for, running_phase
 from .workspaces import WorkspaceError, WorkspaceInfo, WorkspaceManager, WorkspaceSourceSyncResult
 
 
+DEFAULT_PULL_REQUEST_MONITOR_LIMIT = 1
+
+
 @dataclass(frozen=True)
 class ProcessResult:
     issue_id: int
@@ -66,9 +69,14 @@ class Orchestrator:
                 continue
         return None
 
-    def monitor_pull_requests(self, repo_path: str | None = None) -> list[ProcessResult]:
+    def monitor_pull_requests(
+        self,
+        repo_path: str | None = None,
+        *,
+        limit: int = DEFAULT_PULL_REQUEST_MONITOR_LIMIT,
+    ) -> list[ProcessResult]:
         results: list[ProcessResult] = []
-        for candidate in self.store.list_issues_awaiting_pr_closure(repo_path=repo_path):
+        for candidate in self.store.list_issues_awaiting_pr_closure(limit=limit, repo_path=repo_path):
             monitor_id = f"pr-monitor-{uuid.uuid4()}"
             issue = self.store.claim_pr_monitor_issue(
                 candidate.id,
