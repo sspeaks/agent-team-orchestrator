@@ -1999,6 +1999,7 @@ class WorkspaceManager:
 
     def _recreate_pull_request_repair_worktree(self, issue: Issue, info: WorkspaceInfo, head_ref: str) -> None:
         expected_head = self._git(info.source_root, "rev-parse", head_ref)
+        expected_target_head = info.source_head
         if info.worktree_root.exists() or self._is_registered_worktree(info.source_root, info.worktree_root):
             if not info.worktree_root.is_dir():
                 raise WorkspaceError(f"Workspace worktree path is not a directory for issue {issue.id}: {info.worktree_root}")
@@ -2031,6 +2032,14 @@ class WorkspaceManager:
                     raise WorkspaceError(
                         f"Existing hosted PR repair metadata for issue {issue.id} records PR head "
                         f"{recorded_head[:12]}, but the provider now reports {expected_head[:12]}. "
+                        "Refusing to reuse stale conflict markers; inspect or reset the issue workspace before retrying."
+                    )
+                recorded_target_head = _clean_optional_string(metadata.get("hosted_pull_request_target_head"))
+                if recorded_target_head != expected_target_head:
+                    recorded_target = recorded_target_head[:12] if recorded_target_head else "missing"
+                    raise WorkspaceError(
+                        f"Existing hosted PR repair metadata for issue {issue.id} records target head "
+                        f"{recorded_target}, but the provider target branch now resolves to {expected_target_head[:12]}. "
                         "Refusing to reuse stale conflict markers; inspect or reset the issue workspace before retrying."
                     )
                 return

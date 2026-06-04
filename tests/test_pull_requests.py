@@ -1027,7 +1027,21 @@ class PullRequestProviderTests(unittest.TestCase):
         self.assertFalse(snapshot.has_conflicts)
         self.assertEqual(snapshot.merge_state, "rejectedbypolicy")
         self.assertEqual(snapshot.head_sha, "b" * 40)
-        self.assertEqual(runner.calls[0][:4], ("az", "repos", "pr", "show"))
+        self.assertEqual(
+            runner.calls[0],
+            (
+                "az",
+                "repos",
+                "pr",
+                "show",
+                "--id",
+                "17",
+                "--org",
+                "https://dev.azure.com/org",
+                "--output",
+                "json",
+            ),
+        )
 
     def test_azure_devops_status_snapshot_detects_conflict(self) -> None:
         metadata = {
@@ -1180,8 +1194,50 @@ class PullRequestProviderTests(unittest.TestCase):
 
         self.assertTrue(result.created)
         self.assertEqual(result.id, "1")
-        self.assertEqual(runner.calls[0][:4], ("az", "rest", "--method", "get"))
-        self.assertEqual(runner.calls[1][:4], ("az", "rest", "--method", "post"))
+        threads_url = "https://dev.azure.com/org/project/_apis/git/repositories/repo/pullRequests/17/threads?api-version=7.1"
+        resource = "499b84ac-1321-427f-aa17-267ca6975798"
+        self.assertEqual(
+            runner.calls[0],
+            ("az", "rest", "--method", "get", "--url", threads_url, "--resource", resource),
+        )
+        self.assertEqual(
+            runner.calls[1][:8],
+            ("az", "rest", "--method", "post", "--url", threads_url, "--resource", resource),
+        )
+        created_body = json.loads(runner.calls[1][runner.calls[1].index("--body") + 1])
+        self.assertEqual(created_body["status"], "active")
+        self.assertEqual(created_body["comments"][0]["content"], "<!-- marker -->\nbody")
+
+    def test_azure_devops_conflict_comment_updates_existing_marker_with_resource(self) -> None:
+        metadata = {
+            "provider": "azure-devops",
+            "remote_name": "origin",
+            "remote_identity": ["azure-devops", "org", "project", "repo"],
+            "id": "17",
+            "conflict_comment_marker": "<!-- marker -->",
+        }
+        runner = FakeRunner(
+            [
+                command_result({"value": [{"id": 123, "comments": [{"id": 4, "content": "prior\n<!-- marker -->"}]}]}),
+                command_result({"id": 4, "content": "<!-- marker -->\nupdated"}),
+            ]
+        )
+
+        result = ensure_pull_request_conflict_comment(metadata, "<!-- marker -->\nupdated", runner)
+
+        self.assertFalse(result.created)
+        self.assertEqual(result.id, "4")
+        resource = "499b84ac-1321-427f-aa17-267ca6975798"
+        update_url = (
+            "https://dev.azure.com/org/project/_apis/git/repositories/repo/pullRequests/17/"
+            "threads/123/comments/4?api-version=7.1"
+        )
+        self.assertEqual(
+            runner.calls[1][:8],
+            ("az", "rest", "--method", "patch", "--url", update_url, "--resource", resource),
+        )
+        updated_body = json.loads(runner.calls[1][runner.calls[1].index("--body") + 1])
+        self.assertEqual(updated_body["content"], "<!-- marker -->\nupdated")
 
     def test_pull_request_remote_from_metadata_reconstructs_identity_without_remote_url(self) -> None:
         remote = pull_request_remote_from_metadata(

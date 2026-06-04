@@ -84,6 +84,7 @@
     awaiting_merge_approval: "Merge approval needed",
     ready_for_merge: "Ready to merge",
     merging: "Merging",
+    awaiting_pr_closure: "Monitoring pull request",
     ready_for_merge_conflict_resolution: "Ready to resolve merge conflicts",
     resolving_merge_conflicts: "Resolving merge conflicts",
     awaiting_human_input: "Human input needed",

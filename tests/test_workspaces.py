@@ -1495,6 +1495,30 @@ class WorkspaceManagerTests(unittest.TestCase):
         info = self.manager.existing(issue)
         self.assertIn("<<<<<<<", (info.worktree_root / "README.md").read_text(encoding="utf-8"))
 
+    def test_prepare_pull_request_conflict_workspace_blocks_stale_target_conflicted_worktree(self) -> None:
+        issue, metadata, snapshot, bare_remote = self._hosted_pull_request_repair_fixture(conflict=True)
+        with patch.object(self.manager, "_git_remote", side_effect=self._fetch_from_bare_remote(bare_remote)):
+            self.manager.prepare_pull_request_conflict_workspace(issue, metadata, snapshot)
+
+        self._git(self.repo, "checkout", "main")
+        (self.repo / "README.md").write_text("new target change\n", encoding="utf-8")
+        self._git(self.repo, "add", "README.md")
+        self._git(self.repo, "commit", "-m", "advance target readme")
+        self._git(self.repo, "push", str(bare_remote), "main:main")
+        target_advanced_snapshot = PullRequestStatusSnapshot(
+            **{
+                **snapshot.__dict__,
+                "checked_at": "2026-01-02T00:00:00+00:00",
+            }
+        )
+
+        with patch.object(self.manager, "_git_remote", side_effect=self._fetch_from_bare_remote(bare_remote)):
+            with self.assertRaisesRegex(WorkspaceError, "records target head"):
+                self.manager.prepare_pull_request_conflict_workspace(issue, metadata, target_advanced_snapshot)
+
+        info = self.manager.existing(issue)
+        self.assertIn("<<<<<<<", (info.worktree_root / "README.md").read_text(encoding="utf-8"))
+
     def test_merge_recovery_prefers_hosted_repair_workspace_over_stale_pr_metadata(self) -> None:
         issue, metadata, snapshot, bare_remote = self._hosted_pull_request_repair_fixture(conflict=True)
         with patch.object(self.manager, "_git_remote", side_effect=self._fetch_from_bare_remote(bare_remote)):

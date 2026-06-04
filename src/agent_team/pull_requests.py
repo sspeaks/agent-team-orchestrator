@@ -126,6 +126,7 @@ _NONINTERACTIVE_ENV = {
     "GIT_TERMINAL_PROMPT": "0",
     "AZURE_EXTENSION_USE_DYNAMIC_INSTALL": "no",
 }
+_ADO_REST_RESOURCE = "499b84ac-1321-427f-aa17-267ca6975798"
 
 
 class SubprocessCommandRunner:
@@ -584,10 +585,6 @@ def _ado_status_snapshot(
             pr_id,
             "--org",
             _ado_org_url(remote),
-            "--project",
-            _require(remote.project, "project", remote),
-            "--repository",
-            remote.repo,
             "--output",
             "json",
         ]
@@ -674,7 +671,7 @@ def _ado_conflict_comment(
 ) -> PullRequestCommentResult:
     pr_id = _ado_pr_id(metadata)
     threads_url = _ado_threads_url(remote, pr_id)
-    listed = runner.run(["az", "rest", "--method", "get", "--url", threads_url])
+    listed = runner.run(_ado_rest_args("get", threads_url))
     _ensure_success("az rest pull request threads", listed, "Verify Azure CLI can read pull request threads.")
     existing = _find_marked_ado_comment(_load_json(listed.stdout, "az rest pull request threads"), marker)
     if existing is not None:
@@ -682,12 +679,7 @@ def _ado_conflict_comment(
         update_url = _ado_thread_comment_url(remote, pr_id, thread_id, comment_id)
         updated = runner.run(
             [
-                "az",
-                "rest",
-                "--method",
-                "patch",
-                "--url",
-                update_url,
+                *_ado_rest_args("patch", update_url),
                 "--body",
                 json.dumps({"content": body}),
             ]
@@ -708,12 +700,7 @@ def _ado_conflict_comment(
         )
     created = runner.run(
         [
-            "az",
-            "rest",
-            "--method",
-            "post",
-            "--url",
-            threads_url,
+            *_ado_rest_args("post", threads_url),
             "--body",
             json.dumps({"comments": [{"parentCommentId": 0, "content": body}], "status": "active"}),
         ]
@@ -1019,6 +1006,19 @@ def _ado_thread_comment_url(remote: PullRequestRemote, pr_id: str, thread_id: ob
         f"/pullRequests/{_ado_url_part(pr_id)}/threads/{_ado_url_part(thread_id)}"
         f"/comments/{_ado_url_part(comment_id)}?api-version=7.1"
     )
+
+
+def _ado_rest_args(method: str, url: str) -> list[str]:
+    return [
+        "az",
+        "rest",
+        "--method",
+        method,
+        "--url",
+        url,
+        "--resource",
+        _ADO_REST_RESOURCE,
+    ]
 
 
 def _ado_project_url(remote: PullRequestRemote) -> str:

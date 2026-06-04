@@ -1431,6 +1431,7 @@ function collectLinks(node) {{
 }}
 const monitoringPanel = fakeElement("div");
 const phaseNode = {{ textContent: "awaiting_pr_closure" }};
+const phaseLabelNode = {{ textContent: "" }};
 const liveStatus = {{ textContent: "", classList: {{ toggle() {{}} }} }};
 global.document = {{
   hidden: false,
@@ -1441,6 +1442,7 @@ global.document = {{
   }},
   querySelector(selector) {{
     if (selector === "[data-issue-phase]") return phaseNode;
+    if (selector === "[data-issue-phase-label]") return phaseLabelNode;
     if (selector === "[data-pull-request-monitoring]") return monitoringPanel;
     if (selector === "[data-live-status]") return liveStatus;
     return null;
@@ -1469,6 +1471,7 @@ setTimeout(() => {{
   let text = collectText(monitoringPanel);
   assert.strictEqual(reloadCount, 0);
   assert.strictEqual(monitoringPanel.hidden, false);
+  assert.strictEqual(phaseLabelNode.textContent, "Monitoring pull request");
   assert(text.includes("Pull request monitoring"));
   assert(text.includes("Pull request #7"));
   assert(text.includes("OPEN"));
