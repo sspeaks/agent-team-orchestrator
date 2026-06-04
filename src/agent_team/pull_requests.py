@@ -585,6 +585,8 @@ def _ado_status_snapshot(
             pr_id,
             "--org",
             _ado_org_url(remote),
+            "--project",
+            _require(remote.project, "project", remote),
             "--output",
             "json",
         ]

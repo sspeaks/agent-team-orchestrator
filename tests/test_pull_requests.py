@@ -1038,6 +1038,8 @@ class PullRequestProviderTests(unittest.TestCase):
                 "17",
                 "--org",
                 "https://dev.azure.com/org",
+                "--project",
+                "project",
                 "--output",
                 "json",
             ),
