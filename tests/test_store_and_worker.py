@@ -1149,6 +1149,54 @@ class StoreAndWorkerTests(unittest.TestCase):
         self.assertIsNone(recovered.lock_expires_at)
         self.assertEqual(results[0].action, "post_transition_lock_cleared")
 
+    def test_recovery_clears_stale_pr_monitor_lock_after_done_transition(self) -> None:
+        issue = self._issue_awaiting_pr_closure()
+        monitor_id = "pr-monitor-dead-done"
+        self.assertIsNotNone(self.store.claim_pr_monitor_issue(issue.id, "legacy-worker", 60, monitor_id))
+        self.store.transition_issue(issue.id, "done", monitor_id, "Hosted pull request merged.")
+        self._expire_lock(issue.id)
+
+        result = Orchestrator(self.store, self.artifacts, self.config).recover_interrupted_issue(issue.id)
+        second = Orchestrator(self.store, self.artifacts, self.config).recover_interrupted_issue(issue.id)
+
+        self.assertIsNotNone(result)
+        self.assertIsNone(second)
+        self.assertEqual(result.run_id, monitor_id)
+        self.assertEqual(result.agent_phase, "pr_monitor")
+        self.assertEqual(result.action, "pr_monitor_post_transition_lock_cleared")
+        self.assertEqual(result.previous_phase, "done")
+        self.assertEqual(result.next_phase, "done")
+        recovered = self.store.get_issue(issue.id)
+        self.assertEqual(recovered.phase, "done")
+        self.assertEqual(recovered.status, "closed")
+        self.assertIsNone(recovered.current_run_id)
+        self.assertIsNone(recovered.lock_expires_at)
+        self.assertEqual(self.store.list_runs(issue.id), [])
+
+    def test_recovery_clears_stale_pr_monitor_lock_after_blocked_transition(self) -> None:
+        issue = self._issue_awaiting_pr_closure()
+        monitor_id = "pr-monitor-dead-blocked"
+        blocked_message = "Provider credentials are missing. Add credentials and retry PR monitoring."
+        self.assertIsNotNone(self.store.claim_pr_monitor_issue(issue.id, "legacy-worker", 60, monitor_id))
+        self.store.transition_issue(issue.id, "blocked", monitor_id, blocked_message)
+        self._expire_lock(issue.id)
+
+        results = Orchestrator(self.store, self.artifacts, self.config).recover_interrupted_runs()
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].run_id, monitor_id)
+        self.assertEqual(results[0].agent_phase, "pr_monitor")
+        self.assertEqual(results[0].action, "pr_monitor_post_transition_lock_cleared")
+        self.assertEqual(results[0].previous_phase, "blocked")
+        self.assertEqual(results[0].next_phase, "blocked")
+        recovered = self.store.get_issue(issue.id)
+        self.assertEqual(recovered.phase, "blocked")
+        self.assertEqual(recovered.status, "open")
+        self.assertEqual(recovered.blocked_summary, blocked_message)
+        self.assertIsNone(recovered.current_run_id)
+        self.assertIsNone(recovered.lock_expires_at)
+        self.assertEqual(self.store.list_runs(issue.id), [])
+
     def test_global_merge_recovery_blocks_unreadable_workspace_metadata(self) -> None:
         issue = self._start_stale_merge_run()
         self.artifacts.workspace_metadata_path(issue.id).write_text("{", encoding="utf-8")

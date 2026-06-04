@@ -113,6 +113,8 @@ _MAX_GENERATED_TITLE_LENGTH = 80
 _TITLE_FALLBACK = "Untitled issue"
 _LINK_RE = re.compile(r"!?\[([^\]]*)\]\([^)]+\)")
 _SENTENCE_RE = re.compile(r"(.+?[.!?])(?:\s+|$)")
+_PR_MONITOR_RUN_ID_PREFIX = "pr-monitor-"
+_PR_MONITOR_POST_TRANSITION_PHASES = {"blocked", "done"}
 
 
 def _clean_issue_description(description: str) -> str:
@@ -1792,7 +1794,9 @@ class IssueStore:
         phase = str(row["phase"])
         issue_id = int(row["id"])
         run = self._run_for_recovery(conn, issue_id, row["current_run_id"], None)
-        if run is None or str(run["status"]) == "running":
+        if run is None:
+            return self._recover_pr_monitor_post_transition_issue(conn, row, now_iso)
+        if str(run["status"]) == "running":
             return None
         if not self._run_reached_issue_phase(run, phase):
             return None
@@ -1804,6 +1808,36 @@ class IssueStore:
             conn.execute("UPDATE runs SET next_phase = ? WHERE id = ? AND next_phase IS NULL", (phase, run_id))
         self._add_event(conn, issue_id, run_id, "issue.recovered", summary)
         return RecoveryResult(issue_id, run_id, phase, phase, "post_transition_lock_cleared", summary, str(run["phase"]))
+
+    def _recover_pr_monitor_post_transition_issue(
+        self,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+        now_iso: str,
+    ) -> RecoveryResult | None:
+        phase = str(row["phase"])
+        run_id = row["current_run_id"]
+        if (
+            phase not in _PR_MONITOR_POST_TRANSITION_PHASES
+            or not isinstance(run_id, str)
+            or not run_id.startswith(_PR_MONITOR_RUN_ID_PREFIX)
+        ):
+            return None
+        issue_id = int(row["id"])
+        summary = f"Cleared stale pull request monitor lock {run_id} after issue reached {phase}."
+        blocked_summary = row["blocked_summary"] if phase == "blocked" else None
+        if not self._apply_recovery_issue_update(conn, row, phase, now_iso, summary, blocked_summary):
+            return None
+        self._add_event(conn, issue_id, run_id, "issue.recovered", summary)
+        return RecoveryResult(
+            issue_id,
+            run_id,
+            phase,
+            phase,
+            "pr_monitor_post_transition_lock_cleared",
+            summary,
+            "pr_monitor",
+        )
 
     def _terminal_recovery_target(
         self,

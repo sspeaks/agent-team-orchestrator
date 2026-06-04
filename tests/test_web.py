@@ -715,6 +715,27 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.store.get_issue(issue.id).phase, "ready_for_plan")
         self.assertEqual([run["status"] for run in self.store.list_runs(issue.id)], ["interrupted", "success"])
 
+    def test_web_manual_transition_recovers_stale_pr_monitor_blocked_lock(self) -> None:
+        issue = self.store.create_issue("stale pr monitor", "desc", ready=True)
+        self._move_to_merge_approval(issue.id)
+        self.store.transition_issue(issue.id, "ready_for_merge")
+        self.store.transition_issue(issue.id, "merging")
+        self.store.transition_issue(issue.id, "awaiting_pr_closure")
+        monitor_id = "pr-monitor-web-blocked"
+        self.assertIsNotNone(self.store.claim_pr_monitor_issue(issue.id, "legacy-worker", 60, monitor_id))
+        self.store.transition_issue(issue.id, "blocked", monitor_id, "PR monitor provider credentials are missing.")
+        self._expire_lock(issue.id)
+
+        self.post(
+            f"/issues/{issue.id}/actions/transition",
+            {"next_phase": "awaiting_pr_closure", "message": "Retry PR monitoring."},
+        )
+
+        recovered = self.store.get_issue(issue.id)
+        self.assertEqual(recovered.phase, "awaiting_pr_closure")
+        self.assertIsNone(recovered.current_run_id)
+        self.assertIsNone(recovered.lock_expires_at)
+
     def test_web_plan_approval_recovers_stale_completed_plan_lock(self) -> None:
         issue = self.store.create_issue("stale plan approval", "desc", ready=True)
         self.store.transition_issue(issue.id, "researching")
