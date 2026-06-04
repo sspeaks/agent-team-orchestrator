@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import threading
 import uuid
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ from .workspaces import WorkspaceError, WorkspaceInfo, WorkspaceManager, Workspa
 
 
 DEFAULT_PULL_REQUEST_MONITOR_LIMIT = 1
+PULL_REQUEST_MONITOR_OPERATIONAL_ERRORS = (OSError, ValueError, RuntimeError, sqlite3.Error, KeyError)
 
 
 @dataclass(frozen=True)
@@ -96,14 +98,13 @@ class Orchestrator:
                     self.config.lock_ttl_seconds,
                 ):
                     result = self._monitor_pull_request_issue(issue, monitor_id)
-                results.append(result)
             except _StalePullRequestMonitor as exc:
                 result = ProcessResult(issue.id, monitor_id, "pr_monitor", "stale", None, str(exc), None)
-                results.append(result)
+            except PULL_REQUEST_MONITOR_OPERATIONAL_ERRORS as exc:
+                result = self._block_pull_request_monitor_after_failure(issue, monitor_id, exc)
             finally:
-                self.store.release_lock(issue.id, self.owner, monitor_id)
-                if result is None or result.status != "stale":
-                    self.artifacts.write_issue_snapshot(self.store.get_issue(issue.id))
+                result = self._finalize_pull_request_monitor_claim(issue.id, monitor_id, result)
+            results.append(result)
         return results
 
     def recover_interrupted_runs(self) -> list[RecoveryResult]:
@@ -827,6 +828,112 @@ class Orchestrator:
         self._ensure_pull_request_monitor_current(issue.id, monitor_id)
         self.store.transition_issue(issue.id, "blocked", monitor_id, message, blocked_summary=blocked_summary)
         return ProcessResult(issue.id, monitor_id, "pr_monitor", "blocked", "blocked", message, artifact_path)
+
+    def _block_pull_request_monitor_after_failure(
+        self,
+        issue: Issue,
+        monitor_id: str,
+        exc: BaseException,
+    ) -> ProcessResult:
+        message = f"Pull request monitoring failed for issue {issue.id}: {exc}"
+        try:
+            return self._block_pull_request_monitor(issue, monitor_id, message)
+        except _StalePullRequestMonitor as stale:
+            return ProcessResult(issue.id, monitor_id, "pr_monitor", "stale", None, str(stale), None)
+        except PULL_REQUEST_MONITOR_OPERATIONAL_ERRORS as block_exc:
+            return self._block_pull_request_monitor_minimally(issue, monitor_id, message, block_exc)
+
+    def _block_pull_request_monitor_minimally(
+        self,
+        issue: Issue,
+        monitor_id: str,
+        message: str,
+        block_exc: BaseException,
+    ) -> ProcessResult:
+        fallback_message = (
+            f"{message} Additional failure while recording the blocked PR monitor state: {block_exc}"
+        )
+        blocked_summary = summarize_blocked_reason(fallback_message)
+        try:
+            self._ensure_pull_request_monitor_current(issue.id, monitor_id)
+            self.store.transition_issue(
+                issue.id,
+                "blocked",
+                monitor_id,
+                fallback_message,
+                blocked_summary=blocked_summary,
+            )
+        except _StalePullRequestMonitor as stale:
+            return ProcessResult(issue.id, monitor_id, "pr_monitor", "stale", None, str(stale), None)
+        except PULL_REQUEST_MONITOR_OPERATIONAL_ERRORS as transition_exc:
+            fallback_message = (
+                f"{fallback_message} The issue could not be transitioned to blocked: {transition_exc}"
+            )
+            return ProcessResult(
+                issue.id,
+                monitor_id,
+                "pr_monitor",
+                "blocked",
+                "awaiting_pr_closure",
+                fallback_message,
+                None,
+            )
+        return ProcessResult(issue.id, monitor_id, "pr_monitor", "blocked", "blocked", fallback_message, None)
+
+    def _finalize_pull_request_monitor_claim(
+        self,
+        issue_id: int,
+        monitor_id: str,
+        result: ProcessResult | None,
+    ) -> ProcessResult:
+        if result is None:
+            result = ProcessResult(
+                issue_id,
+                monitor_id,
+                "pr_monitor",
+                "blocked",
+                "awaiting_pr_closure",
+                f"Pull request monitor {monitor_id} ended without a result for issue {issue_id}.",
+                None,
+            )
+        try:
+            self.store.release_lock(issue_id, self.owner, monitor_id)
+        except PULL_REQUEST_MONITOR_OPERATIONAL_ERRORS as exc:
+            result = ProcessResult(
+                result.issue_id,
+                result.run_id,
+                result.phase,
+                result.status,
+                result.next_phase,
+                f"{result.summary} Failed to release PR monitor lock: {exc}",
+                result.artifact_path,
+            )
+        if result.status == "stale":
+            return result
+        try:
+            self.artifacts.write_issue_snapshot(self.store.get_issue(issue_id))
+        except PULL_REQUEST_MONITOR_OPERATIONAL_ERRORS as exc:
+            self._record_pull_request_monitor_warning(
+                issue_id,
+                monitor_id,
+                f"Failed to write issue snapshot after pull request monitoring: {exc}",
+            )
+            result = ProcessResult(
+                result.issue_id,
+                result.run_id,
+                result.phase,
+                result.status,
+                result.next_phase,
+                f"{result.summary} Failed to write issue snapshot: {exc}",
+                result.artifact_path,
+            )
+        return result
+
+    def _record_pull_request_monitor_warning(self, issue_id: int, monitor_id: str, message: str) -> None:
+        try:
+            self.store.record_event(issue_id, "pull_request.monitor_warning", message, monitor_id)
+        except PULL_REQUEST_MONITOR_OPERATIONAL_ERRORS:
+            return
 
     def _ensure_pull_request_monitor_current(self, issue_id: int, monitor_id: str) -> Issue:
         issue = self.store.refresh_pr_monitor_issue(

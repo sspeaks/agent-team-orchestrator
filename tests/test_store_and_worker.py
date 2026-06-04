@@ -3267,6 +3267,73 @@ class StoreAndWorkerTests(unittest.TestCase):
         assert second_metadata is not None
         self.assertNotIn("last_status_check_at", second_metadata)
 
+    def test_process_batch_isolates_pull_request_monitor_metadata_update_failure(self) -> None:
+        first = self._issue_awaiting_pr_closure()
+        second = self._issue_awaiting_pr_closure()
+        self._write_waiting_pr_metadata(first.id)
+        self._write_waiting_pr_metadata(second.id)
+        snapshot = self._pr_snapshot(status="OPEN", is_open=True, head_sha="b" * 40)
+        original_update = self.artifacts.update_pull_request_metadata
+
+        def update_metadata(issue_id: int, updates: dict[str, object]) -> Path:
+            if issue_id == first.id:
+                raise ValueError("pull_request.json disappeared")
+            return original_update(issue_id, updates)
+
+        with patch("agent_team.orchestrator.get_pull_request_status", return_value=snapshot):
+            with patch.object(self.artifacts, "update_pull_request_metadata", side_effect=update_metadata):
+                with patch.object(worker_module, "PULL_REQUEST_MONITOR_SWEEP_LIMIT", 2):
+                    results = process_batch(self.store, self.artifacts, self.config, concurrency=1)
+
+        self.assertEqual([result.issue_id for result in results], [first.id, second.id])
+        self.assertEqual(results[0].status, "blocked")
+        self.assertEqual(results[0].next_phase, "blocked")
+        self.assertIn("pull_request.json disappeared", results[0].summary)
+        self.assertEqual(results[1].status, "waiting")
+        self.assertEqual(results[1].next_phase, "awaiting_pr_closure")
+        self.assertEqual(self.store.get_issue(first.id).phase, "blocked")
+        self.assertEqual(self.store.get_issue(second.id).phase, "awaiting_pr_closure")
+        second_metadata = self.artifacts.read_pull_request_metadata(second.id)
+        self.assertIsNotNone(second_metadata)
+        assert second_metadata is not None
+        self.assertEqual(second_metadata["last_head_commit"], "b" * 40)
+
+    def test_pull_request_monitor_blocks_transition_failure_and_continues_sweep(self) -> None:
+        first = self._issue_awaiting_pr_closure()
+        second = self._issue_awaiting_pr_closure()
+        self._write_waiting_pr_metadata(first.id)
+        self._write_waiting_pr_metadata(second.id)
+        closed_snapshot = self._pr_snapshot(
+            status="MERGED",
+            is_closed=True,
+            is_merged=True,
+            merged_at="2026-01-02T00:00:00+00:00",
+        )
+        open_snapshot = self._pr_snapshot(status="OPEN", is_open=True, head_sha="c" * 40)
+        original_transition = self.store.transition_issue
+
+        def transition_issue(issue_id: int, next_phase: str, *args: object, **kwargs: object) -> Issue:
+            if issue_id == first.id and next_phase == "done":
+                raise RuntimeError("simulated current-run transition failure")
+            return original_transition(issue_id, next_phase, *args, **kwargs)
+
+        with patch("agent_team.orchestrator.get_pull_request_status", side_effect=[closed_snapshot, open_snapshot]):
+            with patch.object(self.store, "transition_issue", side_effect=transition_issue):
+                results = Orchestrator(self.store, self.artifacts, self.config).monitor_pull_requests(limit=2)
+
+        self.assertEqual([result.issue_id for result in results], [first.id, second.id])
+        self.assertEqual(results[0].status, "blocked")
+        self.assertEqual(results[0].next_phase, "blocked")
+        self.assertIn("simulated current-run transition failure", results[0].summary)
+        self.assertEqual(results[1].status, "waiting")
+        self.assertEqual(results[1].next_phase, "awaiting_pr_closure")
+        self.assertEqual(self.store.get_issue(first.id).phase, "blocked")
+        self.assertEqual(self.store.get_issue(second.id).phase, "awaiting_pr_closure")
+        second_metadata = self.artifacts.read_pull_request_metadata(second.id)
+        self.assertIsNotNone(second_metadata)
+        assert second_metadata is not None
+        self.assertEqual(second_metadata["last_head_commit"], "c" * 40)
+
     def test_pull_request_monitor_skips_history_when_open_status_is_unchanged(self) -> None:
         issue = self._issue_awaiting_pr_closure()
         self._write_waiting_pr_metadata(issue.id)
