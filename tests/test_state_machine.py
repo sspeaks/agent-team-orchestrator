@@ -83,9 +83,19 @@ class StateMachineTests(unittest.TestCase):
         validate_transition("awaiting_merge_approval", "ready_for_merge")
         validate_transition("ready_for_merge", "merging")
         validate_transition("merging", "done")
+        validate_transition("merging", "awaiting_pr_closure")
         self.assertIsNone(runnable_phase_for("awaiting_merge_approval"))
         self.assertEqual(runnable_phase_for("ready_for_merge"), "merge")
         self.assertEqual(default_next_phase("merge"), "done")
+
+    def test_pull_request_closure_waiting_phase_is_non_runnable(self) -> None:
+        validate_transition("awaiting_pr_closure", "done")
+        validate_transition("awaiting_pr_closure", "ready_for_merge_conflict_resolution")
+        validate_transition("awaiting_pr_closure", "ready_for_validation")
+        validate_transition("awaiting_pr_closure", "blocked")
+        validate_transition("blocked", "awaiting_pr_closure")
+        self.assertIsNone(runnable_phase_for("awaiting_pr_closure"))
+        self.assertFalse(is_running_phase("awaiting_pr_closure"))
 
     def test_merge_conflict_resolution_transitions_are_valid(self) -> None:
         validate_transition("merging", "ready_for_merge_conflict_resolution")

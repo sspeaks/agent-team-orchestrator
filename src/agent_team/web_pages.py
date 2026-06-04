@@ -21,6 +21,7 @@ from .web_html import (
     _render_blocked_reason,
     _render_closed_synopsis,
     _render_human_input_panel,
+    _render_pull_request_monitoring_panel,
     _runtime_summary,
     _summary_card,
     phase_label,
@@ -131,6 +132,7 @@ def render_issue_detail_body(
     csrf_token: str,
 ) -> str:
     human_input_panel = _render_human_input_panel(payload["human_input"])
+    pull_request_monitoring_panel = _render_pull_request_monitoring_panel(payload.get("pull_request_monitoring"))
     controls = _manager_controls_html(payload["manager_controls"], csrf_token)
     blocked_reason = _render_blocked_reason(payload["blocked_reason"])
     closed_synopsis = _render_closed_synopsis(payload["closed_synopsis"])
@@ -169,7 +171,7 @@ def render_issue_detail_body(
     focus_panels = (
         f"{blocked_reason if payload['blocked_reason'] else ''}"
         f"{closed_synopsis if payload['closed_synopsis'] else ''}"
-        f"{plan_review}{human_input_panel}{review_artifact}"
+        f"{plan_review}{human_input_panel}{pull_request_monitoring_panel}{review_artifact}"
     )
     hidden_status_panels = (
         f"{blocked_reason if not payload['blocked_reason'] else ''}"

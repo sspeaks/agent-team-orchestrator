@@ -57,7 +57,8 @@ VALID_TRANSITIONS: dict[str, set[str]] = {
     },
     "awaiting_merge_approval": {"ready_for_merge", "ready_for_review", "ready_for_implementation", "blocked"},
     "ready_for_merge": {"merging", "blocked"},
-    "merging": {"done", "ready_for_merge_conflict_resolution", "blocked"},
+    "merging": {"done", "awaiting_pr_closure", "ready_for_merge_conflict_resolution", "blocked"},
+    "awaiting_pr_closure": {"done", "ready_for_merge_conflict_resolution", "ready_for_validation", "blocked"},
     "ready_for_merge_conflict_resolution": {"resolving_merge_conflicts", "blocked"},
     "resolving_merge_conflicts": {"ready_for_validation", "ready_for_implementation", "awaiting_human_input", "blocked"},
     "awaiting_human_input": {
@@ -77,6 +78,7 @@ VALID_TRANSITIONS: dict[str, set[str]] = {
         "ready_for_validation",
         "ready_for_review",
         "awaiting_merge_approval",
+        "awaiting_pr_closure",
         "ready_for_merge",
         "ready_for_merge_conflict_resolution",
     },

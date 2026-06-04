@@ -207,7 +207,8 @@
 
     // Idle poll interval in seconds for worker loop and serve mode.
     // Default: 60.
-    // Safety: lower values poll more often; 0 can spin quickly when idle.
+    // Safety: lower values poll ready issues and hosted pull request status
+    // more often; 0 can spin quickly when idle.
     // Legacy env: AGENT_TEAM_WORKER_INTERVAL_SECONDS.
     // "worker_interval_seconds": 60
   // }

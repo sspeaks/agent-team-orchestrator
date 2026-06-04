@@ -113,6 +113,8 @@ _MAX_GENERATED_TITLE_LENGTH = 80
 _TITLE_FALLBACK = "Untitled issue"
 _LINK_RE = re.compile(r"!?\[([^\]]*)\]\([^)]+\)")
 _SENTENCE_RE = re.compile(r"(.+?[.!?])(?:\s+|$)")
+_PR_MONITOR_RUN_ID_PREFIX = "pr-monitor-"
+_PR_MONITOR_POST_TRANSITION_PHASES = {"blocked", "done"}
 
 
 def _clean_issue_description(description: str) -> str:
@@ -393,6 +395,43 @@ class IssueStore:
             ).fetchall()
         return [Issue.from_row(row) for row in rows]
 
+    def list_issues_awaiting_pr_closure(
+        self,
+        limit: int = 100,
+        *,
+        repo_path: str | None = None,
+        exclude_issue_ids: set[int] | None = None,
+    ) -> list[Issue]:
+        if limit <= 0:
+            return []
+        excluded = sorted(exclude_issue_ids or set())
+        exclude_clause = ""
+        repo_clause = ""
+        params: list[object] = [utc_now_iso()]
+        if repo_path is not None:
+            repo_clause = "AND repo_path = ?"
+            params.append(repo_path)
+        if excluded:
+            exclude_placeholders = ",".join("?" for _ in excluded)
+            exclude_clause = f"AND id NOT IN ({exclude_placeholders})"
+            params.extend(excluded)
+        params.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM issues
+                WHERE status = 'open'
+                  AND phase = 'awaiting_pr_closure'
+                  AND (lock_expires_at IS NULL OR lock_expires_at < ?)
+                  {repo_clause}
+                  {exclude_clause}
+                ORDER BY priority ASC, COALESCE(last_scheduled_at, created_at) ASC, id ASC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [Issue.from_row(row) for row in rows]
+
     def dashboard_summary(self, repo_path: str | None = None) -> dict[str, object]:
         now = utc_now_iso()
         issue_where = "WHERE repo_path = ?" if repo_path is not None else ""
@@ -608,9 +647,10 @@ class IssueStore:
                 """,
                 issue_scope,
             ).fetchall()
+            finalized_scope = [*issue_scope, *issue_scope]
             recently_merged = conn.execute(
                 f"""
-                WITH ranked_merges AS (
+                WITH finalizations AS (
                     SELECT
                         issues.id AS issue_id,
                         issues.title,
@@ -623,13 +663,7 @@ class IssueStore:
                         runs.started_at,
                         runs.completed_at,
                         runs.summary,
-                        runs.next_phase,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY issues.id
-                            ORDER BY COALESCE(runs.completed_at, runs.started_at) DESC,
-                                     runs.started_at DESC,
-                                     runs.id DESC
-                        ) AS row_num
+                        runs.next_phase
                     FROM runs
                     JOIN issues ON issues.id = runs.issue_id
                     WHERE issues.status = 'closed'
@@ -637,15 +671,59 @@ class IssueStore:
                       AND runs.phase = 'merge'
                       AND runs.status = 'success'
                       {joined_and}
+                    UNION ALL
+                    SELECT
+                        issues.id AS issue_id,
+                        issues.title,
+                        issues.repo_path,
+                        issues.updated_at,
+                        events.run_id AS run_id,
+                        'pr_monitor' AS phase,
+                        'pull-request-monitor' AS runner,
+                        'success' AS status,
+                        NULL AS started_at,
+                        events.created_at AS completed_at,
+                        events.message AS summary,
+                        'done' AS next_phase
+                    FROM events
+                    JOIN issues ON issues.id = events.issue_id
+                    WHERE issues.status = 'closed'
+                      AND issues.phase = 'done'
+                      AND events.event_type = 'pull_request.closed'
+                      {joined_and}
+                ),
+                ranked_finalizations AS (
+                    SELECT
+                        issue_id,
+                        title,
+                        repo_path,
+                        updated_at,
+                        run_id,
+                        phase,
+                        runner,
+                        status,
+                        started_at,
+                        completed_at,
+                        summary,
+                        next_phase,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY issue_id
+                            ORDER BY COALESCE(completed_at, started_at, updated_at) DESC,
+                                     COALESCE(started_at, completed_at, updated_at) DESC,
+                                     COALESCE(run_id, '') DESC
+                        ) AS row_num
+                    FROM finalizations
                 )
                 SELECT issue_id, title, repo_path, updated_at, run_id, phase, runner, status,
                        started_at, completed_at, summary, next_phase
-                FROM ranked_merges
+                FROM ranked_finalizations
                 WHERE row_num = 1
-                ORDER BY COALESCE(completed_at, started_at) DESC, started_at DESC, run_id DESC
+                ORDER BY COALESCE(completed_at, started_at, updated_at) DESC,
+                         COALESCE(started_at, completed_at, updated_at) DESC,
+                         COALESCE(run_id, '') DESC
                 LIMIT 10
                 """,
-                issue_scope,
+                finalized_scope,
             ).fetchall()
         approval_issues = awaiting_plan_approval + awaiting_merge_approval
         approval_count = int(awaiting_plan_approval_count["count"]) + int(awaiting_merge_approval_count["count"])
@@ -868,17 +946,48 @@ class IssueStore:
 
     def release_lock(self, issue_id: int, owner: str, run_id: str | None = None) -> None:
         now = utc_now_iso()
+        run_guard = ""
+        params: list[object] = [now, issue_id, owner]
+        if run_id is not None:
+            run_guard = "AND current_run_id = ?"
+            params.append(run_id)
         with self.connect() as conn:
             cur = conn.execute(
-                """
+                f"""
                 UPDATE issues
                 SET lock_owner = NULL, lock_expires_at = NULL, current_run_id = NULL, updated_at = ?
                 WHERE id = ? AND lock_owner = ?
+                  {run_guard}
                 """,
-                (now, issue_id, owner),
+                params,
             )
             if cur.rowcount == 1:
                 self._add_event(conn, issue_id, run_id, "lock.released", f"{owner} released lock")
+
+    def claim_pr_monitor_issue(self, issue_id: int, owner: str, ttl_seconds: int, monitor_id: str) -> Issue | None:
+        if not self.acquire_lock(
+            issue_id,
+            owner,
+            ttl_seconds,
+            monitor_id,
+            expected_phase="awaiting_pr_closure",
+            mark_scheduled=True,
+        ):
+            return None
+        return self.get_issue(issue_id)
+
+    def refresh_pr_monitor_issue(self, issue_id: int, owner: str, ttl_seconds: int, monitor_id: str) -> Issue | None:
+        return self.refresh_issue_lock(
+            issue_id,
+            owner,
+            ttl_seconds,
+            expected_phase="awaiting_pr_closure",
+            expected_run_id=monitor_id,
+        )
+
+    def record_event(self, issue_id: int, event_type: str, message: str, run_id: str | None = None) -> None:
+        with self.connect() as conn:
+            self._add_event(conn, issue_id, run_id, event_type, message)
 
     def transition_issue(
         self,
@@ -1685,7 +1794,9 @@ class IssueStore:
         phase = str(row["phase"])
         issue_id = int(row["id"])
         run = self._run_for_recovery(conn, issue_id, row["current_run_id"], None)
-        if run is None or str(run["status"]) == "running":
+        if run is None:
+            return self._recover_pr_monitor_post_transition_issue(conn, row, now_iso)
+        if str(run["status"]) == "running":
             return None
         if not self._run_reached_issue_phase(run, phase):
             return None
@@ -1697,6 +1808,36 @@ class IssueStore:
             conn.execute("UPDATE runs SET next_phase = ? WHERE id = ? AND next_phase IS NULL", (phase, run_id))
         self._add_event(conn, issue_id, run_id, "issue.recovered", summary)
         return RecoveryResult(issue_id, run_id, phase, phase, "post_transition_lock_cleared", summary, str(run["phase"]))
+
+    def _recover_pr_monitor_post_transition_issue(
+        self,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+        now_iso: str,
+    ) -> RecoveryResult | None:
+        phase = str(row["phase"])
+        run_id = row["current_run_id"]
+        if (
+            phase not in _PR_MONITOR_POST_TRANSITION_PHASES
+            or not isinstance(run_id, str)
+            or not run_id.startswith(_PR_MONITOR_RUN_ID_PREFIX)
+        ):
+            return None
+        issue_id = int(row["id"])
+        summary = f"Cleared stale pull request monitor lock {run_id} after issue reached {phase}."
+        blocked_summary = row["blocked_summary"] if phase == "blocked" else None
+        if not self._apply_recovery_issue_update(conn, row, phase, now_iso, summary, blocked_summary):
+            return None
+        self._add_event(conn, issue_id, run_id, "issue.recovered", summary)
+        return RecoveryResult(
+            issue_id,
+            run_id,
+            phase,
+            phase,
+            "pr_monitor_post_transition_lock_cleared",
+            summary,
+            "pr_monitor",
+        )
 
     def _terminal_recovery_target(
         self,
