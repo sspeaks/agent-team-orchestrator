@@ -57,7 +57,7 @@ def stop_issue(
 
     Orchestrator(store, artifacts, config).recover_interrupted_issue(issue_id)
     stop_message = (message or "").strip() or DEFAULT_STOP_MESSAGE
-    stopped = store.stop_issue(issue_id, stop_message, stopped_by=stopped_by)
+    stopped = store.force_stop_issue(issue_id, stop_message, stopped_by=stopped_by)
     if stopped.stopped_human_input_request is not None:
         artifacts.append_human_input_stop(stopped.stopped_human_input_request)
         artifacts.write_human_input_summary(issue_id, store.list_human_input_requests(issue_id))

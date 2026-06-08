@@ -1,5 +1,8 @@
 import unittest
 import tempfile
+import sys
+import threading
+import time
 from pathlib import Path
 
 from agent_team.human_input_policy import human_input_policy_prompt
@@ -1102,6 +1105,66 @@ None.
         self.assertEqual(result.status, "blocked")
         self.assertEqual(result.suggested_next_phase, "blocked")
         self.assertIn("Isolated workspace path does not exist", result.summary)
+
+    def test_cancel_run_terminates_registered_process_group_and_logs_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "run.md"
+            log_path.write_text("# Raw run log\n\n```text\n", encoding="utf-8")
+            runner = CopilotCliRunner(timeout_seconds=30)
+            command = [
+                sys.executable,
+                "-c",
+                "import time; print('started', flush=True); time.sleep(30)",
+            ]
+            completed: list[object] = []
+            errors: list[BaseException] = []
+
+            def run_command() -> None:
+                try:
+                    completed.append(
+                        runner._run_command(
+                            command,
+                            None,
+                            {"run_id": "run-cancel", "run_log": str(log_path)},
+                        )
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            thread = threading.Thread(target=run_command)
+            thread.start()
+            try:
+                deadline = time.monotonic() + 5
+                while "started" not in log_path.read_text(encoding="utf-8") and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertIn("started", log_path.read_text(encoding="utf-8"))
+
+                self.assertTrue(runner.cancel_run("run-cancel", "manager requested stop"))
+                thread.join(timeout=5)
+            finally:
+                runner.cancel_run("run-cancel", "test cleanup")
+                thread.join(timeout=5)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(len(completed), 1)
+            self.assertNotEqual(completed[0].returncode, 0)
+            self.assertIn("Run cancelled: manager requested stop", log_path.read_text(encoding="utf-8"))
+
+    def test_timeout_uses_process_group_termination_and_logs_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "run.md"
+            log_path.write_text("# Raw run log\n\n```text\n", encoding="utf-8")
+            runner = CopilotCliRunner(timeout_seconds=1)
+            completed = runner._run_command(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                None,
+                {"run_id": "run-timeout", "run_log": str(log_path)},
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("timed out", completed.stdout)
+            self.assertIn("timed out", log_path.read_text(encoding="utf-8"))
 
     def test_source_mutation_guard_detects_read_only_phase_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

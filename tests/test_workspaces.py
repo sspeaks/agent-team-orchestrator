@@ -368,6 +368,23 @@ class WorkspaceManagerTests(unittest.TestCase):
         self.assertIn("Merge approval: looks good", merge_message)
         self.assertIn("feature", merge_message)
 
+    def test_merge_cancellation_before_finalization_leaves_source_unchanged(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        source_head = self._git(self.repo, "rev-parse", "HEAD")
+
+        with self.assertRaisesRegex(WorkspaceError, "Merge cancelled"):
+            self.manager.merge_and_cleanup(
+                issue,
+                cancellation_check=lambda: "Manager stopped issue.",
+            )
+
+        self.assertEqual(self._git(self.repo, "rev-parse", "HEAD"), source_head)
+        self.assertFalse((self.repo / "feature.txt").exists())
+        self.assertTrue(info.worktree_root.exists())
+        self.assertIsNotNone(self.artifacts.read_workspace_metadata(issue.id))
+
     def test_merge_rejects_symbolic_target_branch(self) -> None:
         issue = self._issue(1, self.repo)
         info = self.manager.prepare(issue)

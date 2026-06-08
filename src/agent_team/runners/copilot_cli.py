@@ -5,7 +5,9 @@ import json
 import os
 import re
 import select
+import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from importlib import resources
@@ -189,6 +191,9 @@ class CopilotCliRunner(AgentRunner):
         self.phase_overrides = normalized_phase_overrides
         self.plugin_dir = (plugin_dir or self._default_plugin_dir()).expanduser()
         self.plugin_name = self._plugin_name(self.plugin_dir)
+        self._process_lock = threading.Lock()
+        self._active_processes: dict[str, subprocess.Popen] = {}
+        self._cancel_reasons: dict[str, str] = {}
 
     def run(self, phase: str, issue: Issue, context: dict[str, str]) -> AgentResult:
         prompt = self._build_prompt(phase, issue, context)
@@ -287,33 +292,76 @@ class CopilotCliRunner(AgentRunner):
             raw_stderr=stderr,
         )
 
+    def cancel_run(self, run_id: str, reason: str) -> bool:
+        with self._process_lock:
+            process = self._active_processes.get(run_id)
+            if process is None or process.poll() is not None:
+                return False
+            self._cancel_reasons[run_id] = reason
+        self._terminate_process_group(process)
+        return True
+
     def _run_command(self, command: list[str], repo_path: Path | None, context: dict[str, str]) -> "_CompletedCopilotRun":
         log_path = context.get("run_log")
+        run_id = context.get("run_id") or None
         if not log_path:
-            completed = subprocess.run(
-                command,
-                cwd=str(repo_path) if repo_path is not None else None,
-                text=True,
-                capture_output=True,
-                timeout=self.timeout_seconds,
-                check=False,
-            )
-            return _CompletedCopilotRun(completed.returncode, completed.stdout or "", completed.stderr or "", False)
+            return self._run_command_captured(command, repo_path, run_id)
 
-        return self._run_command_with_live_log(command, repo_path, Path(log_path))
+        return self._run_command_with_live_log(command, repo_path, Path(log_path), run_id)
+
+    def _run_command_captured(
+        self,
+        command: list[str],
+        repo_path: Path | None,
+        run_id: str | None,
+    ) -> "_CompletedCopilotRun":
+        process = subprocess.Popen(
+            command,
+            cwd=str(repo_path) if repo_path is not None else None,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        self._register_process(run_id, process)
+        timed_out = False
+        try:
+            try:
+                stdout, stderr = process.communicate(timeout=self.timeout_seconds)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                self._terminate_process_group(process)
+                stdout, stderr = process.communicate()
+        finally:
+            self._unregister_process(run_id)
+        returncode = process.returncode
+        stdout = stdout or ""
+        stderr = stderr or ""
+        cancel_reason = self._pop_cancel_reason(run_id)
+        if cancel_reason:
+            stderr = (stderr.rstrip() + "\n" if stderr else "") + f"Run cancelled: {cancel_reason}"
+        if timed_out:
+            stderr = (stderr.rstrip() + "\n" if stderr else "") + (
+                f"Copilot CLI timed out after {self.timeout_seconds} seconds."
+            )
+            returncode = returncode if returncode != 0 else -1
+        return _CompletedCopilotRun(returncode, stdout, stderr, False)
 
     def _run_command_with_live_log(
         self,
         command: list[str],
         repo_path: Path | None,
         log_path: Path,
+        run_id: str | None,
     ) -> "_CompletedCopilotRun":
         process = subprocess.Popen(
             command,
             cwd=str(repo_path) if repo_path is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
+        self._register_process(run_id, process)
         assert process.stdout is not None
         fd = process.stdout.fileno()
         os.set_blocking(fd, False)
@@ -321,27 +369,39 @@ class CopilotCliRunner(AgentRunner):
         output_parts: list[str] = []
         timed_out = False
 
-        with log_path.open("a", encoding="utf-8") as log_handle:
-            while process.poll() is None:
-                if time.monotonic() > deadline:
-                    timed_out = True
-                    process.kill()
-                    break
-                ready, _, _ = select.select([fd], [], [], 0.2)
-                if ready:
+        try:
+            with log_path.open("a", encoding="utf-8") as log_handle:
+                while process.poll() is None:
+                    if time.monotonic() > deadline:
+                        timed_out = True
+                        self._terminate_process_group(process)
+                        break
+                    ready, _, _ = select.select([fd], [], [], 0.2)
+                    if ready:
+                        chunk = self._read_available(fd)
+                        if chunk:
+                            output_parts.append(chunk)
+                            log_handle.write(chunk)
+                            log_handle.flush()
+                while True:
                     chunk = self._read_available(fd)
-                    if chunk:
-                        output_parts.append(chunk)
-                        log_handle.write(chunk)
-                        log_handle.flush()
-            while True:
-                chunk = self._read_available(fd)
-                if not chunk:
-                    break
-                output_parts.append(chunk)
-                log_handle.write(chunk)
-                log_handle.flush()
-            log_handle.write(f"\n```\n\n- Finished: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n")
+                    if not chunk:
+                        break
+                    output_parts.append(chunk)
+                    log_handle.write(chunk)
+                    log_handle.flush()
+                cancel_reason = self._pop_cancel_reason(run_id)
+                if cancel_reason:
+                    note = f"\n[agent-team] Run cancelled: {cancel_reason}\n"
+                    output_parts.append(note)
+                    log_handle.write(note)
+                if timed_out:
+                    note = f"\n[agent-team] Copilot CLI timed out after {self.timeout_seconds} seconds.\n"
+                    output_parts.append(note)
+                    log_handle.write(note)
+                log_handle.write(f"\n```\n\n- Finished: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n")
+        finally:
+            self._unregister_process(run_id)
 
         process.stdout.close()
         returncode = process.wait()
@@ -350,6 +410,48 @@ class CopilotCliRunner(AgentRunner):
             output += f"\nCopilot CLI timed out after {self.timeout_seconds} seconds."
             returncode = returncode if returncode != 0 else -1
         return _CompletedCopilotRun(returncode, output, "", True)
+
+    def _register_process(self, run_id: str | None, process: subprocess.Popen) -> None:
+        if run_id is None:
+            return
+        with self._process_lock:
+            self._active_processes[run_id] = process
+
+    def _unregister_process(self, run_id: str | None) -> None:
+        if run_id is None:
+            return
+        with self._process_lock:
+            self._active_processes.pop(run_id, None)
+
+    def _pop_cancel_reason(self, run_id: str | None) -> str | None:
+        if run_id is None:
+            return None
+        with self._process_lock:
+            return self._cancel_reasons.pop(run_id, None)
+
+    @staticmethod
+    def _terminate_process_group(process: subprocess.Popen, grace_seconds: float = 2.0) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGTERM)
+            else:
+                process.terminate()
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=grace_seconds)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except ProcessLookupError:
+            return
 
     @staticmethod
     def _read_available(fd: int) -> str:

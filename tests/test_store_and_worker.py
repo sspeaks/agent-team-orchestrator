@@ -264,11 +264,20 @@ class StoreAndWorkerTests(unittest.TestCase):
         self.assertIn("issue.recovered", event_types)
         self.assertIn("issue.stopped", event_types)
 
-    def test_stop_rejects_active_lock_draft_and_closed_issue(self) -> None:
+    def test_stop_force_blocks_active_lock_and_rejects_draft_and_closed_issue(self) -> None:
         locked = self.store.create_issue("locked stop", "desc", ready=True)
         self.assertTrue(self.store.acquire_lock(locked.id, "worker", 60, "run-locked"))
-        with self.assertRaisesRegex(ValueError, "active run|active lock"):
-            stop_issue(self.config, self.store, self.artifacts, locked.id)
+        stop_result = stop_issue(self.config, self.store, self.artifacts, locked.id)
+
+        stopped_lock = self.store.get_issue(locked.id)
+        self.assertEqual(stop_result.prior_phase, "needs_research")
+        self.assertEqual(stopped_lock.phase, "blocked")
+        self.assertIsNone(stopped_lock.current_run_id)
+        self.assertIsNone(stopped_lock.lock_expires_at)
+        self.assertEqual(stopped_lock.blocked_summary, "Issue stopped by manager")
+        event_types = [event["event_type"] for event in self.store.list_events(locked.id)]
+        self.assertIn("run.stopped", event_types)
+        self.assertIn("issue.stopped", event_types)
 
         draft = self.store.create_issue("draft stop", "desc")
         with self.assertRaisesRegex(ValueError, "draft"):
@@ -291,6 +300,100 @@ class StoreAndWorkerTests(unittest.TestCase):
         self.store.transition_issue(done.id, "done")
         with self.assertRaisesRegex(ValueError, "closed"):
             stop_issue(self.config, self.store, self.artifacts, done.id)
+
+    def test_stop_force_marks_current_running_run_stopped(self) -> None:
+        issue = self.store.create_issue("active run stop", "desc", ready=True)
+        self.assertTrue(self.store.acquire_lock(issue.id, "worker", 60, "run-active"))
+        self.store.transition_issue(issue.id, "researching", "run-active")
+        self.store.create_run("run-active", issue.id, "research", "dry-run")
+
+        result = stop_issue(self.config, self.store, self.artifacts, issue.id, "Manager cancelled active work.")
+
+        stopped = self.store.get_issue(issue.id)
+        run = self.store.list_runs(issue.id)[0]
+        self.assertEqual(result.prior_phase, "researching")
+        self.assertEqual(stopped.phase, "blocked")
+        self.assertIsNone(stopped.current_run_id)
+        self.assertIsNone(stopped.lock_owner)
+        self.assertEqual(stopped.blocked_summary, "Manager cancelled active work.")
+        self.assertEqual(run["status"], "stopped")
+        self.assertEqual(run["summary"], "Manager cancelled active work.")
+        self.assertEqual(run["error"], "Manager cancelled active work.")
+        self.assertEqual(run["next_phase"], "blocked")
+        self.assertEqual(self.store.get_forced_stop_state(issue.id, "run-active"), "Manager cancelled active work.")
+
+    def test_create_run_guard_rejects_force_stop_race_before_run_row(self) -> None:
+        issue = self.store.create_issue("race stop", "desc", ready=True)
+        self.assertTrue(self.store.acquire_lock(issue.id, "worker", 60, "run-race"))
+
+        stop_issue(self.config, self.store, self.artifacts, issue.id, "Stop before run row.")
+
+        with self.assertRaisesRegex(RuntimeError, "no longer current"):
+            self.store.create_run(
+                "run-race",
+                issue.id,
+                "research",
+                "dry-run",
+                expected_current_run_id="run-race",
+            )
+        self.assertEqual(self.store.list_runs(issue.id), [])
+
+    def test_orchestrator_force_stop_cancels_runner_and_preserves_blocked_state(self) -> None:
+        issue = self.store.create_issue("cancel active run", "desc", ready=True)
+
+        class CancellableBlockingRunner(AgentRunner):
+            name = "blocking"
+
+            def __init__(self) -> None:
+                self.started = threading.Event()
+                self.cancelled = threading.Event()
+                self.cancel_reason: str | None = None
+
+            def run(self, phase: str, issue: Issue, context: Dict[str, str]) -> AgentResult:
+                self.started.set()
+                self.cancelled.wait(timeout=5)
+                return AgentResult(
+                    status="success",
+                    summary="runner completed after cancellation",
+                    artifact_markdown="Recommendation: `ready_for_plan`",
+                    suggested_next_phase="ready_for_plan",
+                )
+
+            def cancel_run(self, run_id: str, reason: str) -> bool:
+                self.cancel_reason = reason
+                self.cancelled.set()
+                return True
+
+        runner = CancellableBlockingRunner()
+        orchestrator = Orchestrator(self.store, self.artifacts, self.config, runner=runner)
+        result_holder: list[ProcessResult] = []
+        errors: list[BaseException] = []
+
+        def process() -> None:
+            try:
+                result_holder.append(orchestrator.process_issue(issue.id))
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=process)
+        thread.start()
+        try:
+            self.assertTrue(runner.started.wait(timeout=5))
+            stop_issue(self.config, self.store, self.artifacts, issue.id, "Stop active orchestrator run.")
+            thread.join(timeout=5)
+        finally:
+            runner.cancelled.set()
+            thread.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(result_holder), 1)
+        result = result_holder[0]
+        self.assertEqual(result.status, "stopped")
+        self.assertEqual(result.next_phase, "blocked")
+        self.assertEqual(self.store.get_issue(issue.id).phase, "blocked")
+        self.assertEqual(self.store.list_runs(issue.id)[0]["status"], "stopped")
+        self.assertEqual(runner.cancel_reason, "Stop active orchestrator run.")
+        self.assertFalse(self.artifacts.phase_artifact_path(issue.id, "research").exists())
 
     def test_cli_stop_prints_summary_and_uses_default_message(self) -> None:
         issue = self.store.create_issue("cli stop", "desc", ready=True)

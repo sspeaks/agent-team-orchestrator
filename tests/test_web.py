@@ -23,7 +23,7 @@ import agent_team.web as web_module
 from agent_team.cli import build_parser
 from agent_team.config import AppConfig
 from agent_team.models import HumanInputRequestDraft, utc_now_iso
-from agent_team.orchestrator import Orchestrator
+from agent_team.orchestrator import Orchestrator, ProcessResult
 from agent_team.web import AgentTeamWebApp, LOG_TAIL_BYTES, WebJob, serve_web, serve_web_and_worker
 from agent_team.web_html import _render_blocked_reason, _render_closed_synopsis
 
@@ -2187,7 +2187,7 @@ setTimeout(() => {{
         self.assertIsNone(payload["human_input"]["pending"])
         self.assertEqual(payload["human_input"]["requests"][0]["status"], "stopped")
 
-    def test_stop_action_rejects_draft_blocked_done_lock_and_active_job(self) -> None:
+    def test_stop_action_blocks_active_lock_and_cancels_active_job(self) -> None:
         draft = self.store.create_issue("draft stop", "desc")
         with self.assertRaises(urllib.error.HTTPError) as draft_error:
             self.post(f"/issues/{draft.id}/actions/stop", {})
@@ -2206,9 +2206,12 @@ setTimeout(() => {{
 
         locked = self.store.create_issue("locked stop", "desc", ready=True)
         self.assertTrue(self.store.acquire_lock(locked.id, "test-owner", 60, "run-1"))
-        with self.assertRaises(urllib.error.HTTPError) as lock_error:
-            self.post(f"/issues/{locked.id}/actions/stop", {})
-        self.assertEqual(lock_error.exception.code, 409)
+        self.post(f"/issues/{locked.id}/actions/stop", {"message": "Stop locked issue."})
+        locked_issue = self.store.get_issue(locked.id)
+        self.assertEqual(locked_issue.phase, "blocked")
+        self.assertIsNone(locked_issue.current_run_id)
+        self.assertIsNone(locked_issue.lock_expires_at)
+        self.assertEqual(locked_issue.blocked_summary, "Stop locked issue.")
 
         queued = self.store.create_issue("queued stop", "desc", ready=True)
         now = utc_now_iso()
@@ -2222,9 +2225,42 @@ setTimeout(() => {{
                 created_at=now,
                 updated_at=now,
             )
-        with self.assertRaises(urllib.error.HTTPError) as job_error:
-            self.post(f"/issues/{queued.id}/actions/stop", {})
-        self.assertEqual(job_error.exception.code, 409)
+        self.post(f"/issues/{queued.id}/actions/stop", {})
+        self.assertEqual(self.store.get_issue(queued.id).phase, "blocked")
+        self.assertEqual(self.app.jobs.get("queued-stop").status, "cancelled")
+        payload, _headers = self.get_json(f"/api/issues/{queued.id}")
+        self.assertIsNone(payload["active_job"])
+
+    def test_running_web_job_cancel_request_finishes_as_cancelled(self) -> None:
+        issue = self.store.create_issue("running job stop", "desc", ready=True)
+        started = threading.Event()
+        release = threading.Event()
+
+        def run() -> ProcessResult:
+            started.set()
+            release.wait(timeout=5)
+            return ProcessResult(
+                issue_id=issue.id,
+                run_id="run-stopped",
+                phase="research",
+                status="stopped",
+                next_phase="blocked",
+                summary="Stopped by manager.",
+                artifact_path=None,
+            )
+
+        job = self.app.jobs._submit("Run issue", issue.id, None, run)
+        self.assertTrue(started.wait(timeout=5))
+
+        cancelled = self.app.jobs.cancel_jobs_for_issue(issue.id, "Manager stopped issue.")
+        self.assertEqual([item.id for item in cancelled], [job.id])
+        self.assertEqual(self.app.jobs.get(job.id).status, "cancelling")
+        release.set()
+
+        self.assertTrue(self.app.jobs.wait_for_idle(timeout=5))
+        final_job = self.app.jobs.get(job.id)
+        self.assertEqual(final_job.status, "cancelled")
+        self.assertIn("stopped", final_job.message)
 
     def test_transition_to_human_input_without_request_is_rejected(self) -> None:
         issue = self.store.create_issue("manual human input", "desc", ready=True)

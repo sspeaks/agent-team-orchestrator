@@ -940,6 +940,15 @@ class IssueStore:
         *,
         stopped_by: str = "cli",
     ) -> StopIssueResult:
+        return self.force_stop_issue(issue_id, message, stopped_by=stopped_by)
+
+    def force_stop_issue(
+        self,
+        issue_id: int,
+        message: str,
+        *,
+        stopped_by: str = "cli",
+    ) -> StopIssueResult:
         cleaned_message = message.strip()
         if not cleaned_message:
             raise ValueError("Stop message is required")
@@ -957,14 +966,8 @@ class IssueStore:
                 raise ValueError(f"Issue {issue.id} is a draft and is already inactive")
             if issue.phase == "blocked":
                 return StopIssueResult(issue.id, issue.phase, issue, None)
-            if issue.current_run_id is not None:
-                raise ValueError(f"Cannot stop issue {issue.id} while it has an active run {issue.current_run_id}")
-            if issue.lock_expires_at is not None:
-                raise ValueError(
-                    f"Cannot stop issue {issue.id} while it has an active lock "
-                    f"held by {issue.lock_owner or 'unknown'} until {issue.lock_expires_at}"
-                )
             validate_transition(issue.phase, "blocked")
+            active_run_id = issue.current_run_id
 
             stopped_request: HumanInputRequest | None = None
             if issue.phase == "awaiting_human_input":
@@ -999,8 +1002,42 @@ class IssueStore:
                         f"Stopped human input request {stopped_request.id}",
                     )
 
+            if active_run_id is not None:
+                run_row = conn.execute(
+                    "SELECT * FROM runs WHERE id = ? AND issue_id = ?",
+                    (active_run_id, issue_id),
+                ).fetchone()
+                run_cur = conn.execute(
+                    """
+                    UPDATE runs
+                    SET status = 'stopped',
+                        completed_at = ?,
+                        summary = ?,
+                        error = ?,
+                        next_phase = 'blocked'
+                    WHERE id = ? AND issue_id = ? AND status = 'running'
+                    """,
+                    (now, cleaned_message, cleaned_message, active_run_id, issue_id),
+                )
+                if run_cur.rowcount == 1:
+                    self._add_event(conn, issue_id, active_run_id, "run.stopped", cleaned_message)
+                elif run_row is None:
+                    self._add_event(
+                        conn,
+                        issue_id,
+                        active_run_id,
+                        "run.stopped",
+                        f"Stop requested before run {active_run_id} was recorded: {cleaned_message}",
+                    )
+
+            params: list[object] = [summarize_blocked_reason(cleaned_message), now, issue_id, issue.phase]
+            guards = [
+                _expected_value_guard("current_run_id", issue.current_run_id, params),
+                _expected_value_guard("lock_owner", issue.lock_owner, params),
+                _expected_value_guard("lock_expires_at", issue.lock_expires_at, params),
+            ]
             cur = conn.execute(
-                """
+                f"""
                 UPDATE issues
                 SET phase = 'blocked',
                     status = 'open',
@@ -1010,15 +1047,20 @@ class IssueStore:
                     blocked_summary = ?,
                     updated_at = ?
                 WHERE id = ? AND phase = ?
-                  AND current_run_id IS NULL
-                  AND lock_expires_at IS NULL
+                  {''.join(guards)}
                 """,
-                (summarize_blocked_reason(cleaned_message), now, issue_id, issue.phase),
+                params,
             )
             if cur.rowcount != 1:
                 raise RuntimeError(f"Issue {issue.id} could not be stopped because its state changed")
-            self._add_event(conn, issue_id, None, "issue.transitioned", f"Stopped issue; transitioned {issue.phase} -> blocked")
-            self._add_event(conn, issue_id, None, "issue.stopped", cleaned_message)
+            self._add_event(
+                conn,
+                issue_id,
+                active_run_id,
+                "issue.transitioned",
+                f"Stopped issue; transitioned {issue.phase} -> blocked",
+            )
+            self._add_event(conn, issue_id, active_run_id, "issue.stopped", cleaned_message)
             updated_row = conn.execute("SELECT * FROM issues WHERE id = ?", (issue_id,)).fetchone()
         return StopIssueResult(
             issue_id=issue_id,
@@ -1026,6 +1068,21 @@ class IssueStore:
             issue=Issue.from_row(updated_row),
             stopped_human_input_request=stopped_request,
         )
+
+    def get_forced_stop_state(self, issue_id: int, run_id: str) -> str | None:
+        with self.connect() as conn:
+            issue = conn.execute("SELECT * FROM issues WHERE id = ?", (issue_id,)).fetchone()
+            run = conn.execute(
+                "SELECT status, summary, error FROM runs WHERE id = ? AND issue_id = ?",
+                (run_id, issue_id),
+            ).fetchone()
+        if run is not None and str(run["status"]) == "stopped":
+            return str(run["error"] or run["summary"] or f"Run {run_id} was stopped.")
+        if issue is None:
+            return f"Issue {issue_id} no longer exists; stopping run {run_id}."
+        if str(issue["phase"]) == "blocked":
+            return str(issue["blocked_summary"] or f"Issue {issue_id} was stopped.")
+        return None
 
     def reject_plan(self, issue_id: int, feedback: str, run_id: str | None = None) -> Issue:
         cleaned = feedback.strip()
@@ -1147,9 +1204,26 @@ class IssueStore:
             answered_row = conn.execute("SELECT * FROM human_input_requests WHERE id = ?", (request.id,)).fetchone()
         return Issue.from_row(updated_row), HumanInputRequest.from_row(answered_row)
 
-    def create_run(self, run_id: str, issue_id: int, phase: str, runner: str) -> None:
+    def create_run(
+        self,
+        run_id: str,
+        issue_id: int,
+        phase: str,
+        runner: str,
+        *,
+        expected_current_run_id: str | None = None,
+    ) -> None:
         now = utc_now_iso()
         with self.connect() as conn:
+            if expected_current_run_id is not None:
+                current = conn.execute(
+                    "SELECT current_run_id FROM issues WHERE id = ?",
+                    (issue_id,),
+                ).fetchone()
+                if current is None:
+                    raise KeyError(f"Issue not found: {issue_id}")
+                if current["current_run_id"] != expected_current_run_id:
+                    raise RuntimeError(f"Run {expected_current_run_id} is no longer current for issue {issue_id}")
             conn.execute(
                 """
                 INSERT INTO runs (id, issue_id, phase, runner, status, started_at)
