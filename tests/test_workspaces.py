@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from agent_team.artifacts import ArtifactStore
 from agent_team.models import Issue
-from agent_team.pull_requests import PullRequestError, PullRequestRemote, PullRequestResult
+from agent_team.pull_requests import PullRequestError, PullRequestRemote, PullRequestResult, PullRequestStatusSnapshot
 from agent_team.workspaces import (
     WorkspaceError,
     WorkspaceManager,
@@ -944,6 +944,44 @@ class WorkspaceManagerTests(unittest.TestCase):
 
         git.assert_not_called()
 
+    def test_push_pull_request_branch_ignores_provider_observed_head_for_ownership(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        selected_remote = _SelectedRemote(
+            remote=PullRequestRemote(
+                provider="github",
+                remote_name="origin",
+                url="https://github.com/owner/repo.git",
+                repo="repo",
+                owner="owner",
+            ),
+            push_url="https://github.com/owner/repo.git",
+        )
+        source_branch = "agent-team/issue-1"
+        old_owned_head = "a" * 40
+        provider_observed_head = "b" * 40
+        integrated_head = self._git(info.worktree_root, "rev-parse", "HEAD")
+        self.artifacts.write_pull_request_metadata(
+            issue.id,
+            {
+                "provider": "github",
+                "remote_name": "origin",
+                "remote_url": "https://github.com/owner/repo.git",
+                "remote_identity": ["github", "owner", "repo"],
+                "source_branch": source_branch,
+                "head_commit": old_owned_head,
+                "last_head_commit": provider_observed_head,
+            },
+        )
+
+        with patch.object(self.manager, "_remote_branch_head", return_value=provider_observed_head):
+            with patch.object(self.manager, "_git_remote", return_value="") as git:
+                with self.assertRaisesRegex(WorkspaceError, "remote branch changes made after PR finalization"):
+                    self.manager._push_pull_request_branch(issue, info, selected_remote, source_branch, integrated_head)
+
+        git.assert_not_called()
+
     def test_push_pull_request_branch_blocks_owned_retry_after_remote_repository_changes(self) -> None:
         issue = self._issue(1, self.repo)
         info = self.manager.prepare(issue)
@@ -1150,6 +1188,54 @@ class WorkspaceManagerTests(unittest.TestCase):
         self.assertIn("ssh://[redacted]@github.com", message)
         self.assertNotIn("super-secret", message)
 
+    def test_git_remote_error_redacts_standalone_github_tokens(self) -> None:
+        token = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="",
+            stderr=f"fatal: Authentication failed with token {token}",
+        )
+        with patch("agent_team.workspaces.subprocess.run", return_value=completed):
+            with self.assertRaises(WorkspaceError) as caught:
+                self.manager._git_remote(
+                    self.repo,
+                    "ls-remote",
+                    "https://github.com/owner/repo.git",
+                    "agent-team/issue-1",
+                )
+
+        message = str(caught.exception)
+        self.assertIn("[redacted]", message)
+        self.assertNotIn(token, message)
+
+    def test_git_remote_error_redacts_authorization_header_secrets(self) -> None:
+        bearer_token = "gho_abcdefghijklmnopqrstuvwxyz123456"
+        basic_secret = "dXNlcjpzdXBlci1zZWNyZXQ="
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="",
+            stderr=(
+                f"fatal: remote sent Authorization: Bearer {bearer_token}\n"
+                f"trace: http.extraheader=Authorization: Basic {basic_secret}"
+            ),
+        )
+        with patch("agent_team.workspaces.subprocess.run", return_value=completed):
+            with self.assertRaises(WorkspaceError) as caught:
+                self.manager._git_remote(
+                    self.repo,
+                    "ls-remote",
+                    "https://github.com/owner/repo.git",
+                    "agent-team/issue-1",
+                )
+
+        message = str(caught.exception)
+        self.assertIn("Authorization: Bearer [redacted]", message)
+        self.assertIn("Authorization: Basic [redacted]", message)
+        self.assertNotIn(bearer_token, message)
+        self.assertNotIn(basic_secret, message)
+
     def test_push_pull_request_branch_runs_git_push_non_interactively_with_timeout(self) -> None:
         issue = self._issue(1, self.repo)
         info = self.manager.prepare(issue)
@@ -1244,7 +1330,7 @@ class WorkspaceManagerTests(unittest.TestCase):
 
         recovery = self.manager.recover_interrupted_merge(issue)
 
-        self.assertEqual(recovery.next_phase, "done")
+        self.assertEqual(recovery.next_phase, "awaiting_pr_closure")
         self.assertEqual(recovery.run_status, "success")
         self.assertFalse(info.worktree_root.exists())
         self.assertIsNone(self.artifacts.read_workspace_metadata(issue.id))
@@ -1368,6 +1454,111 @@ class WorkspaceManagerTests(unittest.TestCase):
         (info.worktree_root / "dirty.txt").write_text("dirty\n", encoding="utf-8")
         with self.assertRaisesRegex(WorkspaceError, "Issue worktree has uncommitted"):
             self.manager.sync_source_into_workspace(issue, info)
+
+    def test_prepare_pull_request_conflict_workspace_rehydrates_conflicts(self) -> None:
+        issue, metadata, snapshot, bare_remote = self._hosted_pull_request_repair_fixture(conflict=True)
+
+        with patch.object(self.manager, "_git_remote", side_effect=self._fetch_from_bare_remote(bare_remote)):
+            result = self.manager.prepare_pull_request_conflict_workspace(issue, metadata, snapshot)
+
+        self.assertEqual(result.status, "conflicts")
+        self.assertEqual(result.conflict_files, ("README.md",))
+        self.assertIn("Hosted pull request", result.artifact_markdown())
+        info = self.manager.existing(issue)
+        self.assertIn("<<<<<<<", (info.worktree_root / "README.md").read_text(encoding="utf-8"))
+        repair_metadata = self.artifacts.read_workspace_metadata(issue.id)
+        self.assertIsNotNone(repair_metadata)
+        self.assertTrue(repair_metadata["hosted_pull_request_conflict"])
+        self.assertEqual(repair_metadata["hosted_pull_request_target_sync_status"], "conflicts")
+        self.assertEqual(repair_metadata["hosted_pull_request_conflict_files"], ["README.md"])
+
+    def test_prepare_pull_request_conflict_workspace_merges_clean_target_update(self) -> None:
+        issue, metadata, snapshot, bare_remote = self._hosted_pull_request_repair_fixture(conflict=False)
+
+        with patch.object(self.manager, "_git_remote", side_effect=self._fetch_from_bare_remote(bare_remote)):
+            result = self.manager.prepare_pull_request_conflict_workspace(issue, metadata, snapshot)
+
+        self.assertEqual(result.status, "target_synced")
+        self.assertEqual(result.conflict_files, ())
+        info = self.manager.existing(issue)
+        self.assertEqual(self._git(info.worktree_root, "status", "--porcelain"), "")
+        self.assertTrue(self._git_check(info.worktree_root, "merge-base", "--is-ancestor", "HEAD^2", "HEAD"))
+        repair_metadata = self.artifacts.read_workspace_metadata(issue.id)
+        self.assertIsNotNone(repair_metadata)
+        self.assertEqual(repair_metadata["hosted_pull_request_target_sync_status"], "synced")
+        self.assertEqual(repair_metadata["hosted_pull_request_target_sync_commit"], result.worktree_head)
+
+    def test_prepare_pull_request_conflict_workspace_blocks_stale_conflicted_worktree(self) -> None:
+        issue, metadata, snapshot, bare_remote = self._hosted_pull_request_repair_fixture(conflict=True)
+        with patch.object(self.manager, "_git_remote", side_effect=self._fetch_from_bare_remote(bare_remote)):
+            self.manager.prepare_pull_request_conflict_workspace(issue, metadata, snapshot)
+
+        self._git(self.repo, "checkout", "agent-team/issue-1")
+        self._commit_file(self.repo, "new.txt", "new remote work\n")
+        new_head = self._git(self.repo, "rev-parse", "HEAD")
+        self._git(self.repo, "push", str(bare_remote), "HEAD:agent-team/issue-1")
+        stale_snapshot = PullRequestStatusSnapshot(
+            **{
+                **snapshot.__dict__,
+                "head_sha": new_head,
+                "checked_at": "2026-01-02T00:00:00+00:00",
+            }
+        )
+
+        with patch.object(self.manager, "_git_remote", side_effect=self._fetch_from_bare_remote(bare_remote)):
+            with self.assertRaisesRegex(WorkspaceError, "Refusing to reuse stale conflict markers"):
+                self.manager.prepare_pull_request_conflict_workspace(issue, metadata, stale_snapshot)
+
+        info = self.manager.existing(issue)
+        self.assertIn("<<<<<<<", (info.worktree_root / "README.md").read_text(encoding="utf-8"))
+
+    def test_prepare_pull_request_conflict_workspace_blocks_stale_target_conflicted_worktree(self) -> None:
+        issue, metadata, snapshot, bare_remote = self._hosted_pull_request_repair_fixture(conflict=True)
+        with patch.object(self.manager, "_git_remote", side_effect=self._fetch_from_bare_remote(bare_remote)):
+            self.manager.prepare_pull_request_conflict_workspace(issue, metadata, snapshot)
+
+        self._git(self.repo, "checkout", "main")
+        (self.repo / "README.md").write_text("new target change\n", encoding="utf-8")
+        self._git(self.repo, "add", "README.md")
+        self._git(self.repo, "commit", "-m", "advance target readme")
+        self._git(self.repo, "push", str(bare_remote), "main:main")
+        target_advanced_snapshot = PullRequestStatusSnapshot(
+            **{
+                **snapshot.__dict__,
+                "checked_at": "2026-01-02T00:00:00+00:00",
+            }
+        )
+
+        with patch.object(self.manager, "_git_remote", side_effect=self._fetch_from_bare_remote(bare_remote)):
+            with self.assertRaisesRegex(WorkspaceError, "records target head"):
+                self.manager.prepare_pull_request_conflict_workspace(issue, metadata, target_advanced_snapshot)
+
+        info = self.manager.existing(issue)
+        self.assertIn("<<<<<<<", (info.worktree_root / "README.md").read_text(encoding="utf-8"))
+
+    def test_merge_recovery_prefers_hosted_repair_workspace_over_stale_pr_metadata(self) -> None:
+        issue, metadata, snapshot, bare_remote = self._hosted_pull_request_repair_fixture(conflict=True)
+        with patch.object(self.manager, "_git_remote", side_effect=self._fetch_from_bare_remote(bare_remote)):
+            self.manager.prepare_pull_request_conflict_workspace(issue, metadata, snapshot)
+        stale_pr_metadata = {
+            **metadata,
+            "cleanup_removed": True,
+            "finalized_at": "2026-01-01T00:00:00+00:00",
+            "mode": "pull_request",
+            "worktree_head": metadata["head_commit"],
+            "pr_status": "OPEN",
+            "is_existing": False,
+            "raw": {"number": 7},
+        }
+        self.artifacts.write_pull_request_metadata(issue.id, stale_pr_metadata)
+
+        recovery = self.manager.recover_interrupted_merge(issue)
+
+        self.assertEqual(recovery.next_phase, "ready_for_merge_conflict_resolution")
+        self.assertEqual(recovery.run_status, "interrupted")
+        self.assertIn("README.md", recovery.artifact_markdown)
+        self.assertIsNotNone(self.artifacts.read_workspace_metadata(issue.id))
+        self.assertTrue(self.manager.existing(issue).worktree_root.is_dir())
 
     def test_merge_recovery_routes_existing_conflicts_to_resolution(self) -> None:
         issue = self._issue(1, self.repo)
@@ -1573,6 +1764,71 @@ class WorkspaceManagerTests(unittest.TestCase):
         (repo / filename).write_text(content, encoding="utf-8")
         self._git(repo, "add", filename)
         self._git(repo, "commit", "-m", f"add {filename}")
+
+    def _hosted_pull_request_repair_fixture(
+        self, *, conflict: bool
+    ) -> tuple[Issue, dict[str, object], PullRequestStatusSnapshot, Path]:
+        issue = self._issue(1, self.repo)
+        self._git(self.repo, "branch", "-M", "main")
+        bare_remote = self.home / "origin.git"
+        self._git(self.home, "init", "--bare", str(bare_remote))
+        self._git(self.repo, "remote", "add", "origin", "https://github.com/Owner/Repo.git")
+        self._git(self.repo, "push", str(bare_remote), "main:main")
+
+        self._git(self.repo, "checkout", "-b", "agent-team/issue-1")
+        if conflict:
+            (self.repo / "README.md").write_text("feature change\n", encoding="utf-8")
+            self._git(self.repo, "add", "README.md")
+            self._git(self.repo, "commit", "-m", "feature readme")
+        else:
+            self._commit_file(self.repo, "feature.txt", "feature\n")
+        head_sha = self._git(self.repo, "rev-parse", "HEAD")
+        self._git(self.repo, "push", str(bare_remote), "HEAD:agent-team/issue-1")
+
+        self._git(self.repo, "checkout", "main")
+        (self.repo / "README.md").write_text("target change\n", encoding="utf-8")
+        self._git(self.repo, "add", "README.md")
+        self._git(self.repo, "commit", "-m", "target readme")
+        self._git(self.repo, "push", str(bare_remote), "main:main")
+
+        info = self.manager.prepare(issue)
+        metadata: dict[str, object] = {
+            **info.to_metadata(),
+            "provider": "github",
+            "remote_name": "origin",
+            "remote_identity": ["github", "owner", "repo"],
+            "source_branch": "agent-team/issue-1",
+            "target_branch": "main",
+            "head_commit": head_sha,
+            "url": "https://github.com/Owner/Repo/pull/7",
+            "number": 7,
+            "id": "7",
+        }
+        snapshot = PullRequestStatusSnapshot(
+            provider="github",
+            checked_at="2026-01-01T00:00:00+00:00",
+            status="OPEN",
+            merge_state="DIRTY" if conflict else "UNKNOWN",
+            is_open=True,
+            is_closed=False,
+            is_merged=False,
+            has_conflicts=conflict,
+            head_sha=head_sha,
+            url="https://github.com/Owner/Repo/pull/7",
+            raw={},
+            number=7,
+            source_branch="agent-team/issue-1",
+            target_branch="main",
+        )
+        return issue, metadata, snapshot, bare_remote
+
+    def _fetch_from_bare_remote(self, bare_remote: Path):
+        def _fetch(source_root: Path, *args: str) -> str:
+            self.assertGreaterEqual(len(args), 4)
+            self.assertEqual(args[:3], ("fetch", "--no-tags", "origin"))
+            return self.manager._git(source_root, "fetch", "--no-tags", str(bare_remote), *args[3:])
+
+        return _fetch
 
     @staticmethod
     def _issue(issue_id: int, repo_path: Path | None) -> Issue:

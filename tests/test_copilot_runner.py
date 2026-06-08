@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from unittest import mock
 
 from agent_team.human_input_policy import human_input_policy_prompt
 from agent_team.config import AppConfig, CopilotModelSelection
@@ -799,6 +800,45 @@ Recommendation: `awaiting_human_input`
         self.assertEqual(result.status, "blocked")
         self.assertIn("Target repo path is required", result.summary)
         self.assertEqual(result.suggested_next_phase, "blocked")
+
+    def test_run_uses_noninteractive_pager_env_with_live_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / "env.txt"
+            log_path = Path(tmp) / "run.log"
+            script = Path(tmp) / "fake-copilot"
+            script.write_text(
+                f"""#!/usr/bin/env python3
+import os
+import pathlib
+
+pathlib.Path({str(env_path)!r}).write_text(
+    "\\n".join(
+        [
+            os.environ.get("GIT_PAGER", ""),
+            os.environ.get("PAGER", ""),
+            os.environ.get("LESS", ""),
+        ]
+    ),
+    encoding="utf-8",
+)
+print("1. Result\\n\\nRecommendation: `ready_for_plan`")
+""",
+                encoding="utf-8",
+            )
+            script.chmod(0o755)
+
+            with mock.patch.dict("os.environ", {"GIT_PAGER": "less", "PAGER": "less", "LESS": "-R"}):
+                result = CopilotCliRunner(command=str(script)).run(
+                    "research",
+                    self.issue,
+                    {"prompt_template": "Body {title}", "run_log": str(log_path)},
+                )
+
+            pager_env = env_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual(result.suggested_next_phase, "ready_for_plan")
+        self.assertEqual(pager_env, ["cat", "cat", "FRX"])
 
     def test_all_phases_have_custom_agent_commands(self) -> None:
         runner = CopilotCliRunner()

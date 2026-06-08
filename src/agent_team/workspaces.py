@@ -18,9 +18,11 @@ from .pull_requests import (
     PullRequestRemote,
     PullRequestRequest,
     PullRequestResult,
+    PullRequestStatusSnapshot,
     SAFE_PULL_REQUEST_DESCRIPTION,
     create_or_get_pull_request,
     parse_pull_request_remote,
+    pull_request_remote_from_metadata,
 )
 
 _REMOTE_GIT_COMMAND_TIMEOUT_SECONDS = 120.0
@@ -70,7 +72,7 @@ class WorkspaceMergeResult:
             lines.append(f"- Worktree commit created: `{self.worktree_commit}`")
         if self.merge_commit:
             lines.append(f"- Merge commit: `{self.merge_commit}`")
-        if self.status == "pull_request":
+        if self.status == "pull_request" or self.pr_provider or self.pr_url:
             if self.pr_provider:
                 lines.append(f"- Pull request provider: `{self.pr_provider}`")
             if self.pr_remote_name:
@@ -87,6 +89,17 @@ class WorkspaceMergeResult:
                 lines.append(f"- Pull request status: `{self.pr_status}`")
             lines.append(f"- Existing pull request reused: `{str(self.pr_is_existing).lower()}`")
         lines.append(f"- Worktree removed: `{str(self.cleanup_removed).lower()}`")
+        if self.status == "conflicts" and self.pr_url:
+            lines.extend(
+                [
+                    "",
+                    "## Hosted pull request conflict",
+                    "",
+                    "The hosted pull request provider reported merge conflicts. The orchestrator recreated the "
+                    "isolated issue worktree from the PR branch and merged the latest target branch so conflict "
+                    "markers can be resolved locally before validation, review, and merge approval run again.",
+                ]
+            )
         if self.conflict_files:
             lines.extend(["", "## Conflicted files", ""])
             lines.extend(f"- `{path}`" for path in self.conflict_files)
@@ -97,7 +110,12 @@ class WorkspaceMergeResult:
                     "will be committed before validation.",
                 ]
             )
-        recommendation = "ready_for_merge_conflict_resolution" if self.status == "conflicts" else "done"
+        recommendation_by_status = {
+            "conflicts": "ready_for_merge_conflict_resolution",
+            "pull_request": "awaiting_pr_closure",
+            "target_synced": "ready_for_validation",
+        }
+        recommendation = recommendation_by_status.get(self.status, "done")
         lines.extend(["", f"Recommendation: `{recommendation}`"])
         return "\n".join(lines)
 
@@ -316,6 +334,28 @@ class WorkspaceManager:
         with self._repo_lock(info):
             return self._sync_source_into_workspace_locked(issue, info, metadata, branch, old_source_head, synced_at)
 
+    def prepare_pull_request_conflict_workspace(
+        self,
+        issue: Issue,
+        pull_request_metadata: dict[str, Any],
+        status_snapshot: PullRequestStatusSnapshot,
+    ) -> WorkspaceMergeResult:
+        try:
+            info = WorkspaceInfo.from_metadata(pull_request_metadata)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise WorkspaceError(
+                f"Pull request metadata is invalid for issue {issue.id}: "
+                f"{self.artifacts.pull_request_metadata_path(issue.id)}"
+            ) from exc
+        self._validate_pull_request_repair_context(issue, info)
+        with self._repo_lock_for_common_dir(info.source_git_common_dir):
+            return self._prepare_pull_request_conflict_workspace_locked(
+                issue,
+                info,
+                pull_request_metadata,
+                status_snapshot,
+            )
+
     def recover_interrupted_source_sync(self, issue: Issue) -> WorkspaceMergeRecovery | None:
         try:
             metadata = self.artifacts.read_workspace_metadata(issue.id)
@@ -465,6 +505,16 @@ class WorkspaceManager:
             return self._recover_merged_metadata(issue, merged_metadata)
 
         try:
+            metadata = self.artifacts.read_workspace_metadata(issue.id)
+        except (OSError, ValueError) as exc:
+            return _merge_recovery_blocked(
+                f"Workspace metadata is unreadable for issue {issue.id}: "
+                f"{self.artifacts.workspace_metadata_path(issue.id)}\n{exc}"
+            )
+        if metadata is not None and _is_hosted_pull_request_repair_metadata(metadata):
+            return self._recover_workspace_metadata(issue, metadata, target_branch)
+
+        try:
             pull_request_metadata = self.artifacts.read_pull_request_metadata(issue.id)
         except (OSError, ValueError) as exc:
             return _merge_recovery_blocked(
@@ -474,13 +524,6 @@ class WorkspaceManager:
         if pull_request_metadata is not None:
             return self._recover_pull_request_metadata(issue, pull_request_metadata)
 
-        try:
-            metadata = self.artifacts.read_workspace_metadata(issue.id)
-        except (OSError, ValueError) as exc:
-            return _merge_recovery_blocked(
-                f"Workspace metadata is unreadable for issue {issue.id}: "
-                f"{self.artifacts.workspace_metadata_path(issue.id)}\n{exc}"
-            )
         if metadata is None:
             if not issue.repo_path:
                 return _merge_recovery_blocked(
@@ -528,6 +571,8 @@ class WorkspaceManager:
                         f"{self.artifacts.merged_workspace_metadata_path(issue.id)}"
                     )
                 return self._recover_merged_metadata_locked(issue, latest_info, latest_merged_metadata)
+            if _is_hosted_pull_request_repair_metadata(metadata):
+                return self._recover_interrupted_merge_locked(issue, info, branch)
             try:
                 latest_pull_request_metadata = self.artifacts.read_pull_request_metadata(issue.id)
             except (OSError, ValueError) as exc:
@@ -538,6 +583,81 @@ class WorkspaceManager:
             if latest_pull_request_metadata is not None:
                 return self._recover_pull_request_metadata_locked(issue, info, latest_pull_request_metadata)
             return self._recover_interrupted_merge_locked(issue, info, branch)
+
+    def _recover_workspace_metadata(
+        self,
+        issue: Issue,
+        metadata: dict[str, Any],
+        target_branch: str | None,
+    ) -> WorkspaceMergeRecovery:
+        try:
+            info = WorkspaceInfo.from_metadata(metadata)
+        except (KeyError, TypeError, ValueError) as exc:
+            return _merge_recovery_blocked(
+                f"Workspace metadata is invalid for issue {issue.id}: {self.artifacts.workspace_metadata_path(issue.id)}"
+            )
+
+        try:
+            self._validate_merge_workspace(issue, info)
+        except WorkspaceError as exc:
+            return _merge_recovery_blocked(str(exc))
+
+        merge_request = self.artifacts.read_merge_request(issue.id) or {}
+        requested_branch = target_branch or _clean_optional_string(merge_request.get("target_branch"))
+        branch = requested_branch or info.source_branch
+        if not branch:
+            return _merge_recovery_blocked(
+                "Workspace was created from a detached source HEAD; approve merge with an explicit target branch."
+            )
+
+        with self._repo_lock(info):
+            try:
+                latest_merged_metadata = self.artifacts.read_merged_workspace_metadata(issue.id)
+            except (OSError, ValueError) as exc:
+                return _merge_recovery_blocked(
+                    f"Merged workspace metadata is unreadable for issue {issue.id}: "
+                    f"{self.artifacts.merged_workspace_metadata_path(issue.id)}\n{exc}"
+                )
+            if latest_merged_metadata is not None:
+                try:
+                    latest_info = WorkspaceInfo.from_metadata(latest_merged_metadata)
+                except (KeyError, TypeError, ValueError) as exc:
+                    return _merge_recovery_blocked(
+                        f"Merged workspace metadata is invalid for issue {issue.id}: "
+                        f"{self.artifacts.merged_workspace_metadata_path(issue.id)}"
+                    )
+                return self._recover_merged_metadata_locked(issue, latest_info, latest_merged_metadata)
+            try:
+                latest_metadata = self.artifacts.read_workspace_metadata(issue.id)
+            except (OSError, ValueError) as exc:
+                return _merge_recovery_blocked(
+                    f"Workspace metadata is unreadable for issue {issue.id}: "
+                    f"{self.artifacts.workspace_metadata_path(issue.id)}\n{exc}"
+                )
+            if latest_metadata is not None:
+                try:
+                    latest_info = WorkspaceInfo.from_metadata(latest_metadata)
+                except (KeyError, TypeError, ValueError) as exc:
+                    return _merge_recovery_blocked(
+                        f"Workspace metadata is invalid for issue {issue.id}: "
+                        f"{self.artifacts.workspace_metadata_path(issue.id)}"
+                    )
+                latest_branch = requested_branch or latest_info.source_branch
+                if not latest_branch:
+                    return _merge_recovery_blocked(
+                        "Workspace was created from a detached source HEAD; approve merge with an explicit target branch."
+                    )
+                return self._recover_interrupted_merge_locked(issue, latest_info, latest_branch)
+            try:
+                latest_pull_request_metadata = self.artifacts.read_pull_request_metadata(issue.id)
+            except (OSError, ValueError) as exc:
+                return _merge_recovery_blocked(
+                    f"Pull request metadata is unreadable for issue {issue.id}: "
+                    f"{self.artifacts.pull_request_metadata_path(issue.id)}\n{exc}"
+                )
+            if latest_pull_request_metadata is not None:
+                return self._recover_pull_request_metadata_locked(issue, info, latest_pull_request_metadata)
+            return _merge_recovery_blocked(f"Merge recovery could not find workspace metadata for issue {issue.id}.")
 
     def _recover_merged_metadata(
         self,
@@ -625,7 +745,7 @@ class WorkspaceManager:
             pull_request_metadata,
             summary_prefix="Recovered completed pull request finalization",
         )
-        return WorkspaceMergeRecovery("done", "success", result.summary, result.artifact_markdown())
+        return WorkspaceMergeRecovery("awaiting_pr_closure", "success", result.summary, result.artifact_markdown())
 
     def _recover_interrupted_merge_locked(
         self,
@@ -947,6 +1067,141 @@ class WorkspaceManager:
         )
         self._write_source_sync_metadata(issue.id, metadata, result)
         return result
+
+    def _prepare_pull_request_conflict_workspace_locked(
+        self,
+        issue: Issue,
+        info: WorkspaceInfo,
+        pull_request_metadata: dict[str, Any],
+        status_snapshot: PullRequestStatusSnapshot,
+    ) -> WorkspaceMergeResult:
+        remote = self._pull_request_repair_remote(info, pull_request_metadata)
+        source_branch = _clean_optional_string(status_snapshot.source_branch) or _clean_optional_string(
+            pull_request_metadata.get("source_branch")
+        )
+        target_branch = _clean_optional_string(status_snapshot.target_branch) or _clean_optional_string(
+            pull_request_metadata.get("target_branch")
+        )
+        if source_branch is None or target_branch is None:
+            raise WorkspaceError("Pull request metadata is missing source or target branch for conflict repair.")
+        self._validate_remote_branch_name(info.source_root, source_branch, "pull request source branch")
+        self._validate_remote_branch_name(info.source_root, target_branch, "pull request target branch")
+        head_ref, target_ref = self._pull_request_repair_refs(issue.id)
+        self._git_remote(
+            info.source_root,
+            "fetch",
+            "--no-tags",
+            remote.remote_name,
+            f"+refs/heads/{source_branch}:{head_ref}",
+            f"+refs/heads/{target_branch}:{target_ref}",
+        )
+        fetched_head = self._git(info.source_root, "rev-parse", head_ref)
+        if status_snapshot.head_sha and fetched_head != status_snapshot.head_sha:
+            raise WorkspaceError(
+                f"Provider reported PR head {status_snapshot.head_sha[:12]}, but fetching "
+                f"{source_branch} produced {fetched_head[:12]}. Retry PR monitoring after the provider settles."
+            )
+        target_head = self._git(info.source_root, "rev-parse", target_ref)
+        repair_info = WorkspaceInfo(
+            issue_id=issue.id,
+            original_repo_path=info.original_repo_path,
+            source_root=info.source_root,
+            source_git_common_dir=info.source_git_common_dir,
+            relative_subpath=info.relative_subpath,
+            worktree_root=info.worktree_root,
+            workspace_repo_path=info.workspace_repo_path,
+            source_branch=target_branch,
+            source_head=target_head,
+            created_at=utc_now_iso(),
+        )
+        self._recreate_pull_request_repair_worktree(issue, repair_info, head_ref)
+        repair_metadata = {
+            **repair_info.to_metadata(),
+            "hosted_pull_request_conflict": True,
+            "hosted_pull_request_provider": status_snapshot.provider,
+            "hosted_pull_request_url": status_snapshot.url,
+            "hosted_pull_request_source_branch": source_branch,
+            "hosted_pull_request_target_branch": target_branch,
+            "hosted_pull_request_head": fetched_head,
+            "hosted_pull_request_target_head": target_head,
+            "hosted_pull_request_detected_at": status_snapshot.checked_at,
+        }
+        self.artifacts.write_workspace_metadata(issue.id, repair_metadata)
+        if self._git_check(repair_info.worktree_root, "merge-base", "--is-ancestor", target_ref, "HEAD"):
+            synced_head = self._git(repair_info.worktree_root, "rev-parse", "HEAD")
+            self.artifacts.write_workspace_metadata(
+                issue.id,
+                {**repair_metadata, "hosted_pull_request_target_sync_status": "already_included"},
+            )
+            return self._hosted_pull_request_result(
+                issue,
+                pull_request_metadata,
+                status_snapshot,
+                status="target_synced",
+                summary=f"Hosted pull request for issue {issue.id} already includes latest target branch {target_branch}.",
+                target_branch=target_branch,
+                worktree_head=synced_head,
+            )
+        try:
+            self._git(
+                repair_info.worktree_root,
+                "merge",
+                "--no-ff",
+                target_ref,
+                "-m",
+                f"Merge {target_branch} into hosted PR workspace for issue {issue.id}",
+            )
+        except WorkspaceError as exc:
+            conflict_files = self._conflicted_files(repair_info.worktree_root)
+            if not conflict_files:
+                try:
+                    self._git(repair_info.worktree_root, "merge", "--abort")
+                except WorkspaceError as abort_exc:
+                    raise WorkspaceError(f"{exc}\n\nAlso failed to abort hosted PR target merge: {abort_exc}") from abort_exc
+                raise
+            self.artifacts.write_workspace_metadata(
+                issue.id,
+                {
+                    **repair_metadata,
+                    "hosted_pull_request_target_sync_status": "conflicts",
+                    "hosted_pull_request_conflict_files": list(conflict_files),
+                },
+            )
+            return self._hosted_pull_request_result(
+                issue,
+                pull_request_metadata,
+                status_snapshot,
+                status="conflicts",
+                summary=(
+                    f"Hosted pull request for issue {issue.id} has merge conflicts with latest target branch "
+                    f"{target_branch}; AI resolution is required."
+                ),
+                target_branch=target_branch,
+                worktree_head=self._git(repair_info.worktree_root, "rev-parse", "HEAD"),
+                conflict_files=conflict_files,
+            )
+        synced_head = self._git(repair_info.worktree_root, "rev-parse", "HEAD")
+        self._ensure_clean_repo(repair_info.worktree_root, "issue worktree")
+        self.artifacts.write_workspace_metadata(
+            issue.id,
+            {
+                **repair_metadata,
+                "hosted_pull_request_target_sync_status": "synced",
+                "hosted_pull_request_target_sync_commit": synced_head,
+            },
+        )
+        return self._hosted_pull_request_result(
+            issue,
+            pull_request_metadata,
+            status_snapshot,
+            status="target_synced",
+            summary=(
+                f"Merged latest target branch {target_branch} into hosted PR repair workspace for issue "
+                f"{issue.id} at {synced_head[:12]}."
+            ),
+            target_branch=target_branch,
+            worktree_head=synced_head,
+        )
 
     def _finalize_pull_request(
         self,
@@ -1300,6 +1555,28 @@ class WorkspaceManager:
             "number": pr_result.number,
             "pr_status": pr_result.status,
             "is_existing": pr_result.is_existing,
+            "monitoring_enabled": True,
+            "last_status_check_at": None,
+            "last_status": pr_result.status,
+            "last_merge_state": None,
+            "last_head_commit": integrated_head,
+            "last_is_open": None,
+            "last_is_closed": None,
+            "last_is_merged": None,
+            "last_has_conflicts": None,
+            "final_status": None,
+            "closed_at": None,
+            "merged_at": None,
+            "conflict_detected_at": None,
+            "conflict_comment_posted_at": None,
+            "conflict_comment_error": None,
+            "conflict_comment_id": None,
+            "conflict_comment_url": None,
+            "conflict_comment_key": f"issue-{issue.id}:{pr_result.provider}:{pr_result.id or pr_result.number or pr_result.source_branch}",
+            "conflict_comment_marker": (
+                f"<!-- agent-team-orchestrator-conflict:"
+                f"issue-{issue.id}:{pr_result.provider}:{pr_result.id or pr_result.number or pr_result.source_branch} -->"
+            ),
             "raw": pr_result.raw,
         }
 
@@ -1694,6 +1971,144 @@ class WorkspaceManager:
             )
         if not info.workspace_repo_path.is_dir():
             raise WorkspaceError(f"Workspace repo path is missing for issue {issue.id}: {info.workspace_repo_path}")
+
+    def _validate_pull_request_repair_context(self, issue: Issue, info: WorkspaceInfo) -> None:
+        if info.issue_id != issue.id:
+            raise WorkspaceError(f"Pull request metadata issue id does not match issue {issue.id}")
+        if issue.repo_path and Path(issue.repo_path).expanduser().resolve() != info.original_repo_path:
+            raise WorkspaceError(
+                f"Pull request metadata for issue {issue.id} does not match the requested repo. "
+                f"Inspect or remove {self.artifacts.pull_request_metadata_path(issue.id)} before monitoring."
+            )
+        if not info.source_root.is_dir():
+            raise WorkspaceError(f"Workspace source repo is missing for issue {issue.id}: {info.source_root}")
+        if self._git_common_dir(info.source_root) != info.source_git_common_dir:
+            raise WorkspaceError(
+                f"Workspace source repo Git common directory changed for issue {issue.id}: {info.source_root}"
+            )
+
+    def _pull_request_repair_remote(
+        self,
+        info: WorkspaceInfo,
+        pull_request_metadata: dict[str, Any],
+    ) -> PullRequestRemote:
+        try:
+            metadata_remote = pull_request_remote_from_metadata(pull_request_metadata)
+        except PullRequestError as exc:
+            raise WorkspaceError(str(exc)) from exc
+        remote_names = self._remote_names(info.source_root)
+        if metadata_remote.remote_name not in remote_names:
+            raise WorkspaceError(
+                f"Recorded pull request remote no longer exists in source repo: {metadata_remote.remote_name}"
+            )
+        remote_url = self._git(info.source_root, "remote", "get-url", metadata_remote.remote_name)
+        source_remote = parse_pull_request_remote(metadata_remote.remote_name, remote_url)
+        if source_remote is None:
+            raise WorkspaceError(
+                f"Recorded pull request remote no longer uses a supported provider: {metadata_remote.remote_name}"
+            )
+        if not _same_pull_request_repository(metadata_remote, source_remote):
+            raise WorkspaceError(
+                f"Recorded pull request remote points to {_pull_request_remote_label(metadata_remote)}, "
+                f"but source repo remote now points to {_pull_request_remote_label(source_remote)}."
+            )
+        return source_remote
+
+    def _validate_remote_branch_name(self, source_root: Path, branch: str, label: str) -> None:
+        if branch == "HEAD" or branch.startswith("refs/") or "@{" in branch:
+            raise WorkspaceError(f"Recorded {label} is not a safe branch name: {branch}")
+        if not self._git_check(source_root, "check-ref-format", "--branch", branch):
+            raise WorkspaceError(f"Recorded {label} is not a valid Git branch name: {branch}")
+
+    @staticmethod
+    def _pull_request_repair_refs(issue_id: int) -> tuple[str, str]:
+        prefix = f"refs/agent-team/issues/{issue_id}/hosted-pr"
+        return f"{prefix}/head", f"{prefix}/target"
+
+    def _recreate_pull_request_repair_worktree(self, issue: Issue, info: WorkspaceInfo, head_ref: str) -> None:
+        expected_head = self._git(info.source_root, "rev-parse", head_ref)
+        expected_target_head = info.source_head
+        if info.worktree_root.exists() or self._is_registered_worktree(info.source_root, info.worktree_root):
+            if not info.worktree_root.is_dir():
+                raise WorkspaceError(f"Workspace worktree path is not a directory for issue {issue.id}: {info.worktree_root}")
+            try:
+                actual_root = self._git_path(info.worktree_root, "rev-parse", "--show-toplevel")
+            except WorkspaceError as exc:
+                raise WorkspaceError(
+                    f"Workspace path exists but is not a usable Git worktree for issue {issue.id}: {info.worktree_root}"
+                ) from exc
+            if actual_root != info.worktree_root.resolve():
+                raise WorkspaceError(f"Workspace path is not the expected Git worktree for issue {issue.id}: {info.worktree_root}")
+            conflict_files = self._conflicted_files(info.worktree_root)
+            if conflict_files:
+                actual_head = self._git(info.worktree_root, "rev-parse", "HEAD")
+                if actual_head != expected_head:
+                    raise WorkspaceError(
+                        f"Existing hosted PR repair workspace for issue {issue.id} is based on PR head "
+                        f"{actual_head[:12]}, but the provider now reports {expected_head[:12]}. "
+                        "Refusing to reuse stale conflict markers; inspect or reset the issue workspace before retrying."
+                    )
+                try:
+                    metadata = self.artifacts.read_workspace_metadata(issue.id) or {}
+                except (OSError, ValueError) as exc:
+                    raise WorkspaceError(
+                        f"Workspace metadata is unreadable for issue {issue.id}: "
+                        f"{self.artifacts.workspace_metadata_path(issue.id)}\n{exc}"
+                    ) from exc
+                recorded_head = _clean_optional_string(metadata.get("hosted_pull_request_head"))
+                if recorded_head is not None and recorded_head != expected_head:
+                    raise WorkspaceError(
+                        f"Existing hosted PR repair metadata for issue {issue.id} records PR head "
+                        f"{recorded_head[:12]}, but the provider now reports {expected_head[:12]}. "
+                        "Refusing to reuse stale conflict markers; inspect or reset the issue workspace before retrying."
+                    )
+                recorded_target_head = _clean_optional_string(metadata.get("hosted_pull_request_target_head"))
+                if recorded_target_head != expected_target_head:
+                    recorded_target = recorded_target_head[:12] if recorded_target_head else "missing"
+                    raise WorkspaceError(
+                        f"Existing hosted PR repair metadata for issue {issue.id} records target head "
+                        f"{recorded_target}, but the provider target branch now resolves to {expected_target_head[:12]}. "
+                        "Refusing to reuse stale conflict markers; inspect or reset the issue workspace before retrying."
+                    )
+                return
+            self._ensure_clean_repo(info.worktree_root, "issue worktree")
+            self._git(info.source_root, "worktree", "remove", str(info.worktree_root))
+        self.worktrees_dir.mkdir(parents=True, exist_ok=True)
+        self._git(info.source_root, "worktree", "add", "--detach", str(info.worktree_root), head_ref)
+        if not info.workspace_repo_path.is_dir():
+            raise WorkspaceError(
+                f"Isolated workspace subdirectory does not exist for issue {issue.id}: {info.workspace_repo_path}"
+            )
+
+    @staticmethod
+    def _hosted_pull_request_result(
+        issue: Issue,
+        pull_request_metadata: dict[str, Any],
+        status_snapshot: PullRequestStatusSnapshot,
+        *,
+        status: str,
+        summary: str,
+        target_branch: str | None,
+        worktree_head: str | None,
+        conflict_files: tuple[str, ...] = (),
+    ) -> WorkspaceMergeResult:
+        return WorkspaceMergeResult(
+            status=status,
+            summary=summary,
+            target_branch=target_branch,
+            worktree_head=worktree_head,
+            merge_commit=None,
+            conflict_files=conflict_files,
+            cleanup_removed=False,
+            pr_provider=status_snapshot.provider,
+            pr_remote_name=_clean_optional_string(pull_request_metadata.get("remote_name")),
+            pr_source_branch=_clean_optional_string(pull_request_metadata.get("source_branch")),
+            pr_url=status_snapshot.url or _clean_optional_string(pull_request_metadata.get("url")),
+            pr_id=_clean_optional_string(pull_request_metadata.get("id")),
+            pr_number=_clean_optional_int(pull_request_metadata.get("number")),
+            pr_status=status_snapshot.status,
+            pr_is_existing=bool(pull_request_metadata.get("is_existing")),
+        )
 
     def _ensure_clean_source(self, source_root: Path) -> None:
         status = self._git(source_root, "status", "--porcelain")
@@ -2219,16 +2634,20 @@ _CREDENTIAL_URL_RE = re.compile(
     r"\b([A-Za-z][A-Za-z0-9+.-]*://)([^/\s:@]+(?::[^/\s@]*)?@)",
     re.IGNORECASE,
 )
+_AUTH_HEADER_RE = re.compile(r"(?i)\b(authorization\s*[:=]\s*(?:bearer|basic|token)\s+)([^\s,;]+)")
 _SECRET_ASSIGNMENT_RE = re.compile(
     r"(?i)\b("
     r"access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd|pat|secret|sig|token"
     r")(\s*[:=]\s*)([^\s&#;,]+)"
 )
+_GH_TOKEN_RE = re.compile(r"\b(gh[pousr]_[A-Za-z0-9_]{20,})\b")
 
 
 def _redact_git_text(value: str) -> str:
     redacted = _CREDENTIAL_URL_RE.sub(r"\1[redacted]@", value)
-    return _SECRET_ASSIGNMENT_RE.sub(r"\1\2[redacted]", redacted)
+    redacted = _AUTH_HEADER_RE.sub(r"\1[redacted]", redacted)
+    redacted = _SECRET_ASSIGNMENT_RE.sub(r"\1\2[redacted]", redacted)
+    return _GH_TOKEN_RE.sub("[redacted]", redacted)
 
 
 def _truncate_snapshot_subject_detail(value: str) -> str:
@@ -2249,6 +2668,10 @@ def _merge_recovery_blocked(message: str) -> WorkspaceMergeRecovery:
         summary=message,
         artifact_markdown=f"# Merge Recovery\n\n{message}\n\nRecommendation: `blocked`",
     )
+
+
+def _is_hosted_pull_request_repair_metadata(metadata: dict[str, Any] | None) -> bool:
+    return bool(metadata and metadata.get("hosted_pull_request_conflict"))
 
 
 def _merge_recovery_retry(message: str) -> WorkspaceMergeRecovery:

@@ -150,6 +150,13 @@ if set(PHASE_PERMISSION_POLICIES) != set(PHASE_AGENTS):
     raise RuntimeError(f"Phase permission policies must match phase agents; missing={missing}, extra={extra}")
 
 
+NONINTERACTIVE_PAGER_ENV = {
+    "GIT_PAGER": "cat",
+    "PAGER": "cat",
+    "LESS": "FRX",
+}
+
+
 @dataclass(frozen=True)
 class _RecommendationDiagnostic:
     next_phase: str | None
@@ -322,6 +329,7 @@ class CopilotCliRunner(AgentRunner):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
+            env=self._subprocess_env(),
         )
         self._register_process(run_id, process)
         timed_out = False
@@ -360,6 +368,7 @@ class CopilotCliRunner(AgentRunner):
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            env=self._subprocess_env(),
         )
         self._register_process(run_id, process)
         assert process.stdout is not None
@@ -452,6 +461,12 @@ class CopilotCliRunner(AgentRunner):
                 process.kill()
         except ProcessLookupError:
             return
+
+    @staticmethod
+    def _subprocess_env() -> dict[str, str]:
+        env = os.environ.copy()
+        env.update(NONINTERACTIVE_PAGER_ENV)
+        return env
 
     @staticmethod
     def _read_available(fd: int) -> str:

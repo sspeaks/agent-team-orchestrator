@@ -75,9 +75,10 @@ draft -> needs_research -> ready_for_plan -> awaiting_plan_approval
   -> ready_for_implementation
   -> ready_for_validation -> ready_for_review -> awaiting_merge_approval
   -> ready_for_merge -> done
+                    \-> awaiting_pr_closure -> done
 ```
 
-Validation and review can loop back to implementation. Merge conflicts route through `ready_for_merge_conflict_resolution` before returning to validation and review. Any agent phase can pause at `awaiting_human_input` for consultation or stop at `blocked` when it cannot proceed safely. Human input consultation is separate from plan approval and merge approval: approvals are fixed workflow gates, while `human_input.mode` controls how readily agents pause for manager decisions during a phase.
+Validation and review can loop back to implementation. Merge conflicts route through `ready_for_merge_conflict_resolution` before returning to validation and review. When merge finalization opens or reuses a hosted pull request, the local issue moves to `awaiting_pr_closure` and the worker checks the PR once per worker interval until it closes. If the provider reports merge conflicts, the orchestrator comments that it is taking ownership, recreates the isolated workspace from the PR branch, merges the latest target branch to expose conflict markers, and routes through conflict resolution, validation, review, and merge approval before updating the PR branch. Any agent phase can pause at `awaiting_human_input` for consultation or stop at `blocked` when it cannot proceed safely. Human input consultation is separate from plan approval and merge approval: approvals are fixed workflow gates, while `human_input.mode` controls how readily agents pause for manager decisions during a phase.
 
 ## Configuration
 
@@ -104,7 +105,7 @@ Copilot model and reasoning effort can be configured globally or per Copilot-bac
 - Before the first implementation worktree is created, the target source checkout must be a clean Git repository because uncommitted and untracked files are not copied into worktrees.
 - Research and planning use the target checkout as source context. Implementation and later repo-backed phases run in the isolated issue worktree.
 - The web UI binds to `127.0.0.1` by default, uses same-origin/CSRF checks for POSTs, and has no authentication. Do not expose it on a shared network without your own protection.
-- Merge finalization can run locally or open/reuse a hosted PR when a supported GitHub or Azure DevOps Services remote is available. Opening a PR marks the local issue done; hosted PR review and merge remain outside the orchestrator.
+- Merge finalization can run locally or open/reuse a hosted PR when a supported GitHub or Azure DevOps Services remote is available. Hosted PRs remain local open issues until the provider PR closes; monitoring requires non-interactive `gh` or Azure CLI authentication with permission to read PR status and create/update PR comments.
 - Every run, transition, artifact, and log remains local under the configured state directory.
 
 ## Development and tests

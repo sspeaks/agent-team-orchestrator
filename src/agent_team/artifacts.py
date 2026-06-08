@@ -253,6 +253,12 @@ class ArtifactStore:
         path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return path
 
+    def update_pull_request_metadata(self, issue_id: int, updates: dict[str, Any]) -> Path:
+        current = self.read_pull_request_metadata(issue_id)
+        if current is None:
+            raise ValueError(f"Pull request metadata is missing for issue {issue_id}")
+        return self.write_pull_request_metadata(issue_id, {**current, **updates})
+
     def read_pull_request_metadata(self, issue_id: int) -> dict[str, Any] | None:
         path = self.pull_request_metadata_path(issue_id)
         if not path.is_file():

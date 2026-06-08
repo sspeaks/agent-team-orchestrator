@@ -26,6 +26,7 @@ PHASE_LABELS = {
     "awaiting_merge_approval": "Merge approval needed",
     "ready_for_merge": "Ready to merge",
     "merging": "Merging",
+    "awaiting_pr_closure": "Monitoring pull request",
     "ready_for_merge_conflict_resolution": "Ready to resolve merge conflicts",
     "resolving_merge_conflicts": "Resolving merge conflicts",
     "awaiting_human_input": "Human input needed",
@@ -199,6 +200,49 @@ def _render_human_input_panel(human_input: dict[str, Any]) -> str:
                 <pre>{_esc(pending.get("rationale"))}</pre>
                 {options_html}
                 {context_html}
+              </div>
+    """
+
+
+def _render_pull_request_monitoring_panel(metadata: dict[str, Any] | None) -> str:
+    if not metadata:
+        return ""
+    url = metadata.get("url")
+    number = metadata.get("number") or metadata.get("id") or ""
+    label = f"Pull request #{number}" if number else "Pull request"
+    link = (
+        f'<a href="{_esc(url)}" rel="noreferrer">{_esc(label)}</a>'
+        if is_safe_pull_request_url(url)
+        else _esc(label)
+    )
+    warning = ""
+    if metadata.get("conflict_comment_error"):
+        warning = (
+            '<p class="blocked-reason-summary">'
+            f"Conflict comment warning: {_esc(metadata.get('conflict_comment_error'))}"
+            "</p>"
+        )
+    fields = (
+        ("Provider", metadata.get("provider")),
+        ("Status", metadata.get("last_status") or metadata.get("pr_status")),
+        ("Merge state", metadata.get("last_merge_state")),
+        ("Last checked", metadata.get("last_status_check_at")),
+        ("Source branch", metadata.get("source_branch")),
+        ("Target branch", metadata.get("target_branch")),
+        ("Head commit", metadata.get("last_head_commit") or metadata.get("head_commit")),
+        ("Conflict detected", metadata.get("conflict_detected_at")),
+        ("Conflict comment", metadata.get("conflict_comment_posted_at")),
+    )
+    rows = "".join(
+        f"<dt>{_esc(label_text)}</dt><dd>{_esc(value or 'none')}</dd>"
+        for label_text, value in fields
+    )
+    return f"""
+              <div class="panel priority pull-request-monitoring-panel" data-pull-request-monitoring>
+                <h2>Pull request monitoring</h2>
+                <p>{link}</p>
+                <dl class="metadata">{rows}</dl>
+                {warning}
               </div>
     """
 
