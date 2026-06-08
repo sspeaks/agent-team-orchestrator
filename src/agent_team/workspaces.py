@@ -964,6 +964,7 @@ class WorkspaceManager:
                 raise
 
         merge_commit = self._git(info.source_root, "rev-parse", "HEAD")
+        # The source branch is finalized; finish metadata and cleanup even if a stop arrives now.
         merged_metadata = {
             **info.to_metadata(),
             "cleanup_removed": False,
@@ -975,7 +976,6 @@ class WorkspaceManager:
             "merge_branch": merge_branch,
         }
         self.artifacts.write_merged_workspace_metadata(issue.id, merged_metadata)
-        _raise_if_cancelled(cancellation_check)
         self._git(info.source_root, "worktree", "remove", str(info.worktree_root))
         merged_metadata["cleanup_removed"] = True
         self.artifacts.write_merged_workspace_metadata(issue.id, merged_metadata)
@@ -1214,6 +1214,7 @@ class WorkspaceManager:
         integrated_head = _require_string(preflight.integrated_head, "integrated worktree head")
         source_branch = self._pull_request_branch(issue)
         _raise_if_cancelled(cancellation_check)
+        # Pushing/creating a PR is the finalization point; complete metadata and cleanup afterward.
         self._push_pull_request_branch(issue, info, selected_remote, source_branch, integrated_head)
         body_path = self._write_pull_request_body(
             issue,
@@ -1228,7 +1229,6 @@ class WorkspaceManager:
             title=f"Issue {issue.id}: {_single_line(issue.title)}",
             body_path=body_path,
         )
-        _raise_if_cancelled(cancellation_check)
         try:
             pr_result = create_or_get_pull_request(selected_remote.remote, request)
         except PullRequestError as exc:
@@ -1242,7 +1242,6 @@ class WorkspaceManager:
             integrated_head,
         )
         self.artifacts.write_pull_request_metadata(issue.id, metadata)
-        _raise_if_cancelled(cancellation_check)
         self._git(info.source_root, "worktree", "remove", str(info.worktree_root))
         metadata["cleanup_removed"] = True
         self.artifacts.write_pull_request_metadata(issue.id, metadata)

@@ -341,6 +341,8 @@ class CopilotCliRunner(AgentRunner):
                 timed_out = True
                 self._terminate_process_group(active_process)
                 stdout, stderr = process.communicate()
+            if not timed_out:
+                self._terminate_remaining_process_group(active_process)
         finally:
             self._unregister_process(run_id)
         returncode = process.returncode
@@ -401,6 +403,15 @@ class CopilotCliRunner(AgentRunner):
                     output_parts.append(chunk)
                     log_handle.write(chunk)
                     log_handle.flush()
+                if not timed_out:
+                    self._terminate_remaining_process_group(active_process)
+                    while True:
+                        chunk = self._read_available(fd)
+                        if not chunk:
+                            break
+                        output_parts.append(chunk)
+                        log_handle.write(chunk)
+                        log_handle.flush()
                 cancel_reason = self._pop_cancel_reason(run_id)
                 if cancel_reason:
                     note = f"\n[agent-team] Run cancelled: {cancel_reason}\n"
@@ -451,6 +462,13 @@ class CopilotCliRunner(AgentRunner):
             return self._cancel_reasons.pop(run_id, None)
 
     @classmethod
+    def _terminate_remaining_process_group(cls, active_process: "_ActiveCopilotProcess") -> None:
+        if os.name != "posix" or active_process.process_group_id is None:
+            return
+        if cls._process_group_exists(active_process.process_group_id):
+            cls._terminate_process_group(active_process)
+
+    @classmethod
     def _terminate_process_group(cls, active_process: "_ActiveCopilotProcess", grace_seconds: float = 2.0) -> None:
         process = active_process.process
         group_signaled = False
@@ -473,10 +491,7 @@ class CopilotCliRunner(AgentRunner):
                 pass
 
         remaining_grace = grace_seconds - (time.monotonic() - started_at)
-        if group_signaled and remaining_grace > 0 and cls._process_group_exists(active_process.process_group_id):
-            time.sleep(remaining_grace)
-
-        if group_signaled and not cls._process_group_exists(active_process.process_group_id):
+        if group_signaled and cls._wait_for_process_group_exit(active_process.process_group_id, remaining_grace):
             return
         if not group_signaled and process.poll() is not None:
             return
@@ -488,6 +503,25 @@ class CopilotCliRunner(AgentRunner):
                 process.kill()
         except ProcessLookupError:
             return
+        if group_signaled:
+            cls._wait_for_process_group_exit(active_process.process_group_id, 1.0)
+        elif process.poll() is None:
+            try:
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                pass
+
+    @classmethod
+    def _wait_for_process_group_exit(cls, process_group_id: int | None, timeout_seconds: float) -> bool:
+        if process_group_id is None:
+            return True
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        while cls._process_group_exists(process_group_id):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.05, remaining))
+        return True
 
     @staticmethod
     def _process_group_exists(process_group_id: int | None) -> bool:

@@ -1321,9 +1321,10 @@ class _RunCancellationMonitor:
             if reason is None:
                 continue
             self.reason = reason
-            self.cancelled_runner = self.runner.cancel_run(self.run_id, reason)
-            self._stop.set()
-            return
+            if self.runner.cancel_run(self.run_id, reason):
+                self.cancelled_runner = True
+                self._stop.set()
+                return
 
 
 class _StalePullRequestMonitor(RuntimeError):

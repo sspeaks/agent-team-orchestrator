@@ -322,6 +322,34 @@ class StoreAndWorkerTests(unittest.TestCase):
         self.assertEqual(run["next_phase"], "blocked")
         self.assertEqual(self.store.get_forced_stop_state(issue.id, "run-active"), "Manager cancelled active work.")
 
+    def test_stop_force_overwrites_current_run_after_completion_before_transition(self) -> None:
+        issue = self.store.create_issue("completed run stop", "desc", ready=True)
+        self.assertTrue(self.store.acquire_lock(issue.id, "worker", 60, "run-completed"))
+        self.store.transition_issue(issue.id, "researching", "run-completed")
+        self.store.create_run("run-completed", issue.id, "research", "dry-run")
+        self.store.complete_run(
+            "run-completed",
+            issue.id,
+            "success",
+            "Runner finished before transition.",
+            "research.md",
+            next_phase="ready_for_plan",
+        )
+
+        stop_issue(self.config, self.store, self.artifacts, issue.id, "Manager stopped during finalization.")
+
+        stopped = self.store.get_issue(issue.id)
+        run = self.store.list_runs(issue.id)[0]
+        self.assertEqual(stopped.phase, "blocked")
+        self.assertIsNone(stopped.current_run_id)
+        self.assertEqual(run["status"], "stopped")
+        self.assertEqual(run["summary"], "Manager stopped during finalization.")
+        self.assertEqual(run["error"], "Manager stopped during finalization.")
+        self.assertEqual(run["next_phase"], "blocked")
+        event_types = [event["event_type"] for event in self.store.list_events(issue.id)]
+        self.assertIn("run.success", event_types)
+        self.assertIn("run.stopped", event_types)
+
     def test_create_run_guard_rejects_force_stop_race_before_run_row(self) -> None:
         issue = self.store.create_issue("race stop", "desc", ready=True)
         self.assertTrue(self.store.acquire_lock(issue.id, "worker", 60, "run-race"))
@@ -511,6 +539,65 @@ class StoreAndWorkerTests(unittest.TestCase):
         self.assertEqual(self.store.list_runs(issue.id)[0]["status"], "stopped")
         self.assertEqual(runner.cancel_reason, "Stop active orchestrator run.")
         self.assertFalse(self.artifacts.phase_artifact_path(issue.id, "research").exists())
+
+    def test_orchestrator_retries_force_stop_until_runner_cancellation_registers(self) -> None:
+        issue = self.store.create_issue("late cancellable run", "desc", ready=True)
+
+        class LateCancellableRunner(AgentRunner):
+            name = "late-cancellable"
+
+            def __init__(self) -> None:
+                self.started = threading.Event()
+                self.cancelled = threading.Event()
+                self.cancel_reason: str | None = None
+                self.cancel_calls = 0
+
+            def run(self, phase: str, issue: Issue, context: Dict[str, str]) -> AgentResult:
+                self.started.set()
+                self.cancelled.wait(timeout=5)
+                return AgentResult(
+                    status="success",
+                    summary="runner completed after late cancellation",
+                    artifact_markdown="Recommendation: `ready_for_plan`",
+                    suggested_next_phase="ready_for_plan",
+                )
+
+            def cancel_run(self, run_id: str, reason: str) -> bool:
+                self.cancel_calls += 1
+                self.cancel_reason = reason
+                if self.cancel_calls == 1:
+                    return False
+                self.cancelled.set()
+                return True
+
+        runner = LateCancellableRunner()
+        orchestrator = Orchestrator(self.store, self.artifacts, self.config, runner=runner)
+        result_holder: list[ProcessResult] = []
+        errors: list[BaseException] = []
+
+        def process() -> None:
+            try:
+                result_holder.append(orchestrator.process_issue(issue.id))
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=process)
+        thread.start()
+        try:
+            self.assertTrue(runner.started.wait(timeout=5))
+            stop_issue(self.config, self.store, self.artifacts, issue.id, "Stop before runner registration settles.")
+            thread.join(timeout=5)
+        finally:
+            runner.cancelled.set()
+            thread.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(result_holder), 1)
+        self.assertEqual(result_holder[0].status, "stopped")
+        self.assertGreaterEqual(runner.cancel_calls, 2)
+        self.assertEqual(runner.cancel_reason, "Stop before runner registration settles.")
+        self.assertEqual(self.store.get_issue(issue.id).phase, "blocked")
 
     def test_cli_stop_prints_summary_and_uses_default_message(self) -> None:
         issue = self.store.create_issue("cli stop", "desc", ready=True)

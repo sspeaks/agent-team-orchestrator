@@ -1264,6 +1264,81 @@ pathlib.Path({str(child_pid_path)!r}).write_text(str(child.pid), encoding="utf-8
                     except ProcessLookupError:
                         pass
 
+    @unittest.skipIf(os.name != "posix", "POSIX process groups are required for this regression test")
+    def test_run_command_terminates_process_group_child_after_parent_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            log_path = tmp_path / "run.md"
+            log_path.write_text("# Raw run log\n\n```text\n", encoding="utf-8")
+            child_ready_path = tmp_path / "child-ready"
+            child_pid_path = tmp_path / "child-pid"
+            child_terminated_path = tmp_path / "child-terminated"
+            child_code = """
+import pathlib
+import signal
+import sys
+import time
+
+ready_path = pathlib.Path(sys.argv[1])
+terminated_path = pathlib.Path(sys.argv[2])
+
+def handle_term(signum, frame):
+    terminated_path.write_text("terminated", encoding="utf-8")
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, handle_term)
+ready_path.write_text("ready", encoding="utf-8")
+time.sleep(30)
+"""
+            parent_code = f"""
+import pathlib
+import subprocess
+import sys
+import time
+
+child = subprocess.Popen(
+    [
+        sys.executable,
+        "-c",
+        {child_code!r},
+        {str(child_ready_path)!r},
+        {str(child_terminated_path)!r},
+    ],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+pathlib.Path({str(child_pid_path)!r}).write_text(str(child.pid), encoding="utf-8")
+deadline = time.monotonic() + 5
+while not pathlib.Path({str(child_ready_path)!r}).exists() and time.monotonic() < deadline:
+    time.sleep(0.05)
+if not pathlib.Path({str(child_ready_path)!r}).exists():
+    raise SystemExit(2)
+"""
+            runner = CopilotCliRunner(timeout_seconds=30)
+            child_pid: int | None = None
+            try:
+                completed = runner._run_command(
+                    [sys.executable, "-c", parent_code],
+                    None,
+                    {"run_id": "run-orphan-lifecycle", "run_log": str(log_path)},
+                )
+                self.assertEqual(completed.returncode, 0)
+                self.assertTrue(child_pid_path.exists())
+                child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+                deadline = time.monotonic() + 5
+                while not child_terminated_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertTrue(child_terminated_path.exists())
+                self.assertNotIn("run-orphan-lifecycle", runner._active_processes)
+            finally:
+                runner.cancel_run("run-orphan-lifecycle", "test cleanup")
+                if child_pid is not None and not child_terminated_path.exists():
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
     def test_timeout_uses_process_group_termination_and_logs_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "run.md"

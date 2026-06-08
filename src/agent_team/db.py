@@ -1124,7 +1124,7 @@ class IssueStore:
                         summary = ?,
                         error = ?,
                         next_phase = 'blocked'
-                    WHERE id = ? AND issue_id = ? AND status = 'running'
+                    WHERE id = ? AND issue_id = ? AND status != 'stopped'
                     """,
                     (now, cleaned_message, cleaned_message, active_run_id, issue_id),
                 )
