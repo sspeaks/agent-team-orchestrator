@@ -199,7 +199,7 @@ class CopilotCliRunner(AgentRunner):
         self.plugin_dir = (plugin_dir or self._default_plugin_dir()).expanduser()
         self.plugin_name = self._plugin_name(self.plugin_dir)
         self._process_lock = threading.Lock()
-        self._active_processes: dict[str, subprocess.Popen] = {}
+        self._active_processes: dict[str, _ActiveCopilotProcess] = {}
         self._cancel_reasons: dict[str, str] = {}
 
     def run(self, phase: str, issue: Issue, context: dict[str, str]) -> AgentResult:
@@ -301,11 +301,11 @@ class CopilotCliRunner(AgentRunner):
 
     def cancel_run(self, run_id: str, reason: str) -> bool:
         with self._process_lock:
-            process = self._active_processes.get(run_id)
-            if process is None or process.poll() is not None:
+            active_process = self._active_processes.get(run_id)
+            if active_process is None:
                 return False
             self._cancel_reasons[run_id] = reason
-        self._terminate_process_group(process)
+        self._terminate_process_group(active_process)
         return True
 
     def _run_command(self, command: list[str], repo_path: Path | None, context: dict[str, str]) -> "_CompletedCopilotRun":
@@ -331,14 +331,15 @@ class CopilotCliRunner(AgentRunner):
             start_new_session=True,
             env=self._subprocess_env(),
         )
-        self._register_process(run_id, process)
+        active_process = self._active_process(process)
+        self._register_process(run_id, active_process)
         timed_out = False
         try:
             try:
                 stdout, stderr = process.communicate(timeout=self.timeout_seconds)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                self._terminate_process_group(process)
+                self._terminate_process_group(active_process)
                 stdout, stderr = process.communicate()
         finally:
             self._unregister_process(run_id)
@@ -370,7 +371,8 @@ class CopilotCliRunner(AgentRunner):
             start_new_session=True,
             env=self._subprocess_env(),
         )
-        self._register_process(run_id, process)
+        active_process = self._active_process(process)
+        self._register_process(run_id, active_process)
         assert process.stdout is not None
         fd = process.stdout.fileno()
         os.set_blocking(fd, False)
@@ -383,7 +385,7 @@ class CopilotCliRunner(AgentRunner):
                 while process.poll() is None:
                     if time.monotonic() > deadline:
                         timed_out = True
-                        self._terminate_process_group(process)
+                        self._terminate_process_group(active_process)
                         break
                     ready, _, _ = select.select([fd], [], [], 0.2)
                     if ready:
@@ -420,11 +422,21 @@ class CopilotCliRunner(AgentRunner):
             returncode = returncode if returncode != 0 else -1
         return _CompletedCopilotRun(returncode, output, "", True)
 
-    def _register_process(self, run_id: str | None, process: subprocess.Popen) -> None:
+    @staticmethod
+    def _active_process(process: subprocess.Popen) -> "_ActiveCopilotProcess":
+        process_group_id: int | None = None
+        if os.name == "posix":
+            try:
+                process_group_id = os.getpgid(process.pid)
+            except ProcessLookupError:
+                process_group_id = None
+        return _ActiveCopilotProcess(process=process, process_group_id=process_group_id)
+
+    def _register_process(self, run_id: str | None, active_process: "_ActiveCopilotProcess") -> None:
         if run_id is None:
             return
         with self._process_lock:
-            self._active_processes[run_id] = process
+            self._active_processes[run_id] = active_process
 
     def _unregister_process(self, run_id: str | None) -> None:
         if run_id is None:
@@ -438,29 +450,56 @@ class CopilotCliRunner(AgentRunner):
         with self._process_lock:
             return self._cancel_reasons.pop(run_id, None)
 
-    @staticmethod
-    def _terminate_process_group(process: subprocess.Popen, grace_seconds: float = 2.0) -> None:
-        if process.poll() is not None:
-            return
+    @classmethod
+    def _terminate_process_group(cls, active_process: "_ActiveCopilotProcess", grace_seconds: float = 2.0) -> None:
+        process = active_process.process
+        group_signaled = False
+        started_at = time.monotonic()
         try:
-            if os.name == "posix":
-                os.killpg(process.pid, signal.SIGTERM)
+            if os.name == "posix" and active_process.process_group_id is not None:
+                os.killpg(active_process.process_group_id, signal.SIGTERM)
+                group_signaled = True
             else:
+                if process.poll() is not None:
+                    return
                 process.terminate()
         except ProcessLookupError:
             return
-        try:
-            process.wait(timeout=grace_seconds)
+
+        if process.poll() is None:
+            try:
+                process.wait(timeout=grace_seconds)
+            except subprocess.TimeoutExpired:
+                pass
+
+        remaining_grace = grace_seconds - (time.monotonic() - started_at)
+        if group_signaled and remaining_grace > 0 and cls._process_group_exists(active_process.process_group_id):
+            time.sleep(remaining_grace)
+
+        if group_signaled and not cls._process_group_exists(active_process.process_group_id):
             return
-        except subprocess.TimeoutExpired:
-            pass
+        if not group_signaled and process.poll() is not None:
+            return
+
         try:
-            if os.name == "posix":
-                os.killpg(process.pid, signal.SIGKILL)
+            if os.name == "posix" and active_process.process_group_id is not None:
+                os.killpg(active_process.process_group_id, signal.SIGKILL)
             else:
                 process.kill()
         except ProcessLookupError:
             return
+
+    @staticmethod
+    def _process_group_exists(process_group_id: int | None) -> bool:
+        if process_group_id is None:
+            return False
+        try:
+            os.killpg(process_group_id, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
 
     @staticmethod
     def _subprocess_env() -> dict[str, str]:
@@ -1073,6 +1112,12 @@ class _CompletedCopilotRun:
         self.stdout = stdout
         self.stderr = stderr
         self.logged = logged
+
+
+@dataclass(frozen=True)
+class _ActiveCopilotProcess:
+    process: subprocess.Popen
+    process_group_id: int | None
 
 
 @dataclass(frozen=True)

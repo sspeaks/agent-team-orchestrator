@@ -338,6 +338,123 @@ class StoreAndWorkerTests(unittest.TestCase):
             )
         self.assertEqual(self.store.list_runs(issue.id), [])
 
+    def test_create_run_guard_is_atomic_when_stop_commits_before_insert(self) -> None:
+        issue = self.store.create_issue("insert race stop", "desc", ready=True)
+        self.assertTrue(self.store.acquire_lock(issue.id, "worker", 60, "run-race"))
+        outer = self
+        original_connect = self.store.connect
+        stopped_before_insert = False
+
+        class RaceConnection:
+            def __init__(self, connection: sqlite3.Connection) -> None:
+                self._connection = connection
+
+            def __enter__(self) -> "RaceConnection":
+                return self
+
+            def __exit__(self, exc_type: object, exc: object, tb: object) -> object:
+                return self._connection.__exit__(exc_type, exc, tb)
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self._connection, name)
+
+            def execute(self, sql: str, parameters: object = ()) -> sqlite3.Cursor:
+                nonlocal stopped_before_insert
+                normalized_sql = " ".join(sql.split())
+                if not stopped_before_insert and normalized_sql.startswith("INSERT INTO runs"):
+                    stopped_before_insert = True
+                    with patch.object(outer.store, "connect", original_connect):
+                        stop_issue(
+                            outer.config,
+                            outer.store,
+                            outer.artifacts,
+                            issue.id,
+                            "Stop between run guard and insert.",
+                        )
+                return self._connection.execute(sql, parameters)
+
+        def connect_with_race() -> RaceConnection:
+            return RaceConnection(original_connect())
+
+        with patch.object(self.store, "connect", connect_with_race):
+            with self.assertRaisesRegex(RuntimeError, "no longer current"):
+                self.store.create_run(
+                    "run-race",
+                    issue.id,
+                    "research",
+                    "dry-run",
+                    expected_current_run_id="run-race",
+                )
+
+        self.assertTrue(stopped_before_insert)
+        self.assertEqual(self.store.get_issue(issue.id).phase, "blocked")
+        self.assertEqual(self.store.list_runs(issue.id), [])
+
+    def test_complete_run_guard_is_atomic_when_stop_commits_before_update(self) -> None:
+        issue = self.store.create_issue("complete race stop", "desc", ready=True)
+        self.assertTrue(self.store.acquire_lock(issue.id, "worker", 60, "run-complete"))
+        self.store.transition_issue(issue.id, "researching", "run-complete")
+        self.store.create_run("run-complete", issue.id, "research", "dry-run")
+        outer = self
+        original_connect = self.store.connect
+        stopped_before_update = False
+
+        class RaceConnection:
+            def __init__(self, connection: sqlite3.Connection) -> None:
+                self._connection = connection
+
+            def __enter__(self) -> "RaceConnection":
+                return self
+
+            def __exit__(self, exc_type: object, exc: object, tb: object) -> object:
+                return self._connection.__exit__(exc_type, exc, tb)
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self._connection, name)
+
+            def execute(self, sql: str, parameters: object = ()) -> sqlite3.Cursor:
+                nonlocal stopped_before_update
+                normalized_sql = " ".join(sql.split())
+                if (
+                    not stopped_before_update
+                    and normalized_sql.startswith("UPDATE runs")
+                    and "artifact_path" in normalized_sql
+                ):
+                    stopped_before_update = True
+                    with patch.object(outer.store, "connect", original_connect):
+                        stop_issue(
+                            outer.config,
+                            outer.store,
+                            outer.artifacts,
+                            issue.id,
+                            "Stop before stale run completion.",
+                        )
+                return self._connection.execute(sql, parameters)
+
+        def connect_with_race() -> RaceConnection:
+            return RaceConnection(original_connect())
+
+        with patch.object(self.store, "connect", connect_with_race):
+            with self.assertRaisesRegex(RuntimeError, "no longer current"):
+                self.store.complete_run(
+                    "run-complete",
+                    issue.id,
+                    "success",
+                    "Stale worker completed.",
+                    "research.md",
+                    next_phase="ready_for_plan",
+                )
+
+        run = self.store.list_runs(issue.id)[0]
+        self.assertTrue(stopped_before_update)
+        self.assertEqual(self.store.get_issue(issue.id).phase, "blocked")
+        self.assertEqual(run["status"], "stopped")
+        self.assertEqual(run["summary"], "Stop before stale run completion.")
+        self.assertEqual(run["next_phase"], "blocked")
+        event_types = [event["event_type"] for event in self.store.list_events(issue.id)]
+        self.assertIn("run.stopped", event_types)
+        self.assertNotIn("run.success", event_types)
+
     def test_orchestrator_force_stop_cancels_runner_and_preserves_blocked_state(self) -> None:
         issue = self.store.create_issue("cancel active run", "desc", ready=True)
 

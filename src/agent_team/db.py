@@ -1325,21 +1325,32 @@ class IssueStore:
         now = utc_now_iso()
         with self.connect() as conn:
             if expected_current_run_id is not None:
-                current = conn.execute(
-                    "SELECT current_run_id FROM issues WHERE id = ?",
-                    (issue_id,),
-                ).fetchone()
-                if current is None:
-                    raise KeyError(f"Issue not found: {issue_id}")
-                if current["current_run_id"] != expected_current_run_id:
+                cur = conn.execute(
+                    """
+                    INSERT INTO runs (id, issue_id, phase, runner, status, started_at)
+                    SELECT ?, issues.id, ?, ?, 'running', ?
+                    FROM issues
+                    WHERE issues.id = ?
+                      AND issues.current_run_id = ?
+                    """,
+                    (run_id, phase, runner, now, issue_id, expected_current_run_id),
+                )
+                if cur.rowcount != 1:
+                    current = conn.execute(
+                        "SELECT current_run_id FROM issues WHERE id = ?",
+                        (issue_id,),
+                    ).fetchone()
+                    if current is None:
+                        raise KeyError(f"Issue not found: {issue_id}")
                     raise RuntimeError(f"Run {expected_current_run_id} is no longer current for issue {issue_id}")
-            conn.execute(
-                """
-                INSERT INTO runs (id, issue_id, phase, runner, status, started_at)
-                VALUES (?, ?, ?, ?, 'running', ?)
-                """,
-                (run_id, issue_id, phase, runner, now),
-            )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO runs (id, issue_id, phase, runner, status, started_at)
+                    VALUES (?, ?, ?, ?, 'running', ?)
+                    """,
+                    (run_id, issue_id, phase, runner, now),
+                )
             self._add_event(conn, issue_id, run_id, "run.started", f"Started {phase} with {runner}")
 
     def complete_run(
@@ -1354,23 +1365,37 @@ class IssueStore:
     ) -> None:
         now = utc_now_iso()
         with self.connect() as conn:
-            current = conn.execute(
-                "SELECT current_run_id FROM issues WHERE id = ?",
-                (issue_id,),
-            ).fetchone()
-            if current is None:
-                raise KeyError(f"Issue not found: {issue_id}")
-            if current["current_run_id"] != run_id:
-                raise RuntimeError(f"Run {run_id} is no longer current for issue {issue_id}")
             cur = conn.execute(
                 """
                 UPDATE runs
                 SET status = ?, completed_at = ?, summary = ?, artifact_path = ?, error = ?, next_phase = ?
                 WHERE id = ?
+                  AND issue_id = ?
+                  AND status = 'running'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM issues
+                      WHERE issues.id = ?
+                        AND issues.current_run_id = ?
+                  )
                 """,
-                (status, now, summary, artifact_path, error, next_phase, run_id),
+                (status, now, summary, artifact_path, error, next_phase, run_id, issue_id, issue_id, run_id),
             )
             if cur.rowcount != 1:
+                current = conn.execute(
+                    "SELECT current_run_id FROM issues WHERE id = ?",
+                    (issue_id,),
+                ).fetchone()
+                if current is None:
+                    raise KeyError(f"Issue not found: {issue_id}")
+                if current["current_run_id"] != run_id:
+                    raise RuntimeError(f"Run {run_id} is no longer current for issue {issue_id}")
+                run = conn.execute(
+                    "SELECT status FROM runs WHERE id = ? AND issue_id = ?",
+                    (run_id, issue_id),
+                ).fetchone()
+                if run is not None and run["status"] != "running":
+                    raise RuntimeError(f"Run {run_id} is no longer running")
                 raise RuntimeError(f"Run not found or already reset: {run_id}")
             self._add_event(conn, issue_id, run_id, f"run.{status}", summary)
 
