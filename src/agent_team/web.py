@@ -345,10 +345,9 @@ class AgentTeamWebApp:
                 return
             if action == "stop":
                 issue = self.store.get_issue(issue_id)
-                issue = self._ensure_no_active_lock(issue, "stop this issue")
-                self._ensure_no_active_job(issue_id, "stop this issue")
                 message = form.get("message", "").strip() or None
                 result = stop_issue(self.config, self.store, self.artifacts, issue.id, message, stopped_by="web")
+                self.jobs.cancel_jobs_for_issue(issue.id, result.issue.blocked_summary or "Issue stopped by manager")
                 self._redirect(
                     handler,
                     _context_url(
@@ -524,7 +523,7 @@ class AgentTeamWebApp:
 
     def _ensure_no_active_job(self, issue_id: int, action: str) -> None:
         for job in self.jobs.list_jobs(issue_id):
-            if job.status in {"queued", "running"}:
+            if job.status in {"queued", "running", "cancelling"}:
                 raise WebError(HTTPStatus.CONFLICT, f"Cannot {action} while queued browser action {job.id} is {job.status}")
 
     def _repo_context(self, query: dict[str, list[str]]) -> RepoContext:
@@ -599,7 +598,7 @@ class AgentTeamWebApp:
         human_input_requests = self.store.list_human_input_requests(issue.id)
         pending_human_input = next((request for request in human_input_requests if request.status == "pending"), None)
         jobs = self.jobs.list_jobs(issue.id)
-        active_jobs = [job for job in jobs if job.status in {"queued", "running"}]
+        active_jobs = [job for job in jobs if job.status in {"queued", "running", "cancelling"}]
         artifacts = self._artifact_metadata_payload(issue.id, repo_context)
         blocked_reason = _blocked_reason_payload(issue, runs, events, artifacts, self._blocked_artifact_excerpt)
         manager_controls = self._manager_controls_payload(issue, repo_context, blocked_reason)

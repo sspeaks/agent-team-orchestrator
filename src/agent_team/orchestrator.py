@@ -165,41 +165,84 @@ class Orchestrator:
         artifact_path: Path | None = None
         try:
             running_phase = running_phase_for(phase)
-            self.store.transition_issue(issue.id, running_phase, run_id, f"Starting {phase}")
+            stopped = self._forced_stop_result(issue.id, run_id, phase)
+            if stopped is not None:
+                return stopped
+            try:
+                self.store.transition_issue(issue.id, running_phase, run_id, f"Starting {phase}")
+            except (RuntimeError, ValueError):
+                stopped = self._forced_stop_result(issue.id, run_id, phase)
+                if stopped is not None:
+                    return stopped
+                raise
+            stopped = self._forced_stop_result(issue.id, run_id, phase)
+            if stopped is not None:
+                return stopped
             issue = self.store.get_issue(issue.id)
             runner_name = "workspace-merge" if phase == "merge" else self.runner.name
-            self.store.create_run(run_id, issue.id, phase, runner_name)
+            try:
+                self.store.create_run(run_id, issue.id, phase, runner_name, expected_current_run_id=run_id)
+            except (KeyError, RuntimeError):
+                stopped = self._forced_stop_result(issue.id, run_id, phase)
+                if stopped is not None:
+                    return stopped
+                raise
+            stopped = self._forced_stop_result(issue.id, run_id, phase)
+            if stopped is not None:
+                return stopped
             self.artifacts.write_issue_snapshot(issue)
             self.artifacts.archive_phase_artifact_before_run(issue.id, phase, run_id)
             log_path = self.artifacts.start_run_log(issue.id, phase, run_id, runner_name)
 
-            with _IssueLockHeartbeat(
-                self.store,
-                issue.id,
-                self.owner,
-                run_id,
-                self.config.lock_ttl_seconds,
-                expected_phase=running_phase,
-            ):
-                workspace_info: WorkspaceInfo | None = None
-                runner_invoked = False
-                if phase == "merge":
-                    result = self._run_merge(issue)
-                else:
-                    try:
-                        workspace_info = self._workspace_for_phase(phase, issue)
-                    except WorkspaceError as exc:
-                        result = self._blocked_workspace_result(str(exc))
+            with _RunCancellationMonitor(self.store, self.runner, issue.id, run_id) as cancellation_monitor:
+                with _IssueLockHeartbeat(
+                    self.store,
+                    issue.id,
+                    self.owner,
+                    run_id,
+                    self.config.lock_ttl_seconds,
+                    expected_phase=running_phase,
+                ):
+                    workspace_info: WorkspaceInfo | None = None
+                    runner_invoked = False
+                    stopped = self._forced_stop_result(issue.id, run_id, phase, cancellation_monitor.reason)
+                    if stopped is not None:
+                        return stopped
+                    if phase == "merge":
+                        result = self._run_merge(issue, run_id)
                     else:
-                        context = self._build_context(phase, issue, log_path, workspace_info)
-                        runner_invoked = True
-                        result = self.runner.run(phase, issue, context)
+                        try:
+                            workspace_info = self._workspace_for_phase(phase, issue)
+                        except WorkspaceError as exc:
+                            result = self._blocked_workspace_result(str(exc))
+                        else:
+                            stopped = self._forced_stop_result(issue.id, run_id, phase, cancellation_monitor.reason)
+                            if stopped is not None:
+                                return stopped
+                            context = self._build_context(phase, issue, log_path, workspace_info, run_id)
+                            runner_invoked = True
+                            result = self.runner.run(phase, issue, context)
+                    stopped = self._forced_stop_result(issue.id, run_id, phase, cancellation_monitor.reason)
+                    if stopped is not None:
+                        return stopped
+                stopped = self._forced_stop_result(issue.id, run_id, phase, cancellation_monitor.reason)
+                if stopped is not None:
+                    return stopped
             if not self.store.refresh_run_lock(issue.id, self.owner, run_id, self.config.lock_ttl_seconds):
+                stopped = self._forced_stop_result(issue.id, run_id, phase)
+                if stopped is not None:
+                    return stopped
                 raise RuntimeError(f"Run {run_id} is no longer current for issue {issue.id}")
+            stopped = self._forced_stop_result(issue.id, run_id, phase)
+            if stopped is not None:
+                return stopped
             if result.raw_stdout or result.raw_stderr:
                 self.artifacts.finish_run_log(log_path, result.raw_stdout, result.raw_stderr)
             elif self.runner.name != "copilot-cli" or not runner_invoked:
                 self.artifacts.finish_run_log(log_path)
+            stopped = self._forced_stop_result(issue.id, run_id, phase)
+            if stopped is not None:
+                return stopped
             try:
                 artifact_path = self.artifacts.write_phase_artifact(issue.id, phase, run_id, result.artifact_markdown)
             except OSError as exc:
@@ -213,6 +256,9 @@ class Orchestrator:
                     blocked_summary=summarize_blocked_reason(message),
                 )
                 artifact_path = None
+            stopped = self._forced_stop_result(issue.id, run_id, phase)
+            if stopped is not None:
+                return stopped
             next_phase = result.suggested_next_phase or default_next_phase(phase)
             if result.status == "requeued" and result.suggested_next_phase is not None:
                 next_phase = result.suggested_next_phase
@@ -239,6 +285,9 @@ class Orchestrator:
                 self.artifacts.clear_plan_rejection_context(issue.id)
             workspace_source_sync: dict[str, object] | None = None
             if self._should_sync_source_before_rework(phase, workspace_info, final_status, next_phase):
+                stopped = self._forced_stop_result(issue.id, run_id, phase)
+                if stopped is not None:
+                    return stopped
                 try:
                     sync_result = WorkspaceManager(
                         self.config.worktrees_dir,
@@ -289,8 +338,14 @@ class Orchestrator:
                         else:
                             workspace_source_sync["artifact_path"] = str(sync_artifact_path)
                             next_phase = "ready_for_merge_conflict_resolution"
+                stopped = self._forced_stop_result(issue.id, run_id, phase)
+                if stopped is not None:
+                    return stopped
             workspace_commit = None
             if self._should_commit_phase_snapshot(phase, workspace_info, final_status, next_phase):
+                stopped = self._forced_stop_result(issue.id, run_id, phase)
+                if stopped is not None:
+                    return stopped
                 try:
                     workspace_commit = self._workspace_manager().commit_phase_snapshot(
                         issue,
@@ -314,6 +369,9 @@ class Orchestrator:
                         run_id,
                         self._snapshot_blocked_artifact(phase, final_summary),
                     )
+                stopped = self._forced_stop_result(issue.id, run_id, phase)
+                if stopped is not None:
+                    return stopped
             history_event = {
                 "run_id": run_id,
                 "phase": phase,
@@ -349,15 +407,27 @@ class Orchestrator:
                     result.artifact_markdown or final_error or result.error or final_summary
                 )
                 history_event["blocked_summary"] = final_blocked_summary
+            stopped = self._forced_stop_result(issue.id, run_id, phase)
+            if stopped is not None:
+                return stopped
             self.artifacts.append_history(issue.id, history_event)
+            stopped = self._forced_stop_result(issue.id, run_id, phase)
+            if stopped is not None:
+                return stopped
             if human_input_request is not None:
-                created_request = self.store.complete_run_and_request_human_input(
-                    run_id,
-                    issue.id,
-                    final_summary,
-                    str(artifact_path),
-                    human_input_request,
-                )
+                try:
+                    created_request = self.store.complete_run_and_request_human_input(
+                        run_id,
+                        issue.id,
+                        final_summary,
+                        str(artifact_path),
+                        human_input_request,
+                    )
+                except (RuntimeError, ValueError):
+                    stopped = self._forced_stop_result(issue.id, run_id, phase)
+                    if stopped is not None:
+                        return stopped
+                    raise
                 self.artifacts.append_human_input_request(created_request)
                 self.artifacts.write_human_input_summary(
                     issue.id,
@@ -365,23 +435,35 @@ class Orchestrator:
                 )
                 updated_issue = self.store.get_issue(issue.id)
             else:
-                self.store.complete_run(
-                    run_id,
-                    issue.id,
-                    final_status,
-                    final_summary,
-                    str(artifact_path) if artifact_path is not None else None,
-                    final_error,
-                    next_phase=next_phase,
-                )
+                try:
+                    self.store.complete_run(
+                        run_id,
+                        issue.id,
+                        final_status,
+                        final_summary,
+                        str(artifact_path) if artifact_path is not None else None,
+                        final_error,
+                        next_phase=next_phase,
+                    )
+                except (RuntimeError, ValueError):
+                    stopped = self._forced_stop_result(issue.id, run_id, phase)
+                    if stopped is not None:
+                        return stopped
+                    raise
 
-                updated_issue = self.store.transition_issue(
-                    issue.id,
-                    next_phase,
-                    run_id,
-                    final_summary,
-                    blocked_summary=final_blocked_summary,
-                )
+                try:
+                    updated_issue = self.store.transition_issue(
+                        issue.id,
+                        next_phase,
+                        run_id,
+                        final_summary,
+                        blocked_summary=final_blocked_summary,
+                    )
+                except (RuntimeError, ValueError):
+                    stopped = self._forced_stop_result(issue.id, run_id, phase)
+                    if stopped is not None:
+                        return stopped
+                    raise
             self.artifacts.write_issue_snapshot(updated_issue)
             return ProcessResult(
                 issue_id=issue.id,
@@ -565,6 +647,7 @@ class Orchestrator:
         issue: Issue,
         log_path: Path | None = None,
         workspace_info: WorkspaceInfo | None = None,
+        run_id: str = "",
     ) -> dict[str, str]:
         prompt_path = Path(__file__).parent / "prompts" / f"{phase}.md"
         prompt_template = prompt_path.read_text(encoding="utf-8") if prompt_path.exists() else ""
@@ -573,6 +656,7 @@ class Orchestrator:
             "artifacts_dir": str(self.artifacts.issue_dir(issue.id)),
             "phase_artifact": str(self.artifacts.phase_artifact_path(issue.id, phase)),
             "run_log": str(log_path) if log_path is not None else "",
+            "run_id": run_id,
             "workspace_repo_path": "",
             "workspace_root": "",
             "source_repo_path": issue.repo_path or "",
@@ -601,9 +685,12 @@ class Orchestrator:
             return manager.existing(issue)
         return None
 
-    def _run_merge(self, issue: Issue) -> AgentResult:
+    def _run_merge(self, issue: Issue, run_id: str) -> AgentResult:
         try:
-            merge_result = self._workspace_manager().merge_and_cleanup(issue)
+            merge_result = self._workspace_manager().merge_and_cleanup(
+                issue,
+                cancellation_check=lambda: self.store.get_forced_stop_state(issue.id, run_id),
+            )
         except WorkspaceError as exc:
             return self._blocked_workspace_result(str(exc))
         next_phase_by_status = {
@@ -1033,6 +1120,33 @@ class Orchestrator:
             pr_branch_prefix=self.config.pr_branch_prefix,
         )
 
+    def _forced_stop_result(
+        self,
+        issue_id: int,
+        run_id: str,
+        phase: str,
+        reason: str | None = None,
+    ) -> ProcessResult | None:
+        stop_reason = reason or self.store.get_forced_stop_state(issue_id, run_id)
+        if stop_reason is None:
+            return None
+        try:
+            stopped_issue = self.store.get_issue(issue_id)
+        except KeyError:
+            pass
+        else:
+            if stopped_issue.phase == "blocked":
+                self.artifacts.write_issue_snapshot(stopped_issue)
+        return ProcessResult(
+            issue_id=issue_id,
+            run_id=run_id,
+            phase=phase,
+            status="stopped",
+            next_phase="blocked",
+            summary=stop_reason,
+            artifact_path=None,
+        )
+
     @staticmethod
     def _should_commit_phase_snapshot(
         phase: str,
@@ -1163,6 +1277,52 @@ class _IssueLockHeartbeat:
                 expected_run_id=self.run_id,
             )
             if refreshed is None:
+                self._stop.set()
+                return
+
+
+class _RunCancellationMonitor:
+    def __init__(
+        self,
+        store: IssueStore,
+        runner: AgentRunner,
+        issue_id: int,
+        run_id: str,
+        *,
+        interval_seconds: float = 0.2,
+    ) -> None:
+        self.store = store
+        self.runner = runner
+        self.issue_id = issue_id
+        self.run_id = run_id
+        self.interval_seconds = interval_seconds
+        self.reason: str | None = None
+        self.cancelled_runner = False
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> "_RunCancellationMonitor":
+        self._thread = threading.Thread(
+            target=self._monitor,
+            name=f"agent-team-run-cancellation-{self.issue_id}",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def _monitor(self) -> None:
+        while not self._stop.wait(self.interval_seconds):
+            reason = self.store.get_forced_stop_state(self.issue_id, self.run_id)
+            if reason is None:
+                continue
+            self.reason = reason
+            if self.runner.cancel_run(self.run_id, reason):
+                self.cancelled_runner = True
                 self._stop.set()
                 return
 

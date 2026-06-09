@@ -29,6 +29,9 @@ class QueuedAction:
 
 WebJob = QueuedAction
 
+_TERMINAL_JOB_STATUSES = {"succeeded", "failed", "cancelled"}
+_ACTIVE_JOB_STATUSES = {"queued", "running", "cancelling"}
+
 
 class QueuedActionManager:
     def __init__(self, config: AppConfig, max_workers: int = 1, max_history: int = 100) -> None:
@@ -63,17 +66,36 @@ class QueuedActionManager:
             job_ids = [
                 job.id
                 for job in self._jobs.values()
-                if job.issue_id == issue_id and job.status in {"succeeded", "failed"}
+                if job.issue_id == issue_id and job.status in _TERMINAL_JOB_STATUSES
             ]
             for job_id in job_ids:
                 self._jobs.pop(job_id, None)
                 self._futures.pop(job_id, None)
 
+    def cancel_jobs_for_issue(self, issue_id: int, message: str) -> list[QueuedAction]:
+        cleaned_message = message.strip() or f"Issue {issue_id} was stopped by manager"
+        cancelled: list[QueuedAction] = []
+        with self._lock:
+            for job in self._jobs.values():
+                if job.issue_id != issue_id or job.status not in _ACTIVE_JOB_STATUSES:
+                    continue
+                if job.status == "queued":
+                    job.status = "cancelled"
+                else:
+                    job.status = "cancelling"
+                job.message = cleaned_message
+                job.updated_at = utc_now_iso()
+                future = self._futures.get(job.id)
+                if future is not None:
+                    future.cancel()
+                cancelled.append(job)
+        return cancelled
+
     def wait_for_idle(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             with self._lock:
-                if all(job.status in {"succeeded", "failed"} for job in self._jobs.values()):
+                if all(job.status in _TERMINAL_JOB_STATUSES for job in self._jobs.values()):
                     return True
             time.sleep(0.01)
         return False
@@ -111,14 +133,43 @@ class QueuedActionManager:
         return job
 
     def _execute(self, job_id: str, run: Callable[[], object]) -> object:
-        self._update(job_id, "running", "Running")
+        if not self._mark_running(job_id):
+            return None
         try:
             result = run()
         except Exception as exc:
+            if self._job_is_cancelling(job_id):
+                self._update(job_id, "cancelled", self._job_message(job_id))
+                return None
             self._update(job_id, "failed", str(exc))
             raise
+        if getattr(result, "status", None) == "stopped" or self._job_is_cancelling(job_id):
+            self._update(job_id, "cancelled", job_result_message(result))
+            return result
         self._update(job_id, "succeeded", job_result_message(result))
         return result
+
+    def _mark_running(self, job_id: str) -> bool:
+        with self._lock:
+            job = self._jobs[job_id]
+            if job.status == "cancelled":
+                self._prune_locked()
+                return False
+            job.status = "running"
+            job.message = "Running"
+            job.updated_at = utc_now_iso()
+            self._prune_locked()
+            return True
+
+    def _job_is_cancelling(self, job_id: str) -> bool:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            return job is not None and job.status in {"cancelling", "cancelled"}
+
+    def _job_message(self, job_id: str) -> str:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            return job.message if job is not None else "Cancelled"
 
     def _update(self, job_id: str, status: str, message: str) -> None:
         with self._lock:
@@ -133,7 +184,7 @@ class QueuedActionManager:
         if overflow <= 0:
             return
         completed = sorted(
-            (job for job in self._jobs.values() if job.status in {"succeeded", "failed"}),
+            (job for job in self._jobs.values() if job.status in _TERMINAL_JOB_STATUSES),
             key=lambda job: job.updated_at,
         )
         for job in completed:

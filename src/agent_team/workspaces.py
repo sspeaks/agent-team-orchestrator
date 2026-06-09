@@ -8,7 +8,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 from .artifacts import ArtifactStore
@@ -30,6 +30,8 @@ _REMOTE_GIT_NONINTERACTIVE_ENV = {
     "GIT_TERMINAL_PROMPT": "0",
     "GCM_INTERACTIVE": "never",
 }
+
+CancellationCheck = Callable[[], Optional[str]]
 
 
 class WorkspaceError(Exception):
@@ -444,7 +446,14 @@ class WorkspaceManager:
             allow_empty=self._merge_head_exists(info.worktree_root),
         )
 
-    def merge_and_cleanup(self, issue: Issue, target_branch: str | None = None) -> WorkspaceMergeResult:
+    def merge_and_cleanup(
+        self,
+        issue: Issue,
+        target_branch: str | None = None,
+        *,
+        cancellation_check: CancellationCheck | None = None,
+    ) -> WorkspaceMergeResult:
+        _raise_if_cancelled(cancellation_check)
         metadata = self.artifacts.read_workspace_metadata(issue.id)
         if metadata is None:
             if not issue.repo_path:
@@ -472,6 +481,7 @@ class WorkspaceManager:
                 "Workspace was created from a detached source HEAD; approve merge with an explicit target branch."
             )
 
+        _raise_if_cancelled(cancellation_check)
         with self._repo_lock(info):
             return self._merge_and_cleanup_locked(
                 issue,
@@ -480,6 +490,7 @@ class WorkspaceManager:
                 approval_message,
                 requested_mode,
                 requested_remote,
+                cancellation_check,
             )
 
     def recover_interrupted_merge(self, issue: Issue, target_branch: str | None = None) -> WorkspaceMergeRecovery:
@@ -820,8 +831,10 @@ class WorkspaceManager:
         approval_message: str | None,
         requested_mode: str,
         requested_remote: str | None,
+        cancellation_check: CancellationCheck | None,
     ) -> WorkspaceMergeResult:
-        preflight = self._prepare_merge_in_worktree(issue, info, branch)
+        _raise_if_cancelled(cancellation_check)
+        preflight = self._prepare_merge_in_worktree(issue, info, branch, cancellation_check)
         if preflight.status == "conflicts":
             return WorkspaceMergeResult(
                 status="conflicts",
@@ -838,6 +851,7 @@ class WorkspaceManager:
             )
 
         assert preflight.integrated_head is not None
+        _raise_if_cancelled(cancellation_check)
         final_mode, selected_remote = self._select_finalization_mode(info, requested_mode, requested_remote)
         if final_mode == "pull_request":
             if selected_remote is None:
@@ -847,19 +861,23 @@ class WorkspaceManager:
                 info,
                 preflight,
                 selected_remote,
+                cancellation_check,
             )
-        return self._finalize_local_merge(issue, info, preflight, approval_message)
+        return self._finalize_local_merge(issue, info, preflight, approval_message, cancellation_check)
 
     def _prepare_merge_in_worktree(
         self,
         issue: Issue,
         info: WorkspaceInfo,
         branch: str,
+        cancellation_check: CancellationCheck | None,
     ) -> _MergePreflightResult:
+        _raise_if_cancelled(cancellation_check)
         self._ensure_clean_repo(info.source_root, "source repo")
         branch = self._validate_local_target_branch(info.source_root, branch)
         worktree_commit = self._commit_dirty_worktree(issue, info)
         self._ensure_clean_repo(info.worktree_root, "issue worktree")
+        _raise_if_cancelled(cancellation_check)
         worktree_head = self._git(info.worktree_root, "rev-parse", "HEAD")
         if worktree_head == info.source_head:
             raise WorkspaceError(
@@ -870,6 +888,7 @@ class WorkspaceManager:
         self._checkout_internal_merge_branch(info, merge_branch, worktree_head)
 
         if not self._git_check(info.worktree_root, "merge-base", "--is-ancestor", branch, "HEAD"):
+            _raise_if_cancelled(cancellation_check)
             try:
                 self._git(
                     info.worktree_root,
@@ -900,6 +919,7 @@ class WorkspaceManager:
         integrated_head = self._git(info.worktree_root, "rev-parse", "HEAD")
         self._ensure_clean_repo(info.worktree_root, "issue worktree")
         self._ensure_clean_repo(info.source_root, "source repo")
+        _raise_if_cancelled(cancellation_check)
         return _MergePreflightResult(
             status="ready",
             target_branch=branch,
@@ -915,14 +935,17 @@ class WorkspaceManager:
         info: WorkspaceInfo,
         preflight: _MergePreflightResult,
         approval_message: str | None,
+        cancellation_check: CancellationCheck | None,
     ) -> WorkspaceMergeResult:
         integrated_head = _require_string(preflight.integrated_head, "integrated worktree head")
         branch = preflight.target_branch
         merge_branch = preflight.merge_branch
+        _raise_if_cancelled(cancellation_check)
         self._ensure_clean_repo(info.source_root, "source repo")
         self._git(info.source_root, "checkout", branch)
 
         if not self._git_check(info.source_root, "merge-base", "--is-ancestor", integrated_head, branch):
+            _raise_if_cancelled(cancellation_check)
             try:
                 self._git(
                     info.source_root,
@@ -941,6 +964,7 @@ class WorkspaceManager:
                 raise
 
         merge_commit = self._git(info.source_root, "rev-parse", "HEAD")
+        # The source branch is finalized; finish metadata and cleanup even if a stop arrives now.
         merged_metadata = {
             **info.to_metadata(),
             "cleanup_removed": False,
@@ -1185,9 +1209,12 @@ class WorkspaceManager:
         info: WorkspaceInfo,
         preflight: _MergePreflightResult,
         selected_remote: _SelectedRemote,
+        cancellation_check: CancellationCheck | None,
     ) -> WorkspaceMergeResult:
         integrated_head = _require_string(preflight.integrated_head, "integrated worktree head")
         source_branch = self._pull_request_branch(issue)
+        _raise_if_cancelled(cancellation_check)
+        # Pushing/creating a PR is the finalization point; complete metadata and cleanup afterward.
         self._push_pull_request_branch(issue, info, selected_remote, source_branch, integrated_head)
         body_path = self._write_pull_request_body(
             issue,
@@ -2327,6 +2354,14 @@ def _require_string(value: str | None, label: str) -> str:
     if cleaned is None:
         raise WorkspaceError(f"Missing {label}")
     return cleaned
+
+
+def _raise_if_cancelled(cancellation_check: CancellationCheck | None) -> None:
+    if cancellation_check is None:
+        return
+    reason = cancellation_check()
+    if reason is not None:
+        raise WorkspaceError(f"Merge cancelled because issue stop was requested: {reason}")
 
 
 def _same_pull_request_repository(left: PullRequestRemote, right: PullRequestRemote) -> bool:

@@ -368,6 +368,54 @@ class WorkspaceManagerTests(unittest.TestCase):
         self.assertIn("Merge approval: looks good", merge_message)
         self.assertIn("feature", merge_message)
 
+    def test_merge_cancellation_before_finalization_leaves_source_unchanged(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        source_head = self._git(self.repo, "rev-parse", "HEAD")
+
+        with self.assertRaisesRegex(WorkspaceError, "Merge cancelled"):
+            self.manager.merge_and_cleanup(
+                issue,
+                cancellation_check=lambda: "Manager stopped issue.",
+            )
+
+        self.assertEqual(self._git(self.repo, "rev-parse", "HEAD"), source_head)
+        self.assertFalse((self.repo / "feature.txt").exists())
+        self.assertTrue(info.worktree_root.exists())
+        self.assertIsNotNone(self.artifacts.read_workspace_metadata(issue.id))
+
+    def test_merge_cancellation_after_source_merge_finishes_cleanup(self) -> None:
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        cancel_after_merge = False
+        original_git = self.manager._git
+
+        def git_with_stop(repo: Path, *args: str) -> str:
+            nonlocal cancel_after_merge
+            result = original_git(repo, *args)
+            if repo == info.source_root and args and args[0] == "merge":
+                cancel_after_merge = True
+            return result
+
+        def cancellation_check() -> str | None:
+            return "Manager stopped issue." if cancel_after_merge else None
+
+        with patch.object(self.manager, "_git", side_effect=git_with_stop):
+            result = self.manager.merge_and_cleanup(issue, cancellation_check=cancellation_check)
+
+        self.assertTrue(cancel_after_merge)
+        self.assertEqual(result.status, "merged")
+        self.assertTrue(result.cleanup_removed)
+        self.assertFalse(info.worktree_root.exists())
+        self.assertEqual((self.repo / "feature.txt").read_text(encoding="utf-8"), "feature\n")
+        self.assertIsNone(self.artifacts.read_workspace_metadata(issue.id))
+        merged = self.artifacts.read_merged_workspace_metadata(issue.id)
+        self.assertIsNotNone(merged)
+        assert merged is not None
+        self.assertTrue(merged["cleanup_removed"])
+
     def test_merge_rejects_symbolic_target_branch(self) -> None:
         issue = self._issue(1, self.repo)
         info = self.manager.prepare(issue)
@@ -539,6 +587,52 @@ class WorkspaceManagerTests(unittest.TestCase):
         self.assertIsNone(self.artifacts.read_workspace_metadata(issue.id))
         self.assertFalse(self.artifacts.merged_workspace_metadata_path(issue.id).exists())
         self.assertEqual(self._git(self.repo, "branch", "--list", "agent-team/issue-1-merge-*"), "")
+
+    def test_pull_request_cancellation_after_provider_creation_finishes_cleanup(self) -> None:
+        self._git(self.repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
+        self._git(self.repo, "remote", "set-url", "--push", "origin", "https://github.com/owner/repo.git")
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        self.artifacts.write_merge_request(issue.id, target_branch=None, message="approved", mode="auto")
+        stop_after_pr = False
+        pr_result = PullRequestResult(
+            provider="github",
+            remote_name="origin",
+            source_branch="agent-team/issue-1",
+            target_branch="master",
+            title="Issue 1: issue 1",
+            url="https://github.com/owner/repo/pull/7",
+            id="7",
+            number=7,
+            status="OPEN",
+            is_existing=False,
+            raw={"number": 7},
+        )
+
+        def create_pr(remote: PullRequestRemote, request: object) -> PullRequestResult:
+            nonlocal stop_after_pr
+            stop_after_pr = True
+            return pr_result
+
+        def cancellation_check() -> str | None:
+            return "Manager stopped issue." if stop_after_pr else None
+
+        with patch.object(self.manager, "_push_pull_request_branch"):
+            with patch("agent_team.workspaces.create_or_get_pull_request", side_effect=create_pr):
+                result = self.manager.merge_and_cleanup(issue, cancellation_check=cancellation_check)
+
+        self.assertTrue(stop_after_pr)
+        self.assertEqual(result.status, "pull_request")
+        self.assertTrue(result.cleanup_removed)
+        self.assertEqual(result.pr_url, "https://github.com/owner/repo/pull/7")
+        self.assertFalse(info.worktree_root.exists())
+        self.assertIsNone(self.artifacts.read_workspace_metadata(issue.id))
+        metadata = self.artifacts.read_pull_request_metadata(issue.id)
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertTrue(metadata["cleanup_removed"])
+        self.assertEqual(metadata["url"], "https://github.com/owner/repo/pull/7")
 
     def test_pull_request_retry_after_push_before_metadata_reuses_matching_remote_branch(self) -> None:
         bare_remote = self.home / "origin.git"

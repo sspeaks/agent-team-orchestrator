@@ -12,3 +12,5 @@ class AgentRunner(ABC):
     def run(self, phase: str, issue: Issue, context: dict[str, str]) -> AgentResult:
         raise NotImplementedError
 
+    def cancel_run(self, run_id: str, reason: str) -> bool:
+        return False
