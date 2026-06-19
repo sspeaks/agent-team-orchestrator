@@ -14,6 +14,7 @@ from agent_team.pull_requests import (
     PullRequestRemote,
     PullRequestRequest,
     SubprocessCommandRunner,
+    canonicalize_ssh_alias_url,
     create_or_get_pull_request,
     ensure_pull_request_conflict_comment,
     get_pull_request_status,
@@ -131,6 +132,60 @@ class PullRequestRemoteParsingTests(unittest.TestCase):
         for url in urls:
             with self.subTest(url=url):
                 self.assertIsNone(parse_pull_request_remote("origin", url))
+
+
+class SshAliasCanonicalizationTests(unittest.TestCase):
+    def test_canonicalizes_scp_like_github_alias(self) -> None:
+        result = canonicalize_ssh_alias_url(
+            "github:owner/repo.git",
+            lambda host: {"hostname": "github.com", "user": "git"} if host == "github" else {},
+        )
+
+        self.assertEqual(result, "git@github.com:owner/repo.git")
+
+    def test_canonicalizes_ssh_url_github_alias(self) -> None:
+        result = canonicalize_ssh_alias_url(
+            "ssh://myalias/owner/repo.git",
+            lambda host: {"hostname": "github.com", "user": "git"} if host == "myalias" else {},
+        )
+
+        self.assertEqual(result, "ssh://git@github.com/owner/repo.git")
+
+    def test_canonicalizes_azure_devops_scp_alias(self) -> None:
+        result = canonicalize_ssh_alias_url(
+            "ado:v3/org/project/repo",
+            lambda host: {"hostname": "ssh.dev.azure.com", "user": "git"} if host == "ado" else {},
+        )
+
+        self.assertEqual(result, "git@ssh.dev.azure.com:v3/org/project/repo")
+
+    def test_ignores_non_ssh_urls(self) -> None:
+        result = canonicalize_ssh_alias_url(
+            "https://github.com/owner/repo.git",
+            lambda host: {"hostname": "github.com", "user": "git"},
+        )
+
+        self.assertIsNone(result)
+
+    def test_ignores_known_provider_hosts(self) -> None:
+        result = canonicalize_ssh_alias_url(
+            "git@github.com:owner/repo.git",
+            lambda host: {"hostname": "github.com", "user": "git"},
+        )
+
+        self.assertIsNone(result)
+
+    def test_ignores_unresolved_or_unchanged_hosts(self) -> None:
+        unchanged = canonicalize_ssh_alias_url("alias:owner/repo.git", lambda host: {"hostname": "alias"})
+        unresolved = canonicalize_ssh_alias_url("alias:owner/repo.git", lambda host: {})
+
+        self.assertIsNone(unchanged)
+        self.assertIsNone(unresolved)
+
+    def test_malformed_inputs_return_none(self) -> None:
+        for url in ("", "ssh://", "ssh://alias", "local/path:repo", ":repo"):
+            with self.subTest(url=url):
+                self.assertIsNone(canonicalize_ssh_alias_url(url, lambda host: {"hostname": "github.com"}))
 
 
 class PullRequestProviderTests(unittest.TestCase):

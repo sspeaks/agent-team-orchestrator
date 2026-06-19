@@ -588,6 +588,47 @@ class WorkspaceManagerTests(unittest.TestCase):
         self.assertFalse(self.artifacts.merged_workspace_metadata_path(issue.id).exists())
         self.assertEqual(self._git(self.repo, "branch", "--list", "agent-team/issue-1-merge-*"), "")
 
+    def test_auto_remote_resolves_ssh_alias_for_pull_request_without_rewriting_git_url(self) -> None:
+        alias_url = "github:owner/repo.git"
+        self._git(self.repo, "remote", "add", "origin", alias_url)
+        self._git(self.repo, "remote", "set-url", "--push", "origin", alias_url)
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+        self.artifacts.write_merge_request(issue.id, target_branch=None, message="approved", mode="auto")
+        source_head = self._git(self.repo, "rev-parse", "HEAD")
+        self._git(self.repo, "branch", f"agent-team/issue-{issue.id}-merge-{source_head[:12]}", source_head)
+        pr_result = PullRequestResult(
+            provider="github",
+            remote_name="origin",
+            source_branch="agent-team/issue-1",
+            target_branch="master",
+            title="Issue 1: issue 1",
+            url="https://github.com/owner/repo/pull/7",
+            id="7",
+            number=7,
+            status="OPEN",
+            is_existing=False,
+            raw={"number": 7},
+        )
+
+        with patch.object(self.manager, "_ssh_alias_config", return_value={"hostname": "github.com", "user": "git"}):
+            with patch.object(self.manager, "_push_pull_request_branch") as push_branch:
+                with patch("agent_team.workspaces.create_or_get_pull_request", return_value=pr_result):
+                    result = self.manager.merge_and_cleanup(issue)
+
+        self.assertEqual(result.status, "pull_request")
+        selected_remote = push_branch.call_args.args[2]
+        self.assertEqual(selected_remote.push_url, alias_url)
+        self.assertEqual(selected_remote.remote.url, alias_url)
+        metadata = self.artifacts.read_pull_request_metadata(issue.id)
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertEqual(metadata["remote_identity"], ["github", "owner", "repo"])
+        self.assertEqual(metadata["remote_url"], alias_url)
+        self.assertEqual(self._git(self.repo, "rev-parse", "HEAD"), source_head)
+        self.assertFalse((self.repo / "feature.txt").exists())
+
     def test_pull_request_cancellation_after_provider_creation_finishes_cleanup(self) -> None:
         self._git(self.repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
         self._git(self.repo, "remote", "set-url", "--push", "origin", "https://github.com/owner/repo.git")
@@ -1364,6 +1405,24 @@ class WorkspaceManagerTests(unittest.TestCase):
 
         self.assertTrue(info.worktree_root.exists())
         self.assertFalse((self.repo / "feature.txt").exists())
+
+    def test_auto_ssh_alias_to_non_provider_host_still_blocks(self) -> None:
+        self._git(self.repo, "remote", "add", "origin", "github:owner/repo.git")
+        self._git(self.repo, "remote", "set-url", "--push", "origin", "github:owner/repo.git")
+        issue = self._issue(1, self.repo)
+        info = self.manager.prepare(issue)
+        self._commit_file(info.worktree_root, "feature.txt", "feature\n")
+
+        with patch.object(self.manager, "_ssh_alias_config", return_value={"hostname": "example.com"}):
+            with self.assertRaisesRegex(WorkspaceError, "no.*supported pull request provider"):
+                self.manager.merge_and_cleanup(issue)
+
+        self.assertTrue(info.worktree_root.exists())
+        self.assertFalse((self.repo / "feature.txt").exists())
+
+    def test_ssh_alias_config_returns_empty_when_ssh_is_missing(self) -> None:
+        with patch("agent_team.workspaces.subprocess.run", side_effect=FileNotFoundError):
+            self.assertEqual(self.manager._ssh_alias_config("github"), {})
 
     def test_explicit_local_mode_uses_local_merge_even_with_remote(self) -> None:
         self._git(self.repo, "remote", "add", "origin", "https://example.com/owner/repo.git")

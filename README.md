@@ -105,7 +105,7 @@ Copilot model and reasoning effort can be configured globally or per Copilot-bac
 - Before the first implementation worktree is created, the target source checkout must be a clean Git repository because uncommitted and untracked files are not copied into worktrees.
 - Research and planning use the target checkout as source context. Implementation and later repo-backed phases run in the isolated issue worktree.
 - The web UI binds to `127.0.0.1` by default, uses same-origin/CSRF checks for POSTs, and has no authentication. Do not expose it on a shared network without your own protection.
-- Merge finalization can run locally or open/reuse a hosted PR when a supported GitHub or Azure DevOps Services remote is available. Hosted PRs remain local open issues until the provider PR closes; monitoring requires non-interactive `gh` or Azure CLI authentication with permission to read PR status and create/update PR comments.
+- Merge finalization can run locally or open/reuse a hosted PR when a supported GitHub or Azure DevOps Services remote is available. Auto mode recognizes supported remotes even when they use an SSH host alias (for example `github:owner/repo`); on the web merge-approval form, tick **Merge locally** to merge locally instead of opening a pull request. Hosted PRs remain local open issues until the provider PR closes; monitoring requires non-interactive `gh` or Azure CLI authentication with permission to read PR status and create/update PR comments.
 - Every run, transition, artifact, and log remains local under the configured state directory.
 
 ## Development and tests

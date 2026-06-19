@@ -2550,7 +2550,7 @@ setTimeout(() => {{
         self.assertEqual(request["message"], "merge approved")
         self.assertEqual(request["mode"], "auto")
 
-    def test_approve_merge_action_defaults_to_configured_merge_mode(self) -> None:
+    def test_approve_merge_action_unchecked_checkbox_uses_auto_even_when_configured_local(self) -> None:
         self.app.config = replace(self.app.config, merge_mode="local")
         issue = self.store.create_issue("merge issue", "desc")
         self._move_to_merge_approval(issue.id)
@@ -2564,22 +2564,37 @@ setTimeout(() => {{
         request = self.artifacts.read_merge_request(issue.id)
         self.assertIsNotNone(request)
         assert request is not None
-        self.assertEqual(request["mode"], "local")
+        self.assertEqual(request["mode"], "auto")
 
-    def test_approve_merge_action_records_explicit_pull_request_mode_and_remote(self) -> None:
+    def test_approve_merge_action_records_local_checkbox_mode(self) -> None:
         issue = self.store.create_issue("merge issue", "desc")
         self._move_to_merge_approval(issue.id)
 
         self.post(
             f"/issues/{issue.id}/actions/approve-merge",
-            {"branch": "main", "message": "open a PR", "mode": "pull-request", "remote": "upstream"},
+            {"branch": "main", "local": "1", "message": "merge locally"},
         )
 
         self.assertEqual(self.store.get_issue(issue.id).phase, "ready_for_merge")
         request = self.artifacts.read_merge_request(issue.id)
         self.assertIsNotNone(request)
         assert request is not None
-        self.assertEqual(request["mode"], "pull_request")
+        self.assertEqual(request["mode"], "local")
+
+    def test_approve_merge_action_records_remote_with_auto_mode(self) -> None:
+        issue = self.store.create_issue("merge issue", "desc")
+        self._move_to_merge_approval(issue.id)
+
+        self.post(
+            f"/issues/{issue.id}/actions/approve-merge",
+            {"branch": "main", "message": "open a PR", "remote": "upstream"},
+        )
+
+        self.assertEqual(self.store.get_issue(issue.id).phase, "ready_for_merge")
+        request = self.artifacts.read_merge_request(issue.id)
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertEqual(request["mode"], "auto")
         self.assertEqual(request["remote_name"], "upstream")
 
     def test_approve_merge_rejects_wrong_phase(self) -> None:
@@ -2655,8 +2670,9 @@ setTimeout(() => {{
         self.assertIn("/actions/approve-merge", html)
         self.assertIn("Target branch", html)
         self.assertIn('value="main"', html)
-        self.assertIn("Finalization mode", html)
-        self.assertIn('<option value="auto" selected>', html)
+        self.assertIn('type="checkbox" name="local"', html)
+        self.assertIn("Merge locally instead of opening a pull request", html)
+        self.assertNotIn('name="local" value="1" checked', html)
         self.assertIn("PR remote (optional)", html)
         self.assertIn("Approve merge", html)
         self.assertLess(html.index("Primary controls"), html.index("Workflow progress"))
@@ -2670,7 +2686,7 @@ setTimeout(() => {{
 
         html = self.get(f"/issues/{issue.id}")
 
-        self.assertIn('<option value="local" selected>', html)
+        self.assertIn('type="checkbox" name="local" value="1" checked', html)
         self.assertIn('name="remote" value="upstream"', html)
 
     def test_post_requires_csrf_token(self) -> None:

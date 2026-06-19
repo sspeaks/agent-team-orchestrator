@@ -7,7 +7,7 @@ import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 from urllib.parse import quote, unquote, urlparse, urlunparse
 
 
@@ -194,6 +194,25 @@ def parse_pull_request_remote(remote_name: str, remote_url: str) -> PullRequestR
     if _url_embeds_disallowed_credentials(remote_url):
         return None
     return parse_github_remote(remote_name, remote_url) or parse_azure_devops_remote(remote_name, remote_url)
+
+
+def canonicalize_ssh_alias_url(url: str, resolver: Callable[[str], Mapping[str, str]]) -> str | None:
+    """Return an SSH URL rewritten with resolved hostname/user when `url` uses an SSH host alias."""
+    parsed_alias = _parse_ssh_alias_candidate(url)
+    if parsed_alias is None:
+        return None
+    kind, explicit_user, host, path = parsed_alias
+    if _is_known_pull_request_provider_host(host):
+        return None
+    config = resolver(host)
+    hostname = str(config.get("hostname") or "").strip()
+    if not hostname or hostname.casefold() == host.casefold():
+        return None
+    user = str(config.get("user") or explicit_user or "git").strip() or "git"
+    hostname = hostname.lower()
+    if kind == "scp":
+        return f"{user}@{hostname}:{path}"
+    return f"ssh://{user}@{hostname}/{path}"
 
 
 def parse_github_remote(remote_name: str, remote_url: str) -> PullRequestRemote | None:
@@ -886,6 +905,45 @@ def _path_parts(path: str) -> list[str]:
 
 def _strip_dot_git(value: str) -> str:
     return value[:-4] if value.endswith(".git") else value
+
+
+def _parse_ssh_alias_candidate(url: str) -> tuple[str, str | None, str, str] | None:
+    text = url.strip()
+    if not text:
+        return None
+    if "://" not in text and ":" in text:
+        prefix, path = text.split(":", 1)
+        if not prefix or "/" in prefix or not path:
+            return None
+        user, host = _split_optional_ssh_user(prefix)
+        if not host:
+            return None
+        return ("scp", user, host, path)
+    if not text.lower().startswith("ssh://"):
+        return None
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return None
+    host = parsed.hostname or ""
+    path = parsed.path.lstrip("/")
+    if not host or not path:
+        return None
+    return ("ssh", parsed.username, host, path)
+
+
+def _split_optional_ssh_user(value: str) -> tuple[str | None, str]:
+    if "@" not in value:
+        return None, value
+    user, host = value.rsplit("@", 1)
+    return user or None, host
+
+
+def _is_known_pull_request_provider_host(host: str) -> bool:
+    normalized = host.casefold()
+    return normalized in {"github.com", "ssh.dev.azure.com", "dev.azure.com"} or normalized.endswith(
+        ".visualstudio.com"
+    )
 
 
 def _github_repo(remote: PullRequestRemote) -> str:

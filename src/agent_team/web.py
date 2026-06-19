@@ -366,9 +366,7 @@ class AgentTeamWebApp:
                         f"Issue {issue.id} is in phase {issue.phase!r}, not 'awaiting_merge_approval'",
                     )
                 branch = form.get("branch", "").strip() or None
-                mode = (form.get("mode", "").strip() or self.config.merge_mode).lower().replace("-", "_")
-                if mode not in {"auto", "local", "pull_request"}:
-                    raise WebError(HTTPStatus.BAD_REQUEST, "merge mode must be auto, local, or pull-request")
+                mode = "local" if "local" in form else "auto"
                 remote = form.get("remote", "").strip() or None
                 message = form.get("message", "Human approved worktree merge and cleanup").strip()
                 message = message or "Human approved worktree merge and cleanup"
@@ -842,24 +840,11 @@ class AgentTeamWebApp:
                             "placeholder": "main",
                         },
                         {
-                            "type": "select",
-                            "name": "mode",
-                            "label": "Finalization mode",
-                            "value": mode_hint,
-                            "options": [
-                                {
-                                    "value": "auto",
-                                    "label": "Auto: PR for supported remotes, local when no remote",
-                                },
-                                {
-                                    "value": "pull-request",
-                                    "label": "Pull request only",
-                                },
-                                {
-                                    "value": "local",
-                                    "label": "Local merge",
-                                },
-                            ],
+                            "type": "checkbox",
+                            "name": "local",
+                            "label": "Merge locally instead of opening a pull request",
+                            "value": "1",
+                            "checked": (mode_hint == "local"),
                         },
                         {
                             "type": "input",

@@ -478,6 +478,13 @@ def _manager_control_field_html(field: dict[str, Any]) -> str:
             for option in field.get("options", [])
         )
         control = f'<select name="{_esc(name)}"{required}>{options}</select>'
+    elif field_type == "checkbox":
+        checkbox_value = value if value is not None else "1"
+        checked = " checked" if field.get("checked") else ""
+        control = (
+            f'<input type="checkbox" name="{_esc(name)}" value="{_esc(checkbox_value)}"'
+            f"{checked}{required}{placeholder}>"
+        )
     else:
         input_type = field_type if field_type != "input" else "text"
         value_attr = f' value="{_esc(value)}"' if value is not None else ""
@@ -485,6 +492,8 @@ def _manager_control_field_html(field: dict[str, Any]) -> str:
     label = field.get("label")
     if not label:
         return control
+    if field_type == "checkbox":
+        return f"<label>{control} {_esc(label)}</label>"
     return f"<label>{_esc(label)} {control}</label>"
 
 

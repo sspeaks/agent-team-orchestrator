@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -20,6 +20,7 @@ from .pull_requests import (
     PullRequestResult,
     PullRequestStatusSnapshot,
     SAFE_PULL_REQUEST_DESCRIPTION,
+    canonicalize_ssh_alias_url,
     create_or_get_pull_request,
     parse_pull_request_remote,
     pull_request_remote_from_metadata,
@@ -1335,7 +1336,7 @@ class WorkspaceManager:
                 raise WorkspaceError(f"Requested pull request remote does not exist: {remote_name}")
             remote_url = self._git(info.source_root, "remote", "get-url", remote_name)
             push_url = self._git(info.source_root, "remote", "get-url", "--push", remote_name)
-            remote = parse_pull_request_remote(remote_name, remote_url)
+            remote = self._resolve_pull_request_remote(remote_name, remote_url)
             if remote is not None:
                 try:
                     self._validate_pull_request_push_url(remote, push_url)
@@ -1365,7 +1366,7 @@ class WorkspaceManager:
                 "potentially credential-bearing remote URLs to git; use a Git credential helper, an authenticated "
                 "SSH remote, or approve with --mode local to merge locally instead."
             )
-        push_remote = parse_pull_request_remote(remote.remote_name, push_url)
+        push_remote = self._resolve_pull_request_remote(remote.remote_name, push_url)
         if push_remote is None:
             raise WorkspaceError(
                 f"Remote '{remote.remote_name}' fetch URL resolves to {_pull_request_remote_label(remote)}, "
@@ -1380,6 +1381,43 @@ class WorkspaceManager:
                 "Refusing to push issue work to a different repository; fix the remote push URL or approve "
                 "with --mode local to merge locally instead."
             )
+
+    def _resolve_pull_request_remote(self, remote_name: str, url: str) -> PullRequestRemote | None:
+        remote = parse_pull_request_remote(remote_name, url)
+        if remote is not None:
+            return remote
+        canonical = canonicalize_ssh_alias_url(url, self._ssh_alias_config)
+        if canonical is None:
+            return None
+        resolved = parse_pull_request_remote(remote_name, canonical)
+        if resolved is None:
+            return None
+        return replace(resolved, url=url)
+
+    def _ssh_alias_config(self, host: str) -> dict[str, str]:
+        """Return effective `ssh -G <host>` config keys, or {} when unavailable."""
+        try:
+            completed = subprocess.run(
+                ["ssh", "-G", host],
+                text=True,
+                capture_output=True,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                timeout=min(_REMOTE_GIT_COMMAND_TIMEOUT_SECONDS, 30.0),
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            return {}
+        if completed.returncode != 0:
+            return {}
+        config: dict[str, str] = {}
+        for line in (completed.stdout or "").splitlines():
+            parts = line.strip().split(None, 1)
+            if len(parts) != 2:
+                continue
+            key = parts[0].casefold()
+            if key in {"hostname", "user", "port"} and key not in config:
+                config[key] = parts[1].strip()
+        return config
 
     def _remote_names(self, source_root: Path) -> list[str]:
         return [line for line in self._git(source_root, "remote").splitlines() if line]
